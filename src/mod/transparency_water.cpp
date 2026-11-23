@@ -169,16 +169,20 @@ namespace
   }
 } // namespace
 
-// Water reflection visibility (Mon 16 Nov; pdz_fix_reflection_visibility, on by default). Rare's reflection pass
+// Water reflection visibility (Mon 16 Nov; pdz_fix_reflection_visibility, OFF by default since 1.0.1). Rare's reflection pass
 // sub_82621BE8 draws the scene again with a mirrored camera, but runs no visibility query of its own: the mesh drawer
 // below skips every world part whose bit is clear in the MAIN camera's per-frame bit array (pointer at 82E22568, set
 // by sub_82714FF8). A tall building that has left the screen therefore vanishes from the water's reflection. While
 // the pass's "in reflection" byte (82E3C69F) is set, the drawer reads a private all-ones array instead: every world
 // part counts as visible in the reflection. Only the pointer is swapped (and put back); Rare's array is not written.
-REXCVAR_DEFINE_BOOL(pdz_fix_reflection_visibility, true, "Render",
+// Mon 23 Nov (1.0.1): off by default. With it on, Datacore showed the above-water sky (clouds, sunshine) through its
+// windows deep under water: the level's water reflection pass then also draws the world parts of the other side of
+// the water line, the outdoor sky among them. Off, the sky is Rare's. The default is set here, not in a settings
+// template: a player who updates keeps the settings file they have.
+REXCVAR_DEFINE_BOOL(pdz_fix_reflection_visibility, false, "Render",
                     "Water reflections: the reflection pass draws every world part, not only the parts the main "
-                    "camera sees, so tall buildings stay in the reflection when they leave the screen. Off: as on "
-                    "the Xbox 360")
+                    "camera sees, so tall buildings stay in the reflection when they leave the screen. Off (the "
+                    "default: on, Datacore showed the outdoor sky through its underwater windows): as on the Xbox 360")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 // Skyline visibility (Mon 16 Nov, release candidate; pdz_fix_skyline_visibility, OFF by default since the hand test of
