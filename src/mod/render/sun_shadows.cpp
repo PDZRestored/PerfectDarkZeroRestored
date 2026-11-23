@@ -61,19 +61,29 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
+#include <fmt/format.h>
 #include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/ppc/context.h>
 #include <rex/runtime.h>
+#include <rex/ui/keybinds.h>
+#include <rex/ui/window.h>
+#include <rex/ui/windowed_app_context.h>
+
+#include "../../pdz_version.h"
 
 #include "cutscene_dump.h" // pdz_cutscene_frame_dump: the frame's camera matrix
 #include "frame_timing.h"  // pdz::timing::Enabled (the caster counter's switch)
 #include "native/native.h" // Enabled, ShadowMapRelativeScale; gpu_sync.h NullBackend; pdz::shadow guest helpers
+#include "../guest_readable_Sat21Nov.h" // Sun 22 Nov night (audit): pdz::guestmem::Ok
+
+REXCVAR_DECLARE(int32_t, pdz_shadow_map_scale); // native/native_cvars.cpp
 
 REXCVAR_DEFINE_DOUBLE(pdz_shadow_distance_scale, 1.0, "Render",
                       "Enhancement (polish 6): how far the sun's shadows reach. The game ends them at 20 m and fades "
@@ -142,6 +152,14 @@ REXCVAR_DEFINE_DOUBLE(pdz_shadow_split_blend, 0.25, "Render",
     .range(0.0, 0.75)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(pdz_shadow_far_object_fade_fix, true, "Render",
+                    "Native renderer only, fix for the longer sun shadows (pdz_shadow_distance_scale above 1; nothing "
+                    "changes at the stock distance): the game fades an object's shadow (palms, props, characters) out "
+                    "with the distance behind the object. The far cascade's larger depth bias stretched that fade 4 "
+                    "times, so a palm's shadow carried on behind it across walls and showed as a second, darker copy "
+                    "beside its normal shadow (MP Desert). On: the game's own fade length in the far cascade. Off: "
+                    "as before (to compare)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(pdz_shadow_stable, false, "Render",
                     "Enhancement (polish 6c): rotation-stable sun-shadow cascades. The game fits each cascade's shadow "
                     "map to the view and orients it by the camera, so every shadow edge crawls when the camera turns "
@@ -154,6 +172,11 @@ REXCVAR_DEFINE_BOOL(pdz_shadow_stable, false, "Render",
 
 namespace
 {
+  // Set by the Long shadows preset (ApplyPreset, end of this file) while it is applied; 1 = no change (the preset off,
+  // or the plain pdz_shadow_* settings used by hand).
+  std::atomic<float> g_long_split_extra{1.0f};  // extra factor on the near cascade's end (pdz_long_shadows_split)
+  std::atomic<float> g_long_object_fade{1.0f};  // far object shadow fade length, x the game's (pdz_long_shadows_object_fade)
+
   // The factor in effect: 1 for 1, anything below it or not a number (the original), at most 4.
   float DistanceScale()
   {
@@ -329,8 +352,15 @@ namespace
   }
 } // namespace
 
+namespace pdz::sunshadow
+{
+  void ApplyPreset(bool game_thread = false); // the "Long shadows" preset (end of this file)
+  void NoteMaskShader(bool long_patches);     // native_coissue.cpp: how the shadow mask shader was prepared
+}
+
 void PdzShadowFarEnd(PPCRegister &f26)
 {
+  pdz::sunshadow::ApplyPreset(true);
   std::call_once(g_cvar_log_once, RegisterShadowCvarLog);
   const float k = DistanceScale();
   if (k == 1.0f)
@@ -389,7 +419,18 @@ void PdzShadowMaskConstants()
 {
   const double radius = REXCVAR_GET(pdz_shadow_far_pcf);
   const float band = SplitBlendBand();
-  if ((!(radius > 0.0) && band == 0.0f) || !pdz::native::Enabled())
+  // pdz_shadow_far_object_fade_fix: c17.z = the far cascade's depth-range factor t (PdzShadowFarDepthRange), read by
+  // the patched shader to give the far cascade's object shadow fade its original length; 0 (the literal) = no change.
+  float fade_t = 1.0f;
+  if (REXCVAR_GET(pdz_shadow_far_object_fade_fix))
+  {
+    const float k = DistanceScale();
+    fade_t = FarBiasScale(k, MapRelativeScale(), LongShadowFactor(k));
+    // pdz_long_shadows_object_fade (the preset only): the fade that many times the game's length (the shader takes
+    // max(c17.z, 1), so it never gets longer than the unfixed stretch).
+    fade_t = std::max(1.0f, fade_t / g_long_object_fade.load(std::memory_order_relaxed));
+  }
+  if ((!(radius > 0.0) && band == 0.0f && fade_t == 1.0f) || !pdz::native::Enabled())
   {
     return;
   }
@@ -410,7 +451,21 @@ void PdzShadowMaskConstants()
     StoreFloat(base, device + dev::kPsAluConstants + 16 * kMaskBiasRegister + 12, band);
   }
   const uint32_t dirty = device + dev::kDirtyMasks + 8; // PS ALU constants: one bit per 4 registers, from bit 63
-  Store64(base, dirty, pdz::shadow::Load64(base, dirty) | (uint64_t(1) << (63 - kMaskBiasRegister / 4)));
+  uint64_t bits = uint64_t(1) << (63 - kMaskBiasRegister / 4);
+  if (fade_t != 1.0f)
+  {
+    constexpr uint32_t kMaskFadeRegister = 17; // literal {0.7, 0.3, 0, 0}: z unused by the original shader
+    StoreFloat(base, device + dev::kPsAluConstants + 16 * kMaskFadeRegister + 8, fade_t);
+    bits |= uint64_t(1) << (63 - kMaskFadeRegister / 4);
+    static std::atomic<float> logged{1.0f};
+    if (logged.exchange(fade_t, std::memory_order_relaxed) != fade_t)
+    {
+      REXLOG_INFO("pdz_shadow: far object shadow fade fix (pdz_shadow_far_object_fade_fix): the far cascade's object "
+                  "shadow fade x{:g} shorter again (= the game's length)",
+                  fade_t);
+    }
+  }
+  Store64(base, dirty, pdz::shadow::Load64(base, dirty) | bits);
 }
 
 // Polish 6c: the cascade layout (PDZRenderResearch native\stage2\polish\shadows2_cascade.md).
@@ -481,7 +536,8 @@ namespace
     {
       return 1.0f;
     }
-    return DistanceScale();
+    const float k = DistanceScale();
+    return k == 1.0f ? 1.0f : k * g_long_split_extra.load(std::memory_order_relaxed);
   }
 
   std::atomic<float> g_split_logged{1.0f};
@@ -767,6 +823,460 @@ namespace
   }
 } // namespace
 
+// Far-map caster limit (Mon 16 Nov night, performance job step 2a; pdz_long_shadows_far_caster_limit, off).
+// The shadow pass sub_8260C8C0 loops over the two cascades (index at 82E09F08: 0 near, 1 far; 8260CCDC-8260CF3C) and
+// calls the caster draw sub_8261D728 twice per cascade; the object renderer sub_824119A0 (mode 2, flags 0x4001) then
+// selects every object with the view's shadow bit into the list at 82D7CF00 (pointers to the 512-byte render table
+// entries; r20 = count) and draws them all, whatever the cascade. With the limit on, in the FAR cascade's calls only,
+// PdzShadowCasterCount takes out of that list the objects that are both small (bounding radius, object + 60, under
+// pdz_long_shadows_far_caster_radius_cm) and far (centre, object + 48, further from the camera than
+// pdz_long_shadows_far_caster_from_cm + the radius). The object is entry[10 + slot] (slot = 1 - [82FBE3C0], as
+// 82411AD4 / 82411D48 read it). The camera position is the one PdzShadowCasterBox saw last (the setup's camera matrix,
+// row 3). The level's own geometry and the characters are not in this list; the near cascade's calls are not touched;
+// with the caster box at Rare's size (long shadows off) nothing is done. Off: one cvar read per shadow pass.
+REXCVAR_DEFINE_BOOL(pdz_long_shadows_far_caster_limit, false, "Render",
+                    "Long shadows, performance (Mon 16 Nov): small far objects (plants, small props) are not drawn "
+                    "into the far sun-shadow map; large objects, the level's own geometry and characters still are, "
+                    "and the near map is unchanged. Small = bounding radius under "
+                    "pdz_long_shadows_far_caster_radius_cm; far = further from the camera than "
+                    "pdz_long_shadows_far_caster_from_cm. Saves game-thread draw work in the shadow pass; those "
+                    "objects lose their shadow beyond the near map. Only acts while the longer shadows are on. With "
+                    "pdz_frame_timing a 'pdz_shadow: far caster limit' line every 600 shadow passes. Off = every "
+                    "caster in both maps")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(pdz_long_shadows_far_caster_radius_cm, 200.0, "Render",
+                      "pdz_long_shadows_far_caster_limit: an object with a bounding radius under this many cm counts "
+                      "as small")
+    .range(0.0, 100000.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(pdz_long_shadows_far_caster_from_cm, 2400.0, "Render",
+                      "pdz_long_shadows_far_caster_limit: small objects further from the camera than this many cm "
+                      "(plus their radius) are left out of the far map. 2400 = about the reach of the game's own "
+                      "caster box, so the longer shadows' extra reach is kept for large objects only")
+    .range(0.0, 100000.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+// Near-map caster cull (Mon 16 Nov night, step 2a part two; pdz_long_shadows_near_caster_cull, on since Tue 17 Nov): picture-identical.
+// Per cascade the pass builds the caster matrix C = A x V[i] x P[i] (8260CD18-8260CD60, sub_827D4E08 twice; row
+// vectors): A = the pass's r6 (kept in r20), V = the light view table 82FBD2C0, P = the light projection table
+// 82FBD6C0 (64 bytes each), i = 2 (2 view + cascade) + [82E0A0DC] (view = the pass's r8, kept in r24), and sets user
+// clip planes from C's side planes, so nothing outside the map's rectangle is ever written to it. The projection is
+// orthographic along the sun, so a caster whose bounding sphere lies wholly outside the rectangle in light x or y
+// (clip |x| or |y| - radius > 1) cannot write a texel whatever its depth. In the NEAR cascade's calls those casters
+// are taken out of the selection list (the far cascade draws them as before). Kept whenever in doubt: C not affine
+// (w not 1), a bad pointer, a NaN. pdz_long_shadows_near_caster_margin_cm widens the rectangle. PdzShadowPassBegin
+// takes r20 / r24 for this (midasm_hooks_tu3.toml: registers = ["r20", "r24"]).
+REXCVAR_DEFINE_BOOL(pdz_long_shadows_near_caster_cull, true, "Render",
+                    "Long shadows, performance (Mon 16 Nov): objects that cannot reach the near sun-shadow map (their "
+                    "bounding sphere is wholly outside the map's rectangle as the sun sees it) are not drawn into it. "
+                    "The game draws every caster into both maps and lets the GPU clip the near map's away; this "
+                    "skips that draw work on the game thread. No change to the picture is intended. Only acts while "
+                    "the longer shadows are on. Off = every caster drawn into both maps")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(pdz_long_shadows_near_caster_margin_cm, 50.0, "Render",
+                      "pdz_long_shadows_near_caster_cull: safety margin in cm added to every object's bounding radius "
+                      "(raise it if a near shadow is ever missing)")
+    .range(0.0, 100000.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_INT32(pdz_long_shadows_far_caster_radius_offset, -1, "Render",
+                     "pdz_long_shadows_far_caster_limit / pdz_long_shadows_near_caster_cull: where the object's "
+                     "bounding radius is read (the offset of a float in the object; -1 = the model's value, "
+                     "[[entry] + 4] + 56). The 'pdz_shadow: caster fields' log line shows the candidates' ranges")
+    .range(-1, 508)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+namespace
+{
+  constexpr uint32_t kCascadeLightView = 0x82FBD2C0; // V[i], 64 bytes each
+  constexpr uint32_t kCascadeLightProj = 0x82FBD6C0; // P[i]
+  constexpr uint32_t kCascadeTableFlag = 0x82E0A0DC; // [82E09F3C + 416]
+  constexpr uint32_t kCascadeTableSize = 16;         // entries in each table (1024 bytes between the two)
+  constexpr uint32_t kShadowCascadeIndex = 0x82E09F08; // sub_8260C8C0's cascade loop counter (0 near, 1 far)
+  constexpr uint32_t kCasterList = 0x82D7CF00;         // sub_824119A0's selection: r20 render table entry pointers
+  constexpr uint32_t kCasterSlotFlag = 0x82FBE3C0;     // slot = 1 - this (82411AD0)
+  constexpr uint32_t kCasterListMax = 2500;            // the selection loop's table size
+
+  constexpr int kNearCands = 5;
+  const char *const kNearCandNames[kNearCands] = {"A*V*P", "V*P", "(P*V*A)t", "(P*V)t", "inv(A)*V*P"};
+  constexpr int kDiagFields = 5;
+  constexpr int kDiagOffsets[kDiagFields] = {44, 60, 64, 76, -1}; // -1: the model's [[entry] + 4] + 56
+  struct NearCand
+  {
+    bool affine = false;
+    float x[4] = {}, y[4] = {};
+    float sx = 0.0f, sy = 0.0f;
+    float cam[2] = {}, ahead[2] = {}; // clip x, y of the camera and of the point 150 cm ahead of it
+    bool inside = false;              // affine and both points inside the map (|x|, |y| <= 1.02)
+    uint32_t close_in = 0;            // sampled pass: casters within 500 cm of the camera whose centre is inside
+  };
+  struct FarCasterLimit
+  {
+    bool pass = false;   // inside a shadow pass with the limit in effect
+    bool camera = false; // cam is valid
+    float cam[3] = {};
+    uint32_t passes = 0;
+    uint64_t dropped = 0, kept = 0, near_drawn = 0;
+    uint64_t far_small = 0, far_large = 0; // of the far cascade's list: under / over the radius (any distance)
+    // pdz_long_shadows_near_caster_cull
+    bool far_on = false, near_on = false; // the two switches as read at the pass's start
+    uint32_t matrix_a = 0, view = 0;      // the pass's r20 / r24
+    bool near_ready = false, near_ok = false; // the near cascade's matrix was built this pass / is usable
+    float near_x[4] = {}, near_y[4] = {};     // clip x / y = dot((c, 1), these): the candidate picked
+    float near_sx = 0.0f, near_sy = 0.0f;     // clip units per cm of radius
+    uint64_t near_dropped = 0;
+    // The self-check: the candidate conventions for the near cascade's caster matrix (kNearCands), the camera's
+    // forward axis, and one sampled pass per log period (the first) for the diagnostic lines.
+    bool fwd_ok = false;
+    float fwd[3] = {};
+    NearCand cand[kNearCands];
+    int pick = -1;
+    bool sampled = false;
+    uint32_t close_total = 0;         // casters within 500 cm of the camera in the sampled near call
+    std::vector<float> fields[kDiagFields];
+  };
+  FarCasterLimit g_far_limit;
+
+  // The object's bounding radius for the two switches (pdz_long_shadows_far_caster_radius_offset).
+  float CasterRadius(const uint8_t *base, uint32_t entry, uint32_t object, int offset)
+  {
+    // Sun 22 Nov night (audit): each hop only while it is there (NaN = the caster is kept, as before).
+    using pdz::guestmem::Ok;
+    if (offset >= 0)
+    {
+      return Ok(base, object + uint32_t(offset), 4)
+                 ? pdz::shadow::BitsToFloat(pdz::shadow::Load32(base, object + uint32_t(offset)))
+                 : std::numeric_limits<float>::quiet_NaN();
+    }
+    const uint32_t a = Ok(base, entry, 4) ? pdz::shadow::Load32(base, entry) : 0;
+    if (!pdz::shadow::IsGuestPointer(a) || !Ok(base, a + 4, 4))
+    {
+      return std::numeric_limits<float>::quiet_NaN();
+    }
+    const uint32_t model = pdz::shadow::Load32(base, a + 4);
+    return pdz::shadow::IsGuestPointer(model) && Ok(base, model + 56, 4)
+               ? pdz::shadow::BitsToFloat(pdz::shadow::Load32(base, model + 56))
+               : std::numeric_limits<float>::quiet_NaN();
+  }
+
+  struct M4
+  {
+    float m[4][4];
+  };
+  M4 Mul(const M4 &a, const M4 &b)
+  {
+    M4 out;
+    for (uint32_t r = 0; r < 4; ++r)
+    {
+      for (uint32_t c = 0; c < 4; ++c)
+      {
+        out.m[r][c] = a.m[r][0] * b.m[0][c] + a.m[r][1] * b.m[1][c] + a.m[r][2] * b.m[2][c] + a.m[r][3] * b.m[3][c];
+      }
+    }
+    return out;
+  }
+  M4 Transposed(const M4 &a)
+  {
+    M4 out;
+    for (uint32_t r = 0; r < 4; ++r)
+    {
+      for (uint32_t c = 0; c < 4; ++c)
+      {
+        out.m[r][c] = a.m[c][r];
+      }
+    }
+    return out;
+  }
+  // The inverse of a rigid row-vector transform (v R + t): rotation transposed, translation -t Rt.
+  M4 RigidInverse(const M4 &a)
+  {
+    M4 out{};
+    for (uint32_t r = 0; r < 3; ++r)
+    {
+      for (uint32_t c = 0; c < 3; ++c)
+      {
+        out.m[r][c] = a.m[c][r];
+      }
+    }
+    for (uint32_t c = 0; c < 3; ++c)
+    {
+      out.m[3][c] = -(a.m[3][0] * out.m[0][c] + a.m[3][1] * out.m[1][c] + a.m[3][2] * out.m[2][c]);
+    }
+    out.m[3][3] = 1.0f;
+    return out;
+  }
+
+  // The near cascade's caster matrix of this pass in every plausible convention; the one picked is the only one that
+  // puts the camera and the point 150 cm ahead of it inside the near map (several that agree count as one).
+  void BuildNearMatrix(FarCasterLimit &f, const uint8_t *base)
+  {
+    f.near_ready = true;
+    f.near_ok = false;
+    f.pick = -1;
+    const uint32_t i = 2 * (2 * f.view) + pdz::shadow::Load32(base, kCascadeTableFlag); // cascade 0
+    if (i >= kCascadeTableSize || !pdz::shadow::IsGuestPointer(f.matrix_a) || !f.camera || !f.fwd_ok)
+    {
+      for (NearCand &c : f.cand)
+      {
+        c = NearCand{};
+      }
+      return;
+    }
+    auto read = [base](uint32_t address) {
+      M4 m;
+      for (uint32_t k = 0; k < 16; ++k)
+      {
+        m.m[k / 4][k % 4] = pdz::shadow::BitsToFloat(pdz::shadow::Load32(base, address + 4 * k));
+      }
+      return m;
+    };
+    const M4 a = read(f.matrix_a), v = read(kCascadeLightView + 64 * i), p = read(kCascadeLightProj + 64 * i);
+    const M4 vp = Mul(v, p), pv = Mul(p, v);
+    const M4 mats[kNearCands] = {Mul(a, vp), vp, Transposed(Mul(pv, a)), Transposed(pv), Mul(RigidInverse(a), vp)};
+    const float ahead[3] = {f.cam[0] + 150.0f * f.fwd[0], f.cam[1] + 150.0f * f.fwd[1], f.cam[2] + 150.0f * f.fwd[2]};
+    int inside = 0;
+    for (int k = 0; k < kNearCands; ++k)
+    {
+      const M4 &c = mats[k];
+      NearCand &n = f.cand[k];
+      const uint32_t close_in = n.close_in;
+      n = NearCand{};
+      n.close_in = close_in;
+      for (uint32_t r = 0; r < 4; ++r)
+      {
+        n.x[r] = c.m[r][0];
+        n.y[r] = c.m[r][1];
+      }
+      n.sx = std::sqrt(c.m[0][0] * c.m[0][0] + c.m[1][0] * c.m[1][0] + c.m[2][0] * c.m[2][0]);
+      n.sy = std::sqrt(c.m[0][1] * c.m[0][1] + c.m[1][1] * c.m[1][1] + c.m[2][1] * c.m[2][1]);
+      // Usable only if affine (orthographic: w = 1 everywhere) and with a real scale; a NaN fails every test here.
+      n.affine = std::fabs(c.m[0][3]) < 1e-6f && std::fabs(c.m[1][3]) < 1e-6f && std::fabs(c.m[2][3]) < 1e-6f &&
+                 std::fabs(c.m[3][3] - 1.0f) < 1e-4f && n.sx > 1e-9f && n.sy > 1e-9f && n.sx < 1.0f && n.sy < 1.0f;
+      n.cam[0] = f.cam[0] * n.x[0] + f.cam[1] * n.x[1] + f.cam[2] * n.x[2] + n.x[3];
+      n.cam[1] = f.cam[0] * n.y[0] + f.cam[1] * n.y[1] + f.cam[2] * n.y[2] + n.y[3];
+      n.ahead[0] = ahead[0] * n.x[0] + ahead[1] * n.x[1] + ahead[2] * n.x[2] + n.x[3];
+      n.ahead[1] = ahead[0] * n.y[0] + ahead[1] * n.y[1] + ahead[2] * n.y[2] + n.y[3];
+      n.inside = n.affine && std::fabs(n.cam[0]) <= 1.02f && std::fabs(n.cam[1]) <= 1.02f &&
+                 std::fabs(n.ahead[0]) <= 1.02f && std::fabs(n.ahead[1]) <= 1.02f;
+      if (!n.inside)
+      {
+        continue;
+      }
+      ++inside;
+      if (f.pick < 0)
+      {
+        f.pick = k;
+      }
+      else
+      {
+        // A second candidate inside: it must be the same projection as the first, or nothing is usable.
+        const NearCand &q = f.cand[f.pick];
+        float diff = 0.0f;
+        for (uint32_t r = 0; r < 4; ++r)
+        {
+          diff = std::max({diff, std::fabs(q.x[r] - n.x[r]) / (r < 3 ? q.sx : 1.0f),
+                           std::fabs(q.y[r] - n.y[r]) / (r < 3 ? q.sy : 1.0f)});
+        }
+        if (!(diff < 1e-3f))
+        {
+          f.pick = -2;
+          break;
+        }
+      }
+    }
+    if (f.pick >= 0)
+    {
+      const NearCand &q = f.cand[f.pick];
+      std::copy(q.x, q.x + 4, f.near_x);
+      std::copy(q.y, q.y + 4, f.near_y);
+      f.near_sx = q.sx;
+      f.near_sy = q.sy;
+      f.near_ok = true;
+    }
+  }
+
+  // The sampled pass (the first of each log period): per candidate, how many of the casters within 500 cm of the
+  // camera have their centre inside the near map; and the candidate radius fields of every caster in the list.
+  void SampleCasters(FarCasterLimit &f, const uint8_t *base, uint32_t n, uint32_t slot, bool near_call)
+  {
+    auto loadf = [base](uint32_t address) { return pdz::shadow::BitsToFloat(pdz::shadow::Load32(base, address)); };
+    for (uint32_t i = 0; i < n; ++i)
+    {
+      const uint32_t entry = pdz::shadow::Load32(base, kCasterList + 4 * i);
+      if (!pdz::shadow::IsGuestPointer(entry))
+      {
+        continue;
+      }
+      const uint32_t object = pdz::shadow::Load32(base, entry + 4 * (10 + slot));
+      if (!pdz::shadow::IsGuestPointer(object))
+      {
+        continue;
+      }
+      if (!near_call)
+      {
+        for (int k = 0; k < kDiagFields; ++k)
+        {
+          if (f.fields[k].size() < 4096)
+          {
+            f.fields[k].push_back(CasterRadius(base, entry, object, kDiagOffsets[k]));
+          }
+        }
+        continue;
+      }
+      const float cx = loadf(object + 48), cy = loadf(object + 52), cz = loadf(object + 56);
+      const float dx = cx - f.cam[0], dy = cy - f.cam[1], dz = cz - f.cam[2];
+      if (!(dx * dx + dy * dy + dz * dz < 500.0f * 500.0f))
+      {
+        continue;
+      }
+      ++f.close_total;
+      for (NearCand &c : f.cand)
+      {
+        const float x = cx * c.x[0] + cy * c.x[1] + cz * c.x[2] + c.x[3];
+        const float y = cx * c.y[0] + cy * c.y[1] + cz * c.y[2] + c.y[3];
+        c.close_in += std::fabs(x) <= 1.0f && std::fabs(y) <= 1.0f;
+      }
+    }
+  }
+
+  // The near cascade's selection list without the casters wholly outside the map's rectangle; r20 = the new count.
+  void CullNearCasters(FarCasterLimit &f, uint8_t *base, PPCRegister &r20)
+  {
+    const uint32_t n = r20.u32;
+    if (!f.near_ready)
+    {
+      BuildNearMatrix(f, base);
+    }
+    const uint32_t slot = 1u - pdz::shadow::Load32(base, kCasterSlotFlag);
+    if (n == 0 || n > kCasterListMax || slot > 1)
+    {
+      f.near_drawn += n;
+      return;
+    }
+    if (f.passes == 0 && f.camera)
+    {
+      SampleCasters(f, base, n, slot, true);
+    }
+    if (!f.near_ok)
+    {
+      f.near_drawn += n;
+      return;
+    }
+    const float margin = float(REXCVAR_GET(pdz_long_shadows_near_caster_margin_cm));
+    const int offset = REXCVAR_GET(pdz_long_shadows_far_caster_radius_offset);
+    auto loadf = [base](uint32_t address) { return pdz::shadow::BitsToFloat(pdz::shadow::Load32(base, address)); };
+    uint32_t out = 0;
+    for (uint32_t i = 0; i < n; ++i)
+    {
+      const uint32_t entry = pdz::shadow::Load32(base, kCasterList + 4 * i);
+      bool drop = false;
+      if (pdz::shadow::IsGuestPointer(entry))
+      {
+        const uint32_t object = pdz::shadow::Load32(base, entry + 4 * (10 + slot));
+        if (pdz::shadow::IsGuestPointer(object))
+        {
+          const float cx = loadf(object + 48), cy = loadf(object + 52), cz = loadf(object + 56);
+          const float reach = CasterRadius(base, entry, object, offset) + margin;
+          const float x = cx * f.near_x[0] + cy * f.near_x[1] + cz * f.near_x[2] + f.near_x[3];
+          const float y = cx * f.near_y[0] + cy * f.near_y[1] + cz * f.near_y[2] + f.near_y[3];
+          // Every comparison is false for a NaN: the caster is kept. A negative or huge radius keeps it too.
+          drop = reach >= margin && reach < 1.0e6f &&
+                 (std::fabs(x) - reach * f.near_sx > 1.0f || std::fabs(y) - reach * f.near_sy > 1.0f);
+        }
+      }
+      if (drop)
+      {
+        continue;
+      }
+      if (out != i)
+      {
+        uint32_t bits = pdz::shadow::Swap32(entry);
+        std::memcpy(const_cast<uint8_t *>(pdz::shadow::GuestPtr(base, kCasterList + 4 * out)), &bits, sizeof(bits));
+      }
+      ++out;
+    }
+    f.near_dropped += n - out;
+    f.near_drawn += out;
+    r20.u64 = out;
+  }
+
+  // The far cascade's selection list, compacted in place; r20 = the new count.
+  void LimitFarCasters(PPCRegister &r20)
+  {
+    FarCasterLimit &f = g_far_limit;
+    uint8_t *base = rex::Runtime::instance()->virtual_membase();
+    const uint32_t n = r20.u32;
+    const uint32_t cascade = pdz::shadow::Load32(base, kShadowCascadeIndex);
+    if (cascade == 0 && f.near_on)
+    {
+      CullNearCasters(f, base, r20);
+      return;
+    }
+    if (cascade == 1 && f.passes == 0 && n <= kCasterListMax)
+    {
+      const uint32_t sample_slot = 1u - pdz::shadow::Load32(base, kCasterSlotFlag);
+      if (sample_slot <= 1)
+      {
+        SampleCasters(f, base, n, sample_slot, false);
+      }
+    }
+    if (cascade != 1 || !f.far_on)
+    {
+      (cascade == 1 ? f.kept : f.near_drawn) += n;
+      return;
+    }
+    const uint32_t slot = 1u - pdz::shadow::Load32(base, kCasterSlotFlag);
+    if (!f.camera || n == 0 || n > kCasterListMax || slot > 1)
+    {
+      f.kept += n;
+      return;
+    }
+    const float small_cm = float(REXCVAR_GET(pdz_long_shadows_far_caster_radius_cm));
+    const int radius_offset = REXCVAR_GET(pdz_long_shadows_far_caster_radius_offset);
+    const float from = float(REXCVAR_GET(pdz_long_shadows_far_caster_from_cm));
+    auto loadf = [base](uint32_t address) { return pdz::shadow::BitsToFloat(pdz::shadow::Load32(base, address)); };
+    uint32_t out = 0;
+    for (uint32_t i = 0; i < n; ++i)
+    {
+      const uint32_t entry = pdz::shadow::Load32(base, kCasterList + 4 * i);
+      bool drop = false;
+      if (pdz::shadow::IsGuestPointer(entry))
+      {
+        const uint32_t object = pdz::shadow::Load32(base, entry + 4 * (10 + slot));
+        if (pdz::shadow::IsGuestPointer(object))
+        {
+          const float radius = CasterRadius(base, entry, object, radius_offset);
+          if (radius >= 0.0f && radius < small_cm)
+          {
+            ++f.far_small;
+            const float dx = loadf(object + 48) - f.cam[0], dy = loadf(object + 52) - f.cam[1],
+                        dz = loadf(object + 56) - f.cam[2];
+            const float reach = from + radius;
+            drop = dx * dx + dy * dy + dz * dz > reach * reach; // false for a NaN
+          }
+          else
+          {
+            ++f.far_large;
+          }
+        }
+      }
+      if (drop)
+      {
+        continue;
+      }
+      if (out != i)
+      {
+        uint32_t bits = pdz::shadow::Swap32(entry);
+        std::memcpy(const_cast<uint8_t *>(pdz::shadow::GuestPtr(base, kCasterList + 4 * out)), &bits, sizeof(bits));
+      }
+      ++out;
+    }
+    f.dropped += n - out;
+    f.kept += out;
+    r20.u64 = out;
+  }
+} // namespace
+
 void PdzShadowCasterBox(PPCRegister &r31, PPCRegister &r10, PPCRegister &r11, PPCRegister &r28)
 {
   // cutscene_dump.h: the frame's camera matrix, read only (pdz_cutscene_frame_dump; one load while off).
@@ -801,6 +1311,22 @@ void PdzShadowCasterBox(PPCRegister &r31, PPCRegister &r10, PPCRegister &r11, PP
   {
     return;
   }
+  if (REXCVAR_GET(pdz_long_shadows_far_caster_limit) || REXCVAR_GET(pdz_long_shadows_near_caster_cull))
+  {
+    // The camera looks along -z of its matrix (the caster box centre is M (0, 0, -1000)): row 2 negated.
+    const float len = std::sqrt(row2[0] * row2[0] + row2[1] * row2[1] + row2[2] * row2[2]);
+    g_far_limit.fwd_ok = len > 1e-6f;
+    for (uint32_t i = 0; i < 3 && g_far_limit.fwd_ok; ++i)
+    {
+      g_far_limit.fwd[i] = -row2[i] / len;
+    }
+    // The camera position (row 3 of the camera matrix, row vectors): for the far-map caster limit.
+    g_far_limit.camera = std::fabs(row3[3]) > 1e-6f;
+    for (uint32_t i = 0; i < 3 && g_far_limit.camera; ++i)
+    {
+      g_far_limit.cam[i] = row3[i] / row3[3];
+    }
+  }
   const uint32_t p0 = light + 1472 + 12 * idx, p1 = light + 1568 + 12 * idx, radius = light + r11.u32;
   for (uint32_t i = 0; i < 3; ++i)
   {
@@ -820,8 +1346,20 @@ void PdzShadowCasterBox(PPCRegister &r31, PPCRegister &r10, PPCRegister &r11, PP
 
 // Mid-function hook (midasm_hooks_tu3.toml), before T 8260C8F4 (lwz r31,8(r16)) in the shadow pass sub_8260C8C0,
 // after its prologue: the pass's start (pdz_frame_timing only).
-void PdzShadowPassBegin()
+void PdzShadowPassBegin(PPCRegister &r20, PPCRegister &r24)
 {
+  {
+    FarCasterLimit &f = g_far_limit;
+    f.far_on = REXCVAR_GET(pdz_long_shadows_far_caster_limit);
+    f.near_on = REXCVAR_GET(pdz_long_shadows_near_caster_cull);
+    f.pass = (f.far_on || f.near_on) && CasterScale() > 1.0f;
+    if (f.pass)
+    {
+      f.matrix_a = r20.u32;
+      f.view = r24.u32;
+      f.near_ready = false;
+    }
+  }
   if (!pdz::timing::Enabled())
   {
     g_casters.in_pass = false;
@@ -837,6 +1375,10 @@ void PdzShadowPassBegin()
 // sub_8261D310), r15 = the pass flags (0x4001 there). Adds them to the shadow pass in progress (pdz_frame_timing only).
 void PdzShadowCasterCount(PPCRegister &r15, PPCRegister &r16, PPCRegister &r20)
 {
+  if (g_far_limit.pass && r16.u32 == 2 && (r15.u32 & 0xFFFFu) == 0x4001u)
+  {
+    LimitFarCasters(r20); // pdz_long_shadows_far_caster_limit: the far cascade's list without its small far objects
+  }
   if (!g_casters.in_pass || r16.u32 != 2 || (r15.u32 & 0xFFFFu) != 0x4001u)
   {
     return;
@@ -848,6 +1390,64 @@ void PdzShadowCasterCount(PPCRegister &r15, PPCRegister &r16, PPCRegister &r20)
 // its paths reach: the pass's end; every kCasterLogPasses passes one 'pdz_shadow: casters' line.
 void PdzShadowPassEnd()
 {
+  if (g_far_limit.pass)
+  {
+    FarCasterLimit &f = g_far_limit;
+    f.pass = false;
+    if (++f.passes >= kCasterLogPasses)
+    {
+      if (pdz::timing::Enabled())
+      {
+        const double n = double(f.passes);
+        PDZ_LOG_DEFERRED("pdz_shadow: far caster limit (pdz_long_shadows_far_caster_limit, last {} shadow passes) | "
+                         "far map per pass: dropped {:.1f}, kept {:.1f} (objects under {:g} cm radius {:.1f}, others "
+                         "{:.1f}; dropped = small and over {:g} cm from the camera) | near map per pass: {:.1f} drawn, "
+                         "{:.1f} dropped (pdz_long_shadows_near_caster_cull {}, matrix {})",
+                         f.passes, double(f.dropped) / n, double(f.kept) / n,
+                         REXCVAR_GET(pdz_long_shadows_far_caster_radius_cm), double(f.far_small) / n,
+                         double(f.far_large) / n, REXCVAR_GET(pdz_long_shadows_far_caster_from_cm),
+                         double(f.near_drawn) / n, double(f.near_dropped) / n, f.near_on ? "on" : "off",
+                         !f.near_on ? "n/a" : f.near_ok ? kNearCandNames[f.pick] : "NOT usable: nothing culled");
+        if (f.near_on)
+        {
+          std::string line;
+          for (int k = 0; k < kNearCands; ++k)
+          {
+            const NearCand &c = f.cand[k];
+            line += fmt::format(" | {}: {}camera {:.2f},{:.2f} ahead {:.2f},{:.2f} close casters inside {}/{}{}",
+                                kNearCandNames[k], c.affine ? "" : "not affine, ", c.cam[0], c.cam[1], c.ahead[0],
+                                c.ahead[1], c.close_in, f.close_total, k == f.pick ? " PICKED" : "");
+          }
+          PDZ_LOG_DEFERRED("pdz_shadow: near cull candidates (clip x,y of the camera {:.0f},{:.0f},{:.0f} and of the "
+                           "point 150 cm ahead; a usable one has all four within 1; casters within 500 cm of the "
+                           "camera, one sampled pass){}{}",
+                           f.cam[0], f.cam[1], f.cam[2], line,
+                           f.pick == -2 ? " | two candidates inside disagree" : "");
+        }
+        std::string fields;
+        for (int k = 0; k < kDiagFields; ++k)
+        {
+          std::vector<float> &v = f.fields[k];
+          std::sort(v.begin(), v.end(), [](float a, float b) { return (std::isnan(a) ? -1e30f : a) < (std::isnan(b) ? -1e30f : b); });
+          const std::string name = kDiagOffsets[k] < 0 ? std::string("model+56 (offset -1)") : fmt::format("object+{}", kDiagOffsets[k]);
+          fields += v.empty() ? fmt::format(" | {}: none", name)
+                              : fmt::format(" | {}: min {:g} median {:g} max {:g}", name, v.front(), v[v.size() / 2], v.back());
+        }
+        PDZ_LOG_DEFERRED("pdz_shadow: caster fields (far map list, one sampled pass, {} objects; radius read at "
+                         "pdz_long_shadows_far_caster_radius_offset {}){}",
+                         f.fields[0].size(), REXCVAR_GET(pdz_long_shadows_far_caster_radius_offset), fields);
+      }
+      const bool camera = f.camera;
+      const float cam[3] = {f.cam[0], f.cam[1], f.cam[2]};
+      const bool fwd_ok = f.fwd_ok;
+      const float fwd[3] = {f.fwd[0], f.fwd[1], f.fwd[2]};
+      f = FarCasterLimit{};
+      f.camera = camera;
+      std::copy(cam, cam + 3, f.cam);
+      f.fwd_ok = fwd_ok;
+      std::copy(fwd, fwd + 3, f.fwd);
+    }
+  }
   CasterStats &s = g_casters;
   if (!s.in_pass)
   {
@@ -871,3 +1471,239 @@ void PdzShadowPassEnd()
               s.pass_ms / s.passes, s.pass_ms_max, s.box_calls ? s.box_us / double(s.box_calls) : 0.0, s.box_calls);
   s = CasterStats{};
 }
+
+// "Long shadows" preset (Mon 16 Nov): one switch for the recommended combination of the settings above, for the
+// Graphics tab later. pdz_long_shadows on sets pdz_shadow_distance_scale / pdz_shadow_far_pcf / pdz_shadow_bias_scale to
+// the preset's values; off sets them back to the game's own (1 / 0 / 1). Applied when the switch changes (and once
+// before the first shader is prepared when it is on from the start); with the switch never on, nothing is written, so
+// the stock settings and hand-set values are untouched. The shadow map size stays the stock one (pdz_shadow_map_scale
+// needs a restart and costs memory and four large depth resolves a frame; the preset does not need it). F7
+// (bind_long_shadows) switches it while playing, to compare with the game's own shadows.
+REXCVAR_DEFINE_BOOL(pdz_long_shadows, false, "Render",
+                    "Enhancement, native renderer: longer sun shadows, as one switch. The game's shadows end at 20 m; "
+                    "on: they reach 60 m with soft far edges (pdz_shadow_distance_scale = pdz_long_shadows_distance, "
+                    "3; pdz_shadow_far_pcf 1, the far bias x4, the stock shadow map size, "
+                    "pdz_shadow_far_object_fade_fix on). Off: "
+                    "the game's own. F7 switches it while playing")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+// Round 2 (Mon 16 Nov evening): how far the preset reaches. Beyond the cut-off the game draws NO sun / moon shadow at
+// all (the mask fades every cascade result to "lit" between the fade start and the far cascade's end), so ground under
+// a far cliff is lit until the player is within the cut-off (Mansion grounds: the snow under the big rock; Jungle: the
+// foliage that turns dark on approach). The level's big pieces are in both cascades' maps and not in the caster box,
+// so only the cut-off decides. The first preset stopped at 40 m; 3 = 60 m is the longest the shadow study toured
+// (River, Jungle: no new fault). The far bias is kept at the study's x4 for any distance (bias scale = 1 / distance,
+// since the bias grows with the texel size by itself); the caster box for plants and props follows the distance too
+// (pdz_shadow_caster_scale = the distance while the preset is on).
+REXCVAR_DEFINE_DOUBLE(pdz_long_shadows_distance, 3.0, "Render",
+                      "With pdz_long_shadows on: how far the shadows reach, as a multiple of the game's 20 m. 2 = 40 m "
+                      "(fading from 32 m), 3 = 60 m (fading from 48 m), 4 = 80 m: the game draws no shadow beyond that "
+                      "distance, so ground under a far cliff or tree looks lit until you are that close. Further costs "
+                      "more and makes far shadows coarser. Plants and props cast their shadows over the same "
+                      "distance, which is the larger part of the cost where there are many of them. Range 2-4")
+    .range(2.0, 4.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+// Last job of Mon 16 Nov (plants' shading still appearing on approach at 60 m): leaf-on-leaf shadows are smaller than
+// the far cascade's bias and texels, so they only showed inside the near cascade (9 m at distance 3). With the preset
+// on: the shadow maps at twice the size (the far bias follows the texel size by itself: x2 instead of x4) and the near
+// cascade's end twice as far again (18 m at distance 3; its texels are then the size the shadow study toured at
+// distance 3 with the stock maps).
+// Overnight Mon 16 / Tue 17 Nov: both are chosen by the graphics card's dedicated video memory when left at 0
+// (automatic): map scale 2 / split 2 (18 m at 60 m), or map scale 3 / split 3 (27 m) on a card with 12 GB or more
+// (hand test at 4K: split 3 alone looked blockier, with map scale 3 much better; the shadow maps took about 3.4 GB at
+// x3 against 1.5 GB at x2, 7.3 GB in all). A value of 1 or more is the player's own and is kept.
+REXCVAR_DEFINE_INT32(pdz_long_shadows_map_scale, 0, "Render",
+                     "With pdz_long_shadows on: the shadow maps' size, as pdz_shadow_map_scale (1 = the game's, 2 = "
+                     "twice the side: finer far shadows and less bias, so leaves shade each other further away). "
+                     "0 = automatic: 2, or 3 on a graphics card with 12 GB or more of video memory. Costs video "
+                     "memory (the log's 'shadow map scale' line gives the figure) and some GPU time. Read once, when "
+                     "the game starts. Range 0-4")
+    .range(0, 4);
+REXCVAR_DEFINE_DOUBLE(pdz_long_shadows_split, 0.0, "Render",
+                      "With pdz_long_shadows on: how much further the sharp near shadow map reaches, on top of the "
+                      "long shadows distance (1 = 3 m x the distance, 2 = twice that: 18 m at 60 m, 3 = 27 m). "
+                      "Further = fine self-shadowing on plants from further away, but a coarser near map unless the "
+                      "shadow maps are larger too. 0 = automatic: 2, or 3 on a graphics card with 12 GB or more of "
+                      "video memory. Range 0-4")
+    .range(0.0, 4.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(pdz_long_shadows_object_fade, 1.0, "Render",
+                      "With pdz_long_shadows on: the length of an object's own shadow fade in the far shadow map, as a "
+                      "multiple of the game's (plants, props, characters: the shade right behind and under them). 1 = "
+                      "the game's length, the same as in the near map. More makes far plants darker, but brings "
+                      "back object shadows drawn inside a wall's baked shade (MP Desert) as it nears 4. Range 1-4")
+    .range(1.0, 4.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_STRING(pdz_long_shadows_skip_levels, "outpost", "Render",
+                      "With pdz_long_shadows on: the single player levels that keep the game's own shadows (names as "
+                      "pdz_sp_60_levels takes them, separated by commas). Outpost: its start area is over the 120 fps "
+                      "frame time with the game's own shadows already, and the longer shadows draw about 30% more "
+                      "there. Empty: long shadows on every level")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+namespace pdz::pace
+{
+  std::string SpLevelName(const uint8_t *base, std::string *raw); // game_pace.cpp
+}
+
+namespace pdz::transwater
+{
+  void ShowStatus(const std::string &text, int seconds); // the on-screen label (transparency_water.cpp)
+}
+
+namespace pdz::sunshadow
+{
+  namespace
+  {
+    constexpr double kPresetFarPcf = 1.0; // texels
+    // pdz_long_shadows_distance within 2-4 (3 when it is not a number).
+    double PresetDistance()
+    {
+      const double v = REXCVAR_GET(pdz_long_shadows_distance);
+      return v >= 2.0 && v <= 4.0 ? v : v > 4.0 ? 4.0 : v < 2.0 ? 2.0 : 3.0;
+    }
+    // The far bias factor stays x4 (16-123 cm) at any distance: texel size (x distance) x 4 x (1 / distance).
+    double PresetBias(double distance) { return 1.0 / distance; }
+    std::atomic<bool> g_preset_applied{false};
+    std::atomic<double> g_preset_distance{0.0}; // the distance last applied (0: the preset is off)
+    std::atomic<bool> g_preset_level_skipped{false};
+    uint32_t g_preset_level_tick = 0; // game thread
+    // The shadow mask shader is patched (far PCF, the object fade fix) only at its first use. 0: not prepared yet,
+    // 1: prepared with the long shadows' patches, 2: prepared without them (the preset was off then): switching the
+    // preset on now would bring back the object shadows inside baked shade, so it stays off until a restart.
+    std::atomic<int> g_mask_shader_state{0};
+    std::atomic<bool> g_preset_blocked_logged{false};
+
+    // Is the level being played on pdz_long_shadows_skip_levels? Asked on the game thread, about twice a second.
+    bool LevelSkipped()
+    {
+      const std::string list = REXCVAR_GET(pdz_long_shadows_skip_levels);
+      if (list.empty())
+      {
+        return false;
+      }
+      const std::string level = pdz::pace::SpLevelName(rex::Runtime::instance()->virtual_membase(), nullptr);
+      if (level.empty())
+      {
+        return false;
+      }
+      size_t at = 0;
+      while (at <= list.size())
+      {
+        size_t end = list.find_first_of(", ;", at);
+        if (end == std::string::npos)
+        {
+          end = list.size();
+        }
+        if (end > at && list.compare(at, end - at, level) == 0)
+        {
+          return true;
+        }
+        at = end + 1;
+      }
+      return false;
+    }
+    rex::ui::Window *g_window = nullptr;
+  } // namespace
+
+  // Called before the first shader patch decision (native_coissue.cpp) and at every shadow setup: cheap when nothing
+  // changed.
+  void ApplyPreset(bool game_thread)
+  {
+    const bool wanted = REXCVAR_GET(pdz_long_shadows);
+    if (game_thread && wanted && (g_preset_level_tick++ % 64u) == 0)
+    {
+      const bool skip = LevelSkipped();
+      if (g_preset_level_skipped.exchange(skip, std::memory_order_relaxed) != skip)
+      {
+        REXLOG_INFO("pdz_shadow: long shadows: this level is {} pdz_long_shadows_skip_levels: {}",
+                    skip ? "on" : "not on", skip ? "the game's own shadows here" : "long shadows");
+      }
+    }
+    const bool blocked = wanted && g_mask_shader_state.load(std::memory_order_relaxed) == 2;
+    if (blocked && !g_preset_blocked_logged.exchange(true, std::memory_order_relaxed))
+    {
+      REXLOG_WARN("pdz_shadow: long shadows (pdz_long_shadows) switched on after the shadow shader was prepared "
+                  "without them: not applied; start the game with pdz_long_shadows = true");
+    }
+    const bool on = wanted && !blocked && !g_preset_level_skipped.load(std::memory_order_relaxed);
+    const double distance = on ? PresetDistance() : 0.0;
+    const bool same_state = g_preset_applied.exchange(on, std::memory_order_relaxed) == on;
+    if (g_preset_distance.exchange(distance, std::memory_order_relaxed) == distance && same_state)
+    {
+      return; // nothing changed (also a live change of pdz_long_shadows_distance is applied here)
+    }
+    REXCVAR_SET(pdz_shadow_distance_scale, on ? distance : 1.0);
+    REXCVAR_SET(pdz_shadow_far_pcf, on ? kPresetFarPcf : 0.0);
+    REXCVAR_SET(pdz_shadow_bias_scale, on ? PresetBias(distance) : 1.0);
+    // The caster box follows the whole distance (rc item 4, Mon 16 Nov evening): plants and props are drawn into the
+    // shadow maps only inside that box, and the automatic box stops at x2 (about 48 m, less to the sides), so at 60 m
+    // a plant's own shadow and the shade right under it only appeared as the player walked closer. 0 = automatic
+    // again when the preset is off (nothing reads it at the stock distance).
+    REXCVAR_SET(pdz_shadow_caster_scale, on ? distance : 0.0);
+    // The detail level: the player's own values where set (1 or more), else by the card's dedicated video memory.
+    // 11.5 GiB and up counts as a 12 GB card (they report a little under 12 GiB); unknown (0) counts as small.
+    const uint64_t vram = pdz::native::DedicatedVideoMemoryBytes();
+    const bool large_card = vram >= (uint64_t(23) << 29); // 11.5 GiB
+    const int32_t own_maps = REXCVAR_GET(pdz_long_shadows_map_scale);
+    const double own_split = REXCVAR_GET(pdz_long_shadows_split), fade = REXCVAR_GET(pdz_long_shadows_object_fade);
+    const int32_t maps = own_maps >= 1 ? std::min(own_maps, 4) : large_card ? 3 : 2;
+    const double split = own_split >= 1.0 ? std::min(own_split, 4.0) : large_card ? 3.0 : 2.0;
+    g_long_split_extra.store(on ? float(split) : 1.0f, std::memory_order_relaxed);
+    g_long_object_fade.store(on && fade >= 1.0 ? float(std::min(fade, 4.0)) : 1.0f, std::memory_order_relaxed);
+    // The shadow maps' size is latched by the first shadow surface, after this first call (made before the first
+    // shader is prepared): only ever raised, and only while the preset is on at the start.
+    if (on)
+    {
+      if (REXCVAR_GET(pdz_shadow_map_scale) < maps)
+      {
+        REXCVAR_SET(pdz_shadow_map_scale, maps);
+      }
+      REXLOG_INFO("pdz_shadow: long shadows detail: shadow map scale {} ({}), near split x{:g} = {:.0f} m ({}); "
+                  "graphics card video memory {} (12 GB or more picks 3 / 3, otherwise 2 / 2)",
+                  maps, own_maps >= 1 ? "set by hand: pdz_long_shadows_map_scale" : "automatic", split,
+                  3.0 * distance * split, own_split >= 1.0 ? "set by hand: pdz_long_shadows_split" : "automatic",
+                  vram ? fmt::format("{:.1f} GB", double(vram) / 1073741824.0) : std::string("unknown, taken as under 12 GB"));
+    }
+    REXLOG_INFO("pdz_shadow: long shadows {} (pdz_long_shadows): distance x{:g}, far PCF {:g}, bias scale {:g}",
+                on ? "ON" : "OFF (the game's own)", REXCVAR_GET(pdz_shadow_distance_scale),
+                REXCVAR_GET(pdz_shadow_far_pcf), REXCVAR_GET(pdz_shadow_bias_scale));
+  }
+
+  void NoteMaskShader(bool long_patches) { g_mask_shader_state.store(long_patches ? 1 : 2, std::memory_order_relaxed); }
+
+  // F7 (bind_long_shadows): the preset on / off while playing, with the on-screen label and the window title.
+  void Init(rex::ui::Window *window)
+  {
+    g_window = window;
+    rex::ui::RegisterBind("bind_long_shadows", "F7", "Long shadows on / off (pdz_long_shadows), to compare", [] {
+      static auto last = std::chrono::steady_clock::time_point{};
+      const auto now = std::chrono::steady_clock::now();
+      if (now - last < std::chrono::milliseconds(300))
+      {
+        return; // a held key repeats
+      }
+      last = now;
+      bool on = !REXCVAR_GET(pdz_long_shadows);
+      const bool blocked = on && g_mask_shader_state.load(std::memory_order_relaxed) == 2;
+      if (blocked)
+      {
+        on = false;
+      }
+      REXCVAR_SET(pdz_long_shadows, on);
+      ApplyPreset();
+      const std::string text = blocked ? "Long shadows: start the game with them on to use F7"
+                               : !on   ? "Long shadows: OFF (Rare's 20 m)"
+                               : g_preset_level_skipped.load(std::memory_order_relaxed)
+                                     ? "Long shadows: ON (not on this level: Rare's 20 m)"
+                                     : fmt::format("Long shadows: ON ({:.0f} m)", 20.0 * PresetDistance());
+      REXLOG_INFO("pdz_shadow: KEY PRESS: {}", text);
+      pdz::transwater::ShowStatus(text, 3);
+      if (g_window)
+      {
+        rex::ui::Window *w = g_window;
+        const std::string title = std::string("PDZRestored ") + PDZ_RESTORED_VERSION + " | " + text;
+        w->app_context().CallInUIThread([w, title] { w->SetTitle(title); });
+      }
+    });
+  }
+} // namespace pdz::sunshadow

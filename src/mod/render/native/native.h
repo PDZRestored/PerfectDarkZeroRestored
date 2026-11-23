@@ -40,6 +40,17 @@ namespace pdz::native
   // pdz_native_scale_follow in effect (default: graphics_backend null) ChooseScaleAtStartup latches it first.
   uint32_t Scale();
 
+  // Supersampling (pdz_supersample, Mon 16 Nov): the scale of the picture handed to the presenter. Equal to Scale()
+  // unless pdz_supersample is above 100 with the native renderer as the only output: then Scale() (the scale every
+  // surface is drawn at, up to 6) is larger, and the present path shrinks the finished frame from Scale() to
+  // OutputScale() with an area filter (native_present.cpp, native_passes.cpp Downsample). Latched with Scale().
+  uint32_t OutputScale();
+
+  // The dedicated video memory of the hardware graphics adapter with the most of it, in bytes; 0 = unknown. Read from
+  // DXGI at the first call (no device needed, any thread, valid from app start); the same figure the native default
+  // profile logs.
+  uint64_t DedicatedVideoMemoryBytes();
+
   // The sun's shadow maps (BUG_AUDIT VR4): the shadow pass draws into a 1344 x 1344 D24S8 depth surface and a
   // 1344 x 1344 R32F colour target (both created in TU3 sub_8261DFC8) and resolves the depth into four 1344 x 1344
   // k_24_8 textures (the mirrors 1D700000 / 1C580000 / 1B818000 / 1CC64000). No other surface or resolve texture of
@@ -47,13 +58,16 @@ namespace pdz::native
   constexpr uint32_t kShadowMapSize = 1344;
 
   // The host scale of a surface or resolve mirror of this guest size: Scale(), or for the shadow maps (1344 x 1344)
-  // Scale() x pdz_shadow_map_scale (1-4, the product capped at 12 = 16128 x 16128, under D3D12's 16384 limit; latched
-  // with the first one). Every per-surface path (viewport, scissor, clears, resolve copies, point sizes, polygon-offset
+  // OutputScale() x pdz_shadow_map_scale (1-4), never below Scale(), the product capped at 12 = 16128 x 16128, under
+  // D3D12's 16384 limit; latched with the first one. (Without supersampling OutputScale() is Scale(): as before. With
+  // it the shadow maps do not grow with the render scale beyond what the picture is drawn at.) A surface whose side
+  // times the scale would pass 16384 gets the largest scale that fits (only possible above scale 4; logged once).
+  // Every per-surface path (viewport, scissor, clears, resolve copies, point sizes, polygon-offset
   // slope) follows the surface's own scale, so the shadow pass renders at that scale while the guest keeps its
   // 1344 x 1344 viewport. With pdz_shadow_map_scale 1 this is Scale() for every size.
   uint32_t SurfaceScale(uint32_t width, uint32_t height);
 
-  // The shadow maps' extra resolution over the rest of the frame: SurfaceScale(1344, 1344) / Scale() once the first
+  // The shadow maps' extra resolution over the picture: SurfaceScale(1344, 1344) / OutputScale() once the first
   // shadow surface latched it, else 1. Lock-free (any thread): the sun shadow setup hook (sun_shadows.cpp) divides the
   // far cascade's bias factor by it when the native renderer is the only output.
   float ShadowMapRelativeScale();

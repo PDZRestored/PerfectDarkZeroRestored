@@ -15,6 +15,7 @@
 
 #include "latency_log.h"
 #include "shadow_record.h"
+#include "../guest_readable_Sat21Nov.h" // Sun 22 Nov night (audit): pdz::guestmem::Ok
 
 REXCVAR_DEFINE_BOOL(pdz_latency_log, false, "Render",
                     "Input latency: for each trigger pull or right-stick push on pad 0, time the pad read that first "
@@ -106,15 +107,18 @@ namespace pdz::latency
     Hands ReadHands(const uint8_t *base, uint32_t player)
     {
       Hands h;
-      for (uint32_t i = 0; i < 2 && player; ++i)
+      // Sun 22 Nov night (audit): the cached player may be gone (it is kept across levels): every hop is checked.
+      for (uint32_t i = 0; i < 2 && player && pdz::guestmem::Ok(base, player + kPlayerHands[i], 4); ++i)
       {
         const uint32_t hand = pdz::shadow::Load32(base, player + kPlayerHands[i]);
-        if (!pdz::shadow::IsGuestPointer(hand))
+        if (!pdz::shadow::IsGuestPointer(hand) || !pdz::guestmem::Ok(base, hand + kHandGun, kHandClip + 2 - kHandGun))
         {
           continue;
         }
         const uint32_t gun = pdz::shadow::Load32(base, hand + kHandGun);
-        h.action[i] = pdz::shadow::IsGuestPointer(gun) ? int32_t(pdz::shadow::Load32(base, gun + kGunAction)) : -1;
+        h.action[i] = pdz::shadow::IsGuestPointer(gun) && pdz::guestmem::Ok(base, gun + kGunAction, 4)
+                          ? int32_t(pdz::shadow::Load32(base, gun + kGunAction))
+                          : -1;
         const uint8_t *c = pdz::shadow::GuestPtr(base, hand + kHandClip);
         h.clip[i] = int32_t((uint32_t(c[0]) << 8) | c[1]);
       }
@@ -261,7 +265,8 @@ namespace pdz::latency
       return;
     }
     const uint32_t input = pdz::shadow::Load32(base, player + kPlayerInput);
-    if (!pdz::shadow::IsGuestPointer(input) || int32_t(pdz::shadow::Load32(base, input + kInputPad)) != 0)
+    if (!pdz::shadow::IsGuestPointer(input) || !pdz::guestmem::Ok(base, input + kInputPad, 4) ||
+        int32_t(pdz::shadow::Load32(base, input + kInputPad)) != 0) // Sun 22 Nov night (audit): Ok
     {
       return;
     }
@@ -271,6 +276,13 @@ namespace pdz::latency
     REXLOG_INFO("pdz_latency: player {:08X} (pad 0)", player);
   }
 
+  void LevelReset()
+  {
+    std::lock_guard<std::mutex> lock(g.mutex);
+    g.player = 0;
+    g.have_view = false;
+  }
+
   void OnShot(const uint8_t *base, uint32_t shooter)
   {
     if (!Enabled() || !g.player)
@@ -278,7 +290,8 @@ namespace pdz::latency
       return;
     }
     const bool his = shooter == g.player ||
-                     (pdz::shadow::IsGuestPointer(shooter) && pdz::shadow::Load32(base, shooter + kWeaponOwner) == g.player);
+                     (pdz::shadow::IsGuestPointer(shooter) && pdz::guestmem::Ok(base, shooter + kWeaponOwner, 4) &&
+                      pdz::shadow::Load32(base, shooter + kWeaponOwner) == g.player); // Sun 22 Nov night (audit): Ok
     if (his)
     {
       std::lock_guard<std::mutex> lock(g.mutex);
@@ -301,7 +314,8 @@ namespace pdz::latency
       std::lock_guard<std::mutex> lock(g.mutex);
       Arm();
       g.swaps = s_swaps;
-      if (g.player)
+      // Sun 22 Nov night (audit): the cached player is kept across levels: read only while it is there.
+      if (g.player && pdz::guestmem::Ok(base, g.player + kPlayerViewYaw, 8))
       {
         const float yaw = LoadFloat(base, g.player + kPlayerViewYaw);
         const float pitch = LoadFloat(base, g.player + kPlayerViewPitch);

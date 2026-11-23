@@ -30,12 +30,17 @@
 #include <rex/cvar.h>
 
 REXCVAR_DECLARE(int32_t, pdz_native_skip_pm4);
+// Mon 16 Nov: the same skip as mode 1 as its own switch (default off), with one 'pdz_pm4: level' line per level.
+REXCVAR_DECLARE(bool, pdz_native_skip_unused_pm4);
 
 namespace pdz::pm4skip
 {
   // Swap hook (shadow_hooks.cpp), after the guest Swap returned: closes the frame's counters, latches the mode for the
   // next frame, logs the window line.
   void OnSwap();
+  // Swap hook, before pdz::timing::OnSwap takes the scene: whether the frame this Swap closes is a level frame
+  // (pdz_native_skip_unused_pm4's line per level). One plain store.
+  void NoteScene(bool level_frame);
   // Test exit (pdz::test::LogSummary): the SUMMARY line; prints nothing while the mode was never on.
   void LogSummary(const char *why);
 } // namespace pdz::pm4skip

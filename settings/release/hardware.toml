@@ -1,6 +1,9 @@
 # PDZ Restored: the release's settings file (settings/release/hardware.toml, shipped as settings\hardware.toml by
 # tools/release/stage_release.py). The settings window (PDZ Restored Settings, or hold Shift when starting) changes
-# only the lines in its own section at the end; everything else here is for advanced use and testing, with its
+# only the lines in its own section at the end, plus vsync and, only when you change them there, its Graphics and
+# Gameplay tabs' lines where they are (present_effect, swap_post_effect, anisotropic_override,
+# pdz_far_lighting, pdz_far_lighting_beams, pdz_ai_cover_fixes, pdz_lab_guard_stealth, pdz_aim_still_lock,
+# pdz_aim_respect_headshots, pdz_aim_assist_zoomed); everything else here is for advanced use and testing, with its
 # comment. The developer's own settings\hardware.toml in the repository is a different file.
 #
 # perfectdarkzerorecomp - hardware / rendering settings
@@ -49,8 +52,10 @@ present_fsr_sharpness_reduction = 0.2
 present_dither = false
 swap_post_effect = "smaa"
 async_shader_compilation = true
+# Does nothing in Perfect Dark Zero (the game draws no multisampled surfaces); not in the settings window.
 native_2x_msaa = false
-anisotropic_override = 3
+# -1 = the game's own filtering, 2 = 2x, 3 = 4x, 4 = 8x, 5 = 16x (0.9.5: 16x; the Graphics tab's Anisotropic filtering).
+anisotropic_override = 5
 
 texture_cache_memory_limit_soft = 1024
 texture_cache_memory_limit_hard = 4096
@@ -63,7 +68,7 @@ window_width = 1920
 window_height = 1080
 fullscreen = true
 monitor = 0
-resolution = "1920x1080"
+resolution = ""
 
 render_target_path_d3d12 = "rov"
 store_shaders = true
@@ -289,6 +294,18 @@ pdz_ragdoll_log = false
 # tasks, peeks, failed cover tests, totals once a minute). Needs
 # log_level = "info".
 pdz_cover_log = false
+# Player cover fixes (single player; on by default; false = original), each
+# logged as "pdz_cover: C1 / C2 / C3 / C5" lines:
+# C1 take the wall that faces where you look, not the best-ranked one.
+pdz_cover_fix_faced = true
+# C2 the cover scan tries all three places in one frame (prompt at once).
+pdz_cover_fix_fan = true
+# C3 no old cover find: the prompt goes and the press does nothing when the
+# newest scan from where you stand found nothing, or the find is over 40 cm
+# away or over 20 frames old.
+pdz_cover_fix_stale = true
+# C5 the jump to the other end of the cover needs a fresh sideways push.
+pdz_cover_fix_fresh_push = true
 # Diagnostic: "pdz_ai:" lines once a second per enemy that is aware or within
 # 50 m: setup, flags (aware / hurt / shot-at / provoked / no-cover), alert,
 # target and distance, pads, tasks, and what its planner did (plans built,
@@ -440,6 +457,26 @@ pdz_protection_spread = true
 pdz_infection_32 = true
 # Fix: Rare's recorded multiplayer announcer lines that their code never plays.
 pdz_mp_announcer_extras = true
+
+# --- 1.0.0 ---
+# Far lighting (the Graphics tab): distant lights stay lit. On = Rare's cap of 200 lights in a view lifted and Rare's
+# full light shader for every light in view; false = lighting exactly as on the Xbox 360.
+pdz_far_lighting = true
+# With far lighting: lamps that have a beam are drawn even when the game hides the room they are in.
+pdz_far_lighting_beams = true
+# Every light in a hidden room (5): off (0). It costs frame time and can light the near side of a wall.
+pdz_light_draw_distance = 0
+# Debug: F6 steps through the far lighting settings in game. Off.
+pdz_far_lighting_key = false
+# Shader patches and variants are made on background workers when the game creates a shader, not at its first draw
+# (fewer hitches the first time an area is seen). 2 = on with up to 4 workers, 1 = one worker, 0 = off.
+pdz_native_shader_prepare = 2
+# The renderer reuses the previous draw's decoded state where nothing changed. 1 = on, 0 = off.
+pdz_native_draw_memo = 1
+# Counter-Operative (MISSION MODE, under CO-OPERATIVE): two players, one plays the guards. false = no entry.
+pdz_counterop_menu = true
+# Stealth (the Gameplay tab): sneaking on Nightclub, Subway, Mansion and the Laboratory. false = guards as on the Xbox 360.
+pdz_lab_guard_stealth = true
 
 # --- Settings window (PDZ Restored Settings) ---
 # The window writes the lines below and nothing else; edit them here or there.

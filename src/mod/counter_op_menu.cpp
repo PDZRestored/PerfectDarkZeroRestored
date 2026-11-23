@@ -31,6 +31,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -46,13 +47,48 @@
 #include <rex/system/kernel_state.h>
 #include "hook_profile.h" // pdz_hook_profile (must follow <rex/hook.h>)
 
-REXCVAR_DEFINE_BOOL(pdz_counterop_menu, false, "Gameplay",
-                    "Counter-Operative in the campaign menu (built only with PDZ_COUNTEROP; default off: not ready "
-                    "yet): MISSION MODE gets a "
+REXCVAR_DEFINE_BOOL(pdz_counterop_menu, true, "Gameplay",
+                    "Counter-Operative in the campaign menu (built only with PDZ_COUNTEROP; on in the counterop-2 test "
+                    "builds, off in 0.9.4): MISSION MODE gets a "
                     "COUNTER OPERATIVE entry beside SOLO AGENT and CO-OPERATIVE (Rare's own text and card); choosing "
                     "it plays the next local co-op games as Counter-Operative (player 2 on the guards' side) until "
                     "another mode is chosen. Datacore and Arena are refused (no guards). Off = no entry, plain menus "
                     "(pdz_counterop still forces the mode for every co-op game)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(pdz_counterop_skip_empty_briefing, true, "Gameplay",
+                    "Counter-Operative (round 11, default on): a level without a briefing video (Datacore) goes "
+                    "from the difficulty screen straight to the MISSION SUMMARY, as Rare's single player does; "
+                    "the empty ':: NO FEED ::' briefing screen is skipped. Off = Rare's co-op route")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(pdz_counterop_debrief_own_side, true, "Gameplay",
+                    "Counter-Operative (default on, round 8): the shared debriefing's header is written from the "
+                    "counter-op's side: COUNTER-OP / MISSION COMPLETED when he killed the agent, COUNTER-OP / MISSION "
+                    "FAILED when she completed the mission (Rare's strings). Off = the agent's result under his name "
+                    "(rounds 2-7). Only used when the round 12 one-line text for that result is empty")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+// Round 12 (item 7): the shared debriefing's header on ONE line, worded for both players. Rare's header box
+// ('header2' of aid_darkxui_ingame_large_solo_debriefing: 846 x 42 at (50, 95) in the 960 x 720 scene, font 'Zero
+// Twos' 24 pt, Rare's text "MISSION OVER") holds one line; rounds 2-11 wrote two ("COUNTER-OP" + CR LF + "MISSION
+// FAILED"), the second below the box. Rare has no "wins" header: its only winner lines are the multiplayer table's
+// "%s WINS!" / "TEAM %s WINS!" (not loaded in a mission). The names are Rare's own strings (frontend 0xA4 "AGENT",
+// frontend 148 "COUNTER-OP", both loaded in a level), " WINS" is ours, after Rare's "%s WINS!".
+REXCVAR_DEFINE_STRING(pdz_counterop_debrief_agent_text, "[200A4:AGENT] WINS", "Gameplay",
+                      "Counter-Operative (round 12): the shared debriefing's one-line header when the agent "
+                      "completed the mission. Plain text; [HEX:fallback] = Rare's string with that id ((table << 16) "
+                      "| index), the fallback when it is not loaded. Default 'AGENT WINS' with Rare's own AGENT "
+                      "(frontend 0xA4). Empty = the two-line header of rounds 8-11 (pdz_counterop_debrief_own_side)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_STRING(pdz_counterop_debrief_counterop_text, "[20094:COUNTER-OP] WINS", "Gameplay",
+                      "Counter-Operative (round 12): the shared debriefing's one-line header when player 2 stopped "
+                      "the agent. Same format as pdz_counterop_debrief_agent_text. Default 'COUNTER-OP WINS' with "
+                      "Rare's own COUNTER-OP (frontend 148). Empty = the two-line header of rounds 8-11")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+// Round 12 (item 13): mission 13 is the Arena (level id 13, 'cave': Rare's "MISSION %ls" number is the level id,
+// 82230470 -> 8264FFA0(level), so Datacore is MISSION 0 and the Arena, the 14th and last entry, MISSION 13).
+REXCVAR_DEFINE_BOOL(pdz_counterop_hide_mission13, true, "Gameplay",
+                    "Counter-Operative (round 12, default on): mission 13 (the Arena) is left out of the Counter "
+                    "Operative MISSION SELECT list (Rare's list simply ends one entry earlier, at the Bridge). The "
+                    "solo and co-operative lists are unchanged. Off = the Arena is listed as before")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(pdz_counterop_menu_coop_card, true, "Gameplay",
                     "Counter-Operative menu entry (default on): its description card is built from Rare's "
@@ -60,9 +96,17 @@ REXCVAR_DEFINE_BOOL(pdz_counterop_menu_coop_card, true, "Gameplay",
                     "not from Rare's unused counter-op card, whose text sits on the menu column over LEADERBOARDS")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(pdz_counterop_menu_card_log, false, "Gameplay",
+                    "Testing: log the picture elements (place, size, image path) of each menu info card as it is created")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REX_EXTERN(__imp__sub_8278F550); // XuiSceneCreate (base path, path, init data, &scene); hooked in mp_music.cpp
+REX_EXTERN(__imp__sub_824067D8); // difficulty button: key down (this, key r4); 0 = handled, 1 = not
+REX_EXTERN(sub_823BF660);        // (level) -> 1 when the level has no briefing video
 REX_EXTERN(__imp__sub_823FF4C8); // DarkXuiValueNavButton press (this): ButtonValue -> 823B8AD8(GameValue, value)
 REX_EXTERN(__imp__sub_82402318); // MissionList message handler (this: +4 the list's handle)
+REX_EXTERN(__imp__sub_82402458); // MissionList: how many missions it lists (min(profile progress + 2, all))
+REX_EXTERN(sub_82230470);        // (game, level): the chosen level (game +0x19) and its "MISSION n" text
 REX_EXTERN(sub_823AB3C8);        // list: current item index (handle)
 REX_EXTERN(sub_8227AD78);        // MISSION SELECT index -> level id
 REX_EXTERN(sub_8239BCD8);        // a string by id ((table << 16) | index) -> UTF-16 pointer or 0 (table not loaded)
@@ -83,7 +127,12 @@ REX_EXTERN(sub_82794EC0); // XUIElementPropVal clear
 REX_EXTERN(sub_827950E0); // XUIElementPropVal set string
 
 bool PdzCounterOpPlayed();   // counter_op.cpp: the last level started as a supported counter-op game
+bool PdzCounterOpViewSceneCreated(PPCContext &ctx, uint8_t *base, const std::string &path,
+                                  uint32_t scene); // counter_op_view.cpp: the MISSION SUMMARY's player 2 column
 bool PdzCounterOpClonesOn(); // counter_op.cpp: pdz_counterop_clones (Datacore / Arena offered: runtime clones)
+// render/native/native_menu_card.cpp (pdz_counterop_menu_card_file): true = the counter-op entry's card was just
+// created from Rare's co-op card (the player's picture may be shown for it), false = any other scene was asked for.
+void PdzCounterOpMenuCardScene(bool counterop_card);
 
 namespace
 {
@@ -96,7 +145,7 @@ namespace
   constexpr uint32_t kTextCardLine = 0x20092;     // frontend 146: "for two-player counter-operative story missions"
   constexpr uint32_t kTextCoOp = 0x20093, kTextCounterOp = 0x20094; // frontend 147 / 148: CO-OP / COUNTER-OP
   constexpr uint32_t kTextInformation = 0x203E9;  // frontend 1001: Information
-  constexpr uint32_t kTextFailed = 0x40042, kTextCompleted = 0x40043; // general 66 / 67
+  constexpr uint32_t kTextFailed = 0x42, kTextCompleted = 0x43; // general table (slot 0) 66 / 67; round 5: the slot was 4
   constexpr const char *kAnchorId = "CoOp";
   constexpr const char *kButtonId = "CounterOp";
   constexpr const char *kCard = "aid_darkxui_frontend_info_counteroperative_xur";
@@ -532,6 +581,34 @@ namespace
     }
   }
 
+  // pdz_counterop_menu_card_log: every element of an info card with a picture (its Id, place, size and image path).
+  void LogPictures(Xui &x, uint32_t h, const std::string &path, int depth = 0)
+  {
+    for (uint32_t c : depth > 12 ? std::vector<uint32_t>{} : x.Children(h))
+    {
+      const std::string image = x.GetString(c, "ImagePath");
+      if (!image.empty())
+      {
+        float pos[3] = {};
+        x.GetPosition(c, pos);
+        float w = 0, hgt = 0;
+        for (int i = 0; i < 2; ++i)
+        {
+          if (x.Get(c, i ? "Height" : "Width"))
+          {
+            const uint32_t bits = Load32(x.base, x.val + 4);
+            std::memcpy(i ? &hgt : &w, &bits, 4);
+          }
+          x.Clear();
+        }
+        REXLOG_INFO("pdz_counterop: menu: card '{}': picture element '{}' (depth {}) at ({:.0f}, {:.0f}) size {:.0f} x "
+                    "{:.0f}: image '{}'",
+                    path, x.GetString(c, "Id"), depth, pos[0], pos[1], w, hgt, image);
+      }
+      LogPictures(x, c, path, depth + 1);
+    }
+  }
+
   void Disarm(const char *why)
   {
     if (g_armed)
@@ -593,9 +670,60 @@ bool PdzCounterOpRefuseScene(PPCContext &caller, uint8_t *base, const std::strin
 
 // Instead of Rare's XuiSceneCreate (path lower case): the counter-op card's request is created from Rare's co-op card
 // (the same file name with "cooperative" for "counteroperative"); true = done here (r3 = Rare's result).
+namespace
+{
+  bool g_summary_for_briefing = false; // the scene being created was asked for as the briefing
+  // The level chosen on MISSION SELECT (game +0x19, as 8240682C reads it) has no briefing video.
+  bool NoBriefingLevel(PPCContext &caller, uint8_t *base)
+  {
+    const uint32_t game = Load32(base, 0x82D6BFD8);
+    if (!Ptr(game) || Load32(base, game + 0x28) != 1 || Load32(base, game + 0x20) != 0)
+    {
+      return false; // not a local co-op game
+    }
+    PPCContext ctx = caller;
+    rex::CallFrame frame(ctx);
+    frame.ctx.r3.s64 = int8_t(base[game + 0x19]);
+    sub_823BF660(frame.ctx, base);
+    return (frame.ctx.r3.u32 & 0xFF) != 0;
+  }
+} // namespace
+
 bool PdzCounterOpCreateInstead(PPCContext &ctx, uint8_t *base, const std::string &path)
 {
   g_card_from_coop = false;
+  PdzCounterOpMenuCardScene(false); // another scene: the player's menu card picture is no longer wanted (round 12)
+  g_summary_for_briefing = false;
+  if (Menu() && g_armed && REXCVAR_GET(pdz_counterop_skip_empty_briefing) && Ptr(ctx.r4.u32))
+  {
+    constexpr const char *kFrom = "coop_local_briefing", *kTo = "coop_local_start";
+    const size_t b = path.find(kFrom);
+    if (b != std::string::npos && NoBriefingLevel(ctx, base))
+    {
+      std::u16string wide = ReadWide(base, ctx.r4.u32, 260);
+      if (wide.size() >= b + std::strlen(kFrom))
+      {
+        wide.replace(b, std::strlen(kFrom), Wide(kTo));
+        rex::CallFrame frame(ctx);
+        frame.ctx.r3.u64 = ctx.r3.u64; // base path
+        frame.ctx.r5.u64 = ctx.r5.u64; // init data
+        frame.ctx.r6.u64 = ctx.r6.u64; // &scene
+        frame.ctx.r4.u64 = PushWide(frame.ctx, base, wide);
+        __imp__sub_8278F550(frame.ctx, base);
+        ctx.r3.u64 = frame.ctx.r3.u64;
+        g_summary_for_briefing = int32_t(ctx.r3.u32) >= 0;
+        REXLOG_INFO("pdz_counterop: menu: the level has no briefing video: '{}' asked, the MISSION SUMMARY created "
+                    "in its place ({}: result {:08X}), as Rare's single player does",
+                    path, g_summary_for_briefing ? "ok" : "FAILED", ctx.r3.u32);
+        if (g_summary_for_briefing)
+        {
+          return true;
+        }
+        __imp__sub_8278F550(ctx, base); // Rare's briefing scene, as before
+        return true;
+      }
+    }
+  }
   const size_t at = path.find(kCardFrom);
   if (!Menu() || !REXCVAR_GET(pdz_counterop_menu_coop_card) || path.find("info_counteroperative") == std::string::npos ||
       at == std::string::npos || !Ptr(ctx.r4.u32))
@@ -621,6 +749,7 @@ bool PdzCounterOpCreateInstead(PPCContext &ctx, uint8_t *base, const std::string
     ctx.r3.u64 = frame.ctx.r3.u64;
   }
   g_card_from_coop = int32_t(ctx.r3.u32) >= 0;
+  PdzCounterOpMenuCardScene(g_card_from_coop); // pdz_counterop_menu_card_file: the player's picture on this card
   if (++g_card_lines <= 3)
   {
     REXLOG_INFO("pdz_counterop: menu: card: '{}' asked; created from Rare's co-op card '{}' ({}: result {:08X})", path,
@@ -634,8 +763,15 @@ bool PdzCounterOpCreateInstead(PPCContext &ctx, uint8_t *base, const std::string
 }
 
 // After Rare's XuiSceneCreate succeeded.
+void PdzCounterOpLevelBoundary(uint8_t *base, const char *why); // counter_op.cpp (round 6, item 1)
+bool PdzCounterOpStarted();                                      // counter_op.cpp
 void PdzCounterOpSceneCreated(PPCContext &caller, uint8_t *base, const std::string &path, uint32_t scene)
 {
+  // Round 6 (item 1): the first frontend scene after a level = the level is over (ended, quit or failed).
+  if (path.find("darkxui_frontend_") != std::string::npos && PdzCounterOpStarted())
+  {
+    PdzCounterOpLevelBoundary(base, "back in the menus");
+  }
   PPCContext ctx = caller;
   if (!Menu() || !Ptr(scene))
   {
@@ -646,6 +782,11 @@ void PdzCounterOpSceneCreated(PPCContext &caller, uint8_t *base, const std::stri
     Xui x(ctx, base);
     AddButton(x, scene);
     return;
+  }
+  if (REXCVAR_GET(pdz_counterop_menu_card_log) && path.find("frontend_info_") != std::string::npos)
+  {
+    Xui x(ctx, base);
+    LogPictures(x, scene, path);
   }
   if (path.find("info_counteroperative") != std::string::npos && g_card_from_coop)
   {
@@ -692,6 +833,10 @@ void PdzCounterOpSceneCreated(PPCContext &caller, uint8_t *base, const std::stri
   }
   if (PdzCounterOpArmed() && path.find("frontend_coop_") != std::string::npos)
   {
+    PdzCounterOpViewSceneCreated(ctx, base,
+                                 g_summary_for_briefing ? std::string("aid_darkxui_frontend_coop_local_start_xur") : path,
+                                 scene); // round 2 (item 9): his loadout box says COUNTER OPERATIVE
+    g_summary_for_briefing = false;
     Xui x(ctx, base);
     const std::u16string from = Trim(RareText(x.frame.ctx, base, kTextCoOp));
     const std::u16string to = Trim(RareText(x.frame.ctx, base, kTextCounterOp));
@@ -708,9 +853,38 @@ void PdzCounterOpSceneCreated(PPCContext &caller, uint8_t *base, const std::stri
     uint32_t parent = 0;
     const uint32_t header = x.Find(scene, "header2", parent);
     const uint8_t state = base[kLevelState];
-    const uint32_t result = (state & 0x1) ? kTextCompleted : (state & 0x2) ? kTextFailed : 0;
-    std::u16string text = result ? RareText(x.frame.ctx, base, result) : std::u16string();
-    const std::u16string side = Trim(RareText(x.frame.ctx, base, kTextCounterOp)); // empty in a level if unloaded
+    // Round 8: the header is written from the COUNTER-OP's side, as his in-game line is: the agent down = his
+    // mission completed; the agent completed hers = his mission failed. (Rounds 2-7 wrote the agent's result under
+    // his name: after his win the shared debriefing read "COUNTER-OP / MISSION FAILED".)
+    const bool own_side = REXCVAR_GET(pdz_counterop_debrief_own_side);
+    const uint32_t result = (state & 0x1) ? (own_side ? kTextFailed : kTextCompleted)
+                            : (state & 0x2) ? (own_side ? kTextCompleted : kTextFailed) : 0;
+    // Round 12 (item 7): one line for both players, "AGENT WINS" / "COUNTER-OP WINS" (the cvar pair
+    // pdz_counterop_debrief_agent_text / _counterop_text: plain text, [HEX:fallback] = Rare's string by id). An
+    // empty cvar = the two-line header of rounds 8-11 below.
+    const std::string spec = (state & 0x1)   ? std::string(REXCVAR_GET(pdz_counterop_debrief_agent_text))
+                             : (state & 0x2) ? std::string(REXCVAR_GET(pdz_counterop_debrief_counterop_text))
+                                             : std::string();
+    std::u16string line;
+    for (size_t i = 0; i < spec.size(); ++i)
+    {
+      const size_t end = spec[i] == '[' ? spec.find(']', i) : std::string::npos;
+      if (end == std::string::npos)
+      {
+        line += char16_t(uint8_t(spec[i]));
+        continue;
+      }
+      const std::string token = spec.substr(i + 1, end - i - 1); // "HEX" or "HEX:fallback"
+      const size_t bar = token.find(':');
+      const uint32_t id = uint32_t(std::strtoul(token.substr(0, bar).c_str(), nullptr, 16));
+      const std::u16string rare = id ? Trim(RareText(x.frame.ctx, base, id)) : std::u16string();
+      line += !rare.empty() ? rare : bar == std::string::npos ? std::u16string() : Wide(token.substr(bar + 1));
+      i = end;
+    }
+    const bool one_line = !line.empty();
+    std::u16string text = one_line ? line : result ? RareText(x.frame.ctx, base, result) : std::u16string();
+    const std::u16string side = one_line ? std::u16string()
+                                         : Trim(RareText(x.frame.ctx, base, kTextCounterOp)); // empty if unloaded
     if (header && !text.empty())
     {
       if (!side.empty())
@@ -719,6 +893,15 @@ void PdzCounterOpSceneCreated(PPCContext &caller, uint8_t *base, const std::stri
       }
       x.SetText(header, "Text", text);
     }
+    REXLOG_INFO("pdz_counterop: end: debriefing header '{}' ({})", [&] {
+      std::string a;
+      for (char16_t c : text)
+      {
+        a += (c >= 0x20 && c < 0x7F) ? char(c) : '/';
+      }
+      return a;
+    }(), one_line ? "round 12: one line for both players, from '" + spec + "'"
+                  : std::string(own_side ? "from the counter-op's side" : "the agent's result"));
     REXLOG_INFO("pdz_counterop: end: level state {:02X}: the agent {} (debriefing header {})", state,
                 (state & 0x1) ? "completed the mission" : (state & 0x2) ? "is down: the counter-op wins" : "left",
                 header && !text.empty() ? "set" : "left as Rare's");
@@ -775,4 +958,97 @@ REX_HOOK_RAW(sub_82402318)
     g_mission_list = Load32(base, ctx.r3.u32 + 4);
   }
   __imp__sub_82402318(ctx, base);
+}
+
+// Round 12 (item 13): MissionList's count (82402458: min(profile progress + 2, every level) for solo and co-op).
+// Every use of the list goes through it (the item count 82402630, an item's text 824024F8, the cursor 824026F8, the
+// choice 82402790) and so does the debriefing's NEXT MISSION (823A2368: the entry after the current one, the last
+// one staying). While Counter-Operative is armed and the last listed entry is level 13 ('cave', the Arena, Rare's
+// MISSION 13), the count is one less: the list ends at the Bridge, and NEXT MISSION after the Bridge stays on the
+// Bridge. Solo and plain co-op (not armed) return at once with Rare's count. The callers keep values in r4 / r5 /
+// r6 across this call (Rare's own body leaves them alone): only r3 is changed, our calls run on a copy.
+REX_HOOK_RAW(sub_82402458)
+{
+  __imp__sub_82402458(ctx, base);
+  if (!g_armed || !Menu() || !REXCVAR_GET(pdz_counterop_hide_mission13))
+  {
+    return;
+  }
+  constexpr int32_t kMission13 = 13; // the level id = Rare's mission number (82230470 prints the id)
+  const int32_t count = int32_t(ctx.r3.u32);
+  const uint32_t game = Load32(base, kGame);
+  if (count < 2 || count > 64 || !Ptr(game) || Load32(base, game + 40) != 1)
+  {
+    return; // not a co-op list, or nothing to leave out
+  }
+  PPCContext copy = ctx;
+  int32_t last = -1, before = -1;
+  {
+    rex::CallFrame frame(copy);
+    frame.ctx.lr = 0;
+    frame.ctx.r3.u64 = uint32_t(count - 1);
+    sub_8227AD78(frame.ctx, base);
+    last = int32_t(frame.ctx.r3.u32);
+    frame.ctx.r3.u64 = uint32_t(count - 2);
+    sub_8227AD78(frame.ctx, base);
+    before = int32_t(frame.ctx.r3.u32);
+  }
+  static int logged = 0; // 1 = hidden, 2 = not sure
+  if (last != kMission13)
+  {
+    return; // mission 13 is not listed (not unlocked on this profile)
+  }
+  const std::string name = LevelName(base, last);
+  if (name.find("cave") == std::string::npos)
+  {
+    if (logged != 2)
+    {
+      logged = 2;
+      REXLOG_INFO("pdz_counterop: menu: mission 13 NOT hidden: level 13 is '{}', not the Arena ('cave') "
+                  "(pdz_counterop_hide_mission13)",
+                  name);
+    }
+    return;
+  }
+  ctx.r3.u64 = uint32_t(count - 1);
+  if (logged != 1)
+  {
+    logged = 1;
+    REXLOG_INFO("pdz_counterop: menu: mission 13 ('{}') left out of the Counter Operative mission list: {} entries "
+                "instead of {}, the last is level {} ('{}') (pdz_counterop_hide_mission13)",
+                name, count - 1, count, before, LevelName(base, before));
+  }
+  // The list's first call (82402630, return 8240264C) is followed by 'select the level chosen last' (game +0x19):
+  // if that was the Arena (played in co-op before), the entry no longer exists: the choice becomes the last listed
+  // level through Rare's own setter (82230470, what a cursor move calls).
+  if (uint32_t(ctx.lr) == 0x8240264Cu && int8_t(base[game + 0x19]) == kMission13 && before >= 0)
+  {
+    rex::CallFrame frame(copy);
+    frame.ctx.r3.u64 = game;
+    frame.ctx.r4.u64 = uint32_t(before);
+    sub_82230470(frame.ctx, base);
+    REXLOG_INFO("pdz_counterop: menu: the mission chosen last was mission 13: the list opens on level {} instead",
+                before);
+  }
+}
+
+// The difficulty buttons' key handler: Rare's "no briefing" short cut needs the scene's SelectButton to hold the
+// next scene, which the co-op difficulty scene's does not. While armed the short cut is not taken: the button's
+// normal press (difficulty set, PressPath = the briefing) follows, and EDIT 3d turns that into the summary.
+REX_HOOK_RAW(sub_824067D8)
+{
+  if (Menu() && g_armed && REXCVAR_GET(pdz_counterop_skip_empty_briefing) &&
+      (ctx.r4.u32 == 0x5800 || ctx.r4.u32 == 0x5814) && NoBriefingLevel(ctx, base))
+  {
+    static bool logged = false;
+    if (!logged)
+    {
+      logged = true;
+      REXLOG_INFO("pdz_counterop: menu: difficulty chosen for a level without a briefing: Rare's short cut "
+                  "(824067D8: the key passed up to the scene) not taken; the button's own press follows");
+    }
+    ctx.r3.u64 = 1; // not handled
+    return;
+  }
+  __imp__sub_824067D8(ctx, base);
 }

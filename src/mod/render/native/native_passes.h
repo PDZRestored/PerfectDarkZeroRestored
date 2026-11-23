@@ -79,6 +79,21 @@ namespace pdz::native::passes
   };
   bool ApplyGamma(NativeDevice &dev, const GammaDesc &desc);
 
+  // Supersampling (pdz_supersample, Mon 16 Nov): shrinks a finished output image (the gamma pass / swap post effect
+  // result at the render size) into a smaller one of the same format with an area filter: every output pixel is the
+  // average of exactly the source texels it covers, each weighted by the covered part (a 2 x 2 box at 2 : 1; partial
+  // texels at 4 : 3 or 5 : 3), averaged in a squared (about linear light) space. Compute, as the gamma pass.
+  struct DownsampleDesc
+  {
+    ID3D12Resource *src = nullptr;    // R10G10B10A2_UNORM, the caller has it in NON_PIXEL_SHADER_RESOURCE
+    uint32_t src_width = 0, src_height = 0;
+    ID3D12Resource *output = nullptr; // R10G10B10A2_UNORM, UAV-capable, the caller has it in UNORDERED_ACCESS
+    uint32_t width = 0, height = 0;   // the output's size; src / output at most 4 on either axis
+    DXGI_FORMAT format = DXGI_FORMAT_R10G10B10A2_UNORM;
+  };
+  // False (logged once) when the shader or the PSO cannot be had; nothing is recorded then.
+  bool Downsample(NativeDevice &dev, const DownsampleDesc &desc);
+
   // Memory log: the passes' PSOs (gamma + one blit PSO per destination format, failures included) and root signatures.
   uint32_t PipelineCount();
   uint32_t RootSignatureCount();

@@ -7,7 +7,17 @@
 #include <shobjidl.h>
 
 #include <algorithm>
+#include <string>
 #include <thread>
+
+#include <rex/cvar.h>
+#include <rex/logging.h>
+
+// Sun 22 Nov: the renderer's progress window opened over the game window (after a new build, ~2 s after the game
+// window), took the focus with SetForegroundWindow and an exclusive-fullscreen game was minimised until clicked.
+REXCVAR_DEFINE_BOOL(pdz_fix_progress_over_game, true, "Setup",
+                    "No progress window while the game window is open (it took the focus from the game); the work "
+                    "runs with the game window's messages handled. false = the progress window as before");
 
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "ole32.lib")
@@ -154,8 +164,61 @@ namespace pdz::setup_ui
     int g_capture_count = 0;
   } // namespace
 
+  HWND GameWindow()
+  {
+    HWND found = nullptr;
+    EnumWindows(
+        [](HWND w, LPARAM p) -> BOOL {
+          DWORD pid = 0;
+          GetWindowThreadProcessId(w, &pid);
+          wchar_t cls[64] = {};
+          if (pid == GetCurrentProcessId() && IsWindowVisible(w) && GetWindow(w, GW_OWNER) == nullptr &&
+              GetClassNameW(w, cls, 64) > 0 && std::wstring(cls) == L"SDL_app")
+          {
+            *reinterpret_cast<HWND *>(p) = w;
+            return FALSE;
+          }
+          return TRUE;
+        },
+        reinterpret_cast<LPARAM>(&found));
+    return found;
+  }
+
   bool RunWithProgress(const std::wstring &title, State &state, const std::function<void(State &)> &work)
   {
+    if (REXCVAR_GET(pdz_fix_progress_over_game) && GameWindow())
+    {
+      // The game window is open: no window over it. This thread keeps handling the game window's messages while the
+      // work runs (a window left without them for 5 s is shown as Not Responding).
+      const std::string name(title.begin(), title.end());
+      REXLOG_INFO("pdz_setup: '{}': no progress window (the game window is open; a window over it would take the "
+                  "focus from it)",
+                  name);
+      std::thread worker([&] {
+        work(state);
+        std::lock_guard<std::mutex> lock(state.mutex);
+        state.done = true;
+      });
+      for (;;)
+      {
+        {
+          std::lock_guard<std::mutex> lock(state.mutex);
+          if (state.done)
+          {
+            break;
+          }
+        }
+        MsgWaitForMultipleObjects(0, nullptr, FALSE, 50, QS_ALLINPUT);
+        MSG msg;
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE))
+        {
+          TranslateMessage(&msg);
+          DispatchMessageW(&msg);
+        }
+      }
+      worker.join();
+      return true;
+    }
     HINSTANCE inst = GetModuleHandleW(nullptr);
     static bool registered = false;
     if (!registered)

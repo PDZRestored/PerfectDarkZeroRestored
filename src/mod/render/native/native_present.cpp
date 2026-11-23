@@ -80,6 +80,7 @@
 #include <rex/ui/frame_pacing.h>
 
 #include "../game_pace.h"
+#include "../../guest_readable_Sat21Nov.h" // Sun 22 Nov night (audit): pdz::guestmem::Ok (the F12 mark's reads)
 #include "native.h"
 #include "../shadow.h"
 #include "native_device.h"
@@ -122,6 +123,7 @@ REXCVAR_DECLARE(int32_t, pdz_native_draw_dump_rt);
 REXCVAR_DECLARE(int32_t, pdz_native_draw_dump_pick);
 REXCVAR_DECLARE(std::string, pdz_native_draw_dump_dir);
 REXCVAR_DECLARE(bool, pdz_fix_transparency_water);
+namespace pdz::r3 { void PointerPress(); } // restored_sounds_r3_Wed18Nov.cpp: the F12 pointer (log only)
 namespace pdz::transwater
 {
   void TraceFrame(uint32_t frame, uint32_t count); // transparency_water.cpp: trace these game frames (one-shot)
@@ -233,6 +235,106 @@ namespace pdz::native
     // A pending capture that the plugin has not served after this many swaps is dropped (its IssueSwap count is past
     // the requested swap, or a toggle left it behind) so the native output does not stay frozen.
     constexpr uint32_t kCaptureHoldSwaps = 30;
+
+    // Supersampling (pdz_supersample, Mon 16 Nov; native.h OutputScale): the frame is drawn at Scale() and the
+    // presenter gets it at OutputScale(). The output chain (gamma pass, swap post effect) runs at the drawn size into
+    // one intermediate texture, and passes::Downsample (an area filter) shrinks that into the output. Game thread,
+    // render mutex held, as the chain itself.
+    struct SupersampleState
+    {
+      ID3D12Resource *texture = nullptr; // the chain's output at the drawn size (R10G10B10A2, UAV-capable)
+      D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+      uint32_t width = 0, height = 0;
+      bool logged = false, failed_logged = false;
+    };
+    SupersampleState g_supersample;
+
+    // The size of the picture handed to the presenter for a front buffer's host texture: its own size, or with
+    // supersampling its guest size x OutputScale().
+    void OutputSize(const HostTexture &tex, uint32_t &width, uint32_t &height)
+    {
+      width = tex.width;
+      height = tex.height;
+      const uint32_t output = OutputScale();
+      if (output && tex.scale > output && tex.width % tex.scale == 0 && tex.height % tex.scale == 0)
+      {
+        width = tex.width / tex.scale * output;
+        height = tex.height / tex.scale * output;
+      }
+    }
+
+    // The output chain into chain.output (chain.width x chain.height, in UNORDERED_ACCESS, left there). When the
+    // source frame (src_width x src_height) is larger, the chain is recorded at the source size into the intermediate
+    // and shrunk. False: nothing usable was written.
+    bool RecordOutput(NativeDevice &dev, const postfx::ChainDesc &chain, uint32_t src_width, uint32_t src_height,
+                      postfx::Effect &applied)
+    {
+      if (src_width == chain.width && src_height == chain.height)
+      {
+        return postfx::RecordChain(dev, chain, applied);
+      }
+      SupersampleState &s = g_supersample;
+      if (!s.texture || s.width != src_width || s.height != src_height)
+      {
+        if (s.texture)
+        {
+          dev.ReleaseLater(s.texture);
+          s.texture = nullptr;
+        }
+        D3D12_RESOURCE_DESC desc{};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        desc.Width = src_width;
+        desc.Height = src_height;
+        desc.DepthOrArraySize = 1;
+        desc.MipLevels = 1;
+        desc.Format = rex::ui::d3d12::D3D12Presenter::kGuestOutputFormat;
+        desc.SampleDesc.Count = 1;
+        desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        s.texture = dev.CreateTexture(desc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+                                      "pdz_native supersampling output (drawn size)");
+        s.state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        s.width = s.texture ? src_width : 0;
+        s.height = s.texture ? src_height : 0;
+      }
+      if (!s.texture)
+      {
+        if (!s.failed_logged)
+        {
+          s.failed_logged = true;
+          REXLOG_ERROR("pdz_native: supersampling: no {}x{} texture for the output chain: frames are not presented "
+                       "(lower pdz_supersample)",
+                       src_width, src_height);
+        }
+        return false;
+      }
+      postfx::ChainDesc full = chain;
+      full.output = s.texture;
+      full.width = src_width;
+      full.height = src_height;
+      if (!postfx::RecordChain(dev, full, applied))
+      {
+        return false;
+      }
+      dev.Transition(s.texture, s.state, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+      passes::DownsampleDesc down;
+      down.src = s.texture;
+      down.src_width = src_width;
+      down.src_height = src_height;
+      down.output = chain.output;
+      down.width = chain.width;
+      down.height = chain.height;
+      down.format = rex::ui::d3d12::D3D12Presenter::kGuestOutputFormat;
+      const bool ok = passes::Downsample(dev, down);
+      dev.Transition(s.texture, s.state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+      if (!s.logged)
+      {
+        s.logged = true;
+        REXLOG_INFO("pdz_native: supersampling: the output chain runs at {}x{} and is shrunk to {}x{} with the area "
+                    "filter{}",
+                    src_width, src_height, chain.width, chain.height, ok ? "" : " (FAILED: frames are not presented)");
+      }
+      return ok;
+    }
 
     // pdz_native_present_timing 1 with the null GPU backend: native frames handed to the presenter at XE_SWAP (top of
     // this file). Shared by the game thread (stage, publish) and the GPU command processor thread (the listener).
@@ -483,8 +585,10 @@ namespace pdz::native
       // False only when the copier cannot be had (XE_SWAP mode is then off for the session and the caller presents
       // from the Swap hook); a staging texture that cannot be made skips this frame's present (true), because a
       // Swap-hook refresh could run beside a command processor one.
+      // width x height = the staged picture's size (OutputSize); src_width x src_height = the front buffer texture's
+      // (larger with supersampling: RecordOutput shrinks it).
       bool StageFrame(NativeDevice &dev, const FetchDecoded &front, const TextureView &view, uint32_t width,
-                      uint32_t height, D3D12_CPU_DESCRIPTOR_HANDLE lut_srv)
+                      uint32_t height, D3D12_CPU_DESCRIPTOR_HANDLE lut_srv, uint32_t src_width, uint32_t src_height)
       {
         State &s = g;
         PresentState &p = g_present;
@@ -551,9 +655,10 @@ namespace pdz::native
         chain.lut_srv = lut_srv;
         chain.effect = postfx::PresentEffect();
         postfx::Effect applied = postfx::Effect::kNone;
-        const bool ok = postfx::RecordChain(dev, chain, applied);
+        const bool ok = RecordOutput(dev, chain, src_width, src_height, applied);
         dev.Transition(slot.texture, slot.state, D3D12_RESOURCE_STATE_COPY_SOURCE);
-        slot.is_8bpc = applied == postfx::Effect::kNone; // as the plugin (the presenter's dither rule)
+        // As the plugin (the presenter's dither rule); a supersampled frame is an average: more than 8 bits.
+        slot.is_8bpc = applied == postfx::Effect::kNone && src_width == width && src_height == height;
         if (!ok)
         {
           std::lock_guard<std::mutex> lock(s.mutex);
@@ -1112,7 +1217,10 @@ namespace pdz::native
       HostTexture &tex = *view.texture;
       LogFront(front, tex);
       const uint32_t width = tex.width, height = tex.height;
-      if (xeswap::Active() && xeswap::StageFrame(*dev, front, view, width, height, p.lut_srv))
+      // The presenter's picture: the texture's size, or smaller with supersampling (pdz_supersample).
+      uint32_t out_width = width, out_height = height;
+      OutputSize(tex, out_width, out_height);
+      if (xeswap::Active() && xeswap::StageFrame(*dev, front, view, out_width, out_height, p.lut_srv, width, height))
       {
         // pdz_native_present_timing 1: staged; OnSwap publishes it after the frame's submit, the presenter gets it at
         // its XE_SWAP (xeswap::OnXeSwap) or at the publish.
@@ -1129,7 +1237,7 @@ namespace pdz::native
       pdz::timing::PhaseScope sdk_phase(pdz::timing::Phase::kPresentSdkPre);
       // The display aspect is the guest front buffer's (1280x720 or 640x480); the host texture may be scaled.
       presenter->RefreshGuestOutput(
-          width, height, front.width, front.height,
+          out_width, out_height, front.width, front.height,
           [&](rex::ui::Presenter::GuestOutputRefreshContext &context) -> bool {
             wait.Phase("presenter refresh: the native refresher (gamma pass, EndFrame submit)");
             // After this refresher returns, RefreshGuestOutput continues as present.sdk_post (host vblank latch wait,
@@ -1144,13 +1252,13 @@ namespace pdz::native
             // gamma pass alone, as before).
             postfx::ChainDesc chain;
             chain.output = output;
-            chain.width = width;
-            chain.height = height;
+            chain.width = out_width;
+            chain.height = out_height;
             chain.src_srv = view.srv;
             chain.lut_srv = p.lut_srv;
             chain.effect = postfx::PresentEffect();
             postfx::Effect applied = postfx::Effect::kNone;
-            const bool ok = postfx::RecordChain(*dev, chain, applied);
+            const bool ok = RecordOutput(*dev, chain, width, height, applied);
             dev->Transition(output, state, rex::ui::d3d12::D3D12Presenter::kGuestOutputInternalState);
             // pdz_cutscene_black_detect: this Swap's front buffer sampled for the cutscene dump (off by default).
             if (pdz::csdump::WantBrightness(p.swaps))
@@ -1158,7 +1266,7 @@ namespace pdz::native
               BrightnessProbe(*dev, tex, p.swaps);
             }
             // As the plugin: after FXAA / SMAA the image has more than 8 bits per channel (the presenter's dither rule).
-            context.SetIs8bpc(applied == postfx::Effect::kNone);
+            context.SetIs8bpc(applied == postfx::Effect::kNone && out_width == width && out_height == height);
             dev->EndFrame(); // submits on the provider's direct queue before returning, as required
             pdz::latency::OnNativeSubmit(p.swaps); // pdz_latency_log: a reacting frame's submit
             if (REXCVAR_GET(d3d12_debug))
@@ -1375,6 +1483,10 @@ namespace pdz::native
         std::string s;
         for (uint32_t i = 0; i < 64; ++i)
         {
+          if (!pdz::guestmem::Ok(base, address + i, 1))
+          {
+            return "?"; // Sun 22 Nov night (audit): the bytes are not there
+          }
           const uint8_t c = Load8(base, address + i);
           if (!c)
           {
@@ -1406,24 +1518,26 @@ namespace pdz::native
           }
           return sp.empty() ? raw : fmt::format("{} ({})", sp, raw);
         }
-        if (!IsGuestPointer(game))
+        if (!IsGuestPointer(game) || !pdz::guestmem::Ok(base, game + kGameLevelId, 1)) // Sun 22 Nov night (audit)
         {
           return "?";
         }
         const uint32_t id = Load8(base, game + kGameLevelId);
         const uint32_t ids = Load32(base, kLevelList + 32), entries = Load32(base, kLevelList + 8);
         std::string name = "?";
-        if (IsGuestPointer(ids) && IsGuestPointer(entries))
+        // Sun 22 Nov night (audit): each hop only while it is there.
+        if (IsGuestPointer(ids) && IsGuestPointer(entries) && pdz::guestmem::Ok(base, ids + id * 4, 4))
         {
           const int32_t index = int32_t(Load32(base, ids + id * 4));
           if (index < 0)
           {
             name = "none";
           }
-          else if (index < 4096)
+          else if (index < 4096 && pdz::guestmem::Ok(base, entries + uint32_t(index) * 4, 4))
           {
             const uint32_t entry = Load32(base, entries + uint32_t(index) * 4);
-            name = IsGuestPointer(entry) ? GuestText(base, Load32(base, entry)) : std::string("?");
+            name = IsGuestPointer(entry) && pdz::guestmem::Ok(base, entry, 4) ? GuestText(base, Load32(base, entry))
+                                                                              : std::string("?");
           }
         }
         for (const auto &[internal, menu] : kMenuNames)
@@ -1441,12 +1555,17 @@ namespace pdz::native
       std::string Camera(const uint8_t *base, uint32_t game)
       {
         const uint32_t cutscene = Load32(base, kGameBlock + kCutscenePlayer);
-        const uint32_t cutscene_state = IsGuestPointer(cutscene) ? Load32(base, cutscene + kCutsceneState) : 0;
+        // Sun 22 Nov night (audit): Ok on each object.
+        const uint32_t cutscene_state =
+            IsGuestPointer(cutscene) && pdz::guestmem::Ok(base, cutscene + kCutsceneState, 4)
+                ? Load32(base, cutscene + kCutsceneState)
+                : 0;
         if (cutscene_state == 3)
         {
           return "cutscene";
         }
-        const uint32_t state = IsGuestPointer(game) ? Load32(base, game + kGameState) : ~0u;
+        const uint32_t state =
+            IsGuestPointer(game) && pdz::guestmem::Ok(base, game + kGameState, 4) ? Load32(base, game + kGameState) : ~0u;
         if (state == kStateInLevel)
         {
           return cutscene_state ? fmt::format("gameplay (cutscene state {})", cutscene_state) : std::string("gameplay");
@@ -1549,8 +1668,9 @@ namespace pdz::native
         const uint32_t game = Load32(base, kGameBlock);
         const uint32_t player = Load32(base, kPlayerOne);
         const bool have_player = IsGuestPointer(player);
-        const auto field = [&](uint32_t offset) {
-          return have_player ? Number(LoadFloat(base, player + offset)) : std::string("?");
+        const auto field = [&](uint32_t offset) { // Sun 22 Nov night (audit): Ok on each field
+          return have_player && pdz::guestmem::Ok(base, player + offset, 4) ? Number(LoadFloat(base, player + offset))
+                                                                            : std::string("?");
         };
         const std::string renderer =
             null_backend ? std::string("native (graphics_backend null)")
@@ -1560,7 +1680,10 @@ namespace pdz::native
                              "swap {}, renderer {}, resolution_scale {}{}, shadows {}",
                              number, Level(base, game), field(kPosition), field(kPosition + 4), field(kPosition + 8),
                              field(kViewYaw), field(kViewPitch), Camera(base, game),
-                             have_player ? Zoom(LoadFloat(base, player + kZoom)) : std::string("?"), swap,
+                             have_player && pdz::guestmem::Ok(base, player + kZoom, 4)
+                                 ? Zoom(LoadFloat(base, player + kZoom))
+                                 : std::string("?"),
+                             swap,
                              renderer, Flag("resolution_scale"),
                              native ? fmt::format(" (native {})", Scale()) : std::string(), Shadows());
         autodiff::StartMark(std::move(r));
@@ -1723,6 +1846,7 @@ namespace pdz::native
         if (down && !mark::g_key_was_down)
         {
           mark::g_presses.fetch_add(1, std::memory_order_relaxed);
+          pdz::r3::PointerPress(); // (Wed 18 Nov: F12 also names what is under the crosshair, log only)
         }
         mark::g_key_was_down = down;
       }
@@ -1734,6 +1858,7 @@ namespace pdz::native
         if (m != 0)
         {
           mark::g_presses.fetch_add(1, std::memory_order_relaxed);
+          pdz::r3::PointerPress();
         }
       }
       autodiff::MarkOnSwap();
@@ -1819,7 +1944,10 @@ namespace pdz::native
                           "Test aid: mark this spot: full-resolution capture of the next frame (native, and emulated "
                           "too with the GPU plugin rendering) to logs/marks, and one pdz_mark log line (level, player "
                           "position, look, swap, renderer and shadow settings)",
-                          [] { mark::g_presses.fetch_add(1, std::memory_order_relaxed); });
+                          [] {
+                            mark::g_presses.fetch_add(1, std::memory_order_relaxed);
+                            pdz::r3::PointerPress(); // (Wed 18 Nov: F12 also names what is under the crosshair)
+                          });
   }
 
   void PresentPendingFrame()

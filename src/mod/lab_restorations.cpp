@@ -14,7 +14,9 @@
 // words; flag n = word n/32, bit n%32); the handler gets the XOR against the
 // previous frame in r5..r9, so a branch runs when its flag changes.
 //
-// - pdz_lab_blackout_lines (a): pdz_restore_light_speech's lines (R3,
+// - pdz_lab_blackout_lines (a; on by default since round 3, Sun 15 Nov, with
+//   pdz_restore_light_speech: Rare's recorded lines; the one exception to
+//   "off by default" above): pdz_restore_light_speech's lines (R3,
 //   restorations.cpp), spoken only by staff inside the four light-group
 //   boxes (obbvolume1119000721 / 1006 / 1265, 1125326996; full sizes, traced
 //   in the research), so nobody in the still-lit Lab One / Lab Two says
@@ -40,6 +42,18 @@
 //   the registration value) back, flag 40 is set, and CHAN_07 plays. Guards
 //   the receiver darkens afterwards (wake-ups and spawns test "objective 0
 //   complete", not the power) are restored again after each level message.
+//   Round 8: the light measured at Jo (lab_dark_patches.cpp) is taken again
+//   at once, so a guard or scientist who faces her sees her as the lights
+//   come up (Rare's own sight and reactions; nothing is added). EXPLOSIVES
+//   AFTER THE RETURN: Rare's blackout runs once (flag 38 is already set, so
+//   the handler's lights branch gets no change and the level would stay lit
+//   with the generator blown up). When flag 15 (the generator was blown up)
+//   changes after the lights came back, the lights message (r5 bit 0x40) and
+//   the darkness message (r7 high word bit 0x10) are put into that same call
+//   of Rare's handler: Rare's own lights branch and darkness loop run again,
+//   flag 40 is cleared (the tannoy's promises may return) and the power
+//   stays off for good. Explosives DURING the wait: RestorePower tests flag
+//   15 and leaves the power off.
 // - pdz_lab_darkness_list (c): Rare's data slips in the 29-slot darkness
 //   list the setup marks (8231CF54-8231D3A0, bit 0x4 of +6276). The record
 //   ais/s03generator6 carries the id "s3g4" (a duplicate of s03generator4;
@@ -108,6 +122,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -115,12 +130,15 @@
 
 #include <rex/hook.h>
 #include "guest_function.h" // our indirect calls: nullptr for no function (log 101)
+#include "guest_readable_Sat21Nov.h" // Sun 22 Nov night (audit): pdz::guestmem::Ok
 #include <rex/logging.h>
 #include <rex/ppc/func.h>
 #include <rex/system/kernel_state.h>
 
 #include "../game_cvars.h"
+#include "lab_dark_patches.h"
 #include "lab_restorations.h"
+#include "lab_stealth.h"
 #include "hook_profile.h" // pdz_hook_profile (must follow <rex/hook.h>)
 
 REX_EXTERN(sub_82202D20); // cue name -> cue reference (ref, name)
@@ -283,7 +301,9 @@ namespace
 
   bool IsCharacter(const uint8_t *base, uint32_t character)
   {
-    return IsGuestPointer(character) && IsGuestPointer(Load32(base, character));
+    // Sun 22 Nov night (audit): the character's memory is mapped (slot pointers may be stale).
+    return IsGuestPointer(character) && pdz::guestmem::Ok(base, character, kCharacterScheduler + 4) &&
+           IsGuestPointer(Load32(base, character));
   }
 
   bool Alive(PPCContext &ctx, uint8_t *base, uint32_t character)
@@ -292,7 +312,12 @@ namespace
     {
       return false;
     }
-    PPCFunc *fn = pdz::GuestFunction(Load32(base, Load32(base, character) + kHealthSlot), "lab_restorations health");
+    const uint32_t vtable = Load32(base, character);
+    if (vtable < 0x82000000u || vtable >= 0x83000000u)
+    {
+      return false; // Sun 22 Nov night (audit): no class of the game's (GuestFunction refuses _purecall)
+    }
+    PPCFunc *fn = pdz::GuestFunction(Load32(base, vtable + kHealthSlot), "lab_restorations health");
     if (!fn)
     {
       return false;
@@ -329,12 +354,12 @@ namespace
   uint32_t SetupId(const uint8_t *base, uint32_t character)
   {
     const uint32_t data = Load32(base, character + kCharacterData);
-    if (!IsGuestPointer(data))
+    if (!IsGuestPointer(data) || !pdz::guestmem::Ok(base, data + 0x34, 4))
     {
       return 0;
     }
     const uint32_t text = Load32(base, data + 0x34);
-    if (!IsGuestPointer(text))
+    if (!IsGuestPointer(text) || !pdz::guestmem::Ok(base, text, 4)) // (Sun 22 Nov night (audit))
     {
       return 0;
     }
@@ -475,6 +500,7 @@ namespace
     uint32_t character = 0;  // 0: a Chandra line
     const char *cue = nullptr;
     const char *what = "";
+    uint32_t data = 0;       // Sun 22 Nov night (audit): the speaker's setup data when queued (still him at play)
   };
 
   struct State
@@ -492,6 +518,7 @@ namespace
     int coverage = 0;                   // the level latched at the blackout (0: no blackout yet)
     bool dark = false;                  // the blackout happened (lights or darkness message seen)
     bool relit = false;                 // the power return brought the lights back
+    bool dark_again = false;            // explosives after the return: Rare's blackout was run again
     std::vector<uint32_t> extra_lights; // ours (also in `lights`)
     std::vector<uint32_t> darkened;     // the extra characters we darkened
     // pdz_fix_lab_tannoy_repeat
@@ -520,7 +547,8 @@ namespace
 
   void Queue(State &st, const uint8_t *base, float delay_s, uint32_t character, const char *cue, const char *what)
   {
-    st.pending.push_back(Pending{Clock(base) + delay_s, character, cue, what});
+    const uint32_t data = character && IsCharacter(base, character) ? Load32(base, character + kCharacterData) : 0;
+    st.pending.push_back(Pending{Clock(base) + delay_s, character, cue, what, data});
   }
 
   // Due lines: Chandra's through her queue, a character's as a positioned
@@ -542,7 +570,8 @@ namespace
         SayChandra(ctx, base, line.cue);
         REXLOG_INFO("pdz_lab_cut_lines: {}: Chandra {}", line.what, line.cue + 15);
       }
-      else if (Alive(ctx, base, line.character))
+      else if (IsCharacter(base, line.character) && Load32(base, line.character + kCharacterData) == line.data &&
+               Alive(ctx, base, line.character)) // (Sun 22 Nov night (audit): still the speaker queued)
       {
         SayOn(ctx, base, line.character, line.cue);
         REXLOG_INFO("pdz_lab_cut_lines: {}: {} on {:08X}", line.what, line.cue + 15, line.character);
@@ -1228,6 +1257,7 @@ namespace
     const uint32_t guards = UndarkenGuards(ctx, base);
     st.relit = true;
     SetFlag(base, st.script, kFlagPowerBack);
+    lab_dark::Resample(); // round 8: the light at Jo follows the lights at once
     SayChandra(ctx, base, "XACT_SOUNDBANK_LV05_SPEECH_CHAN_07");
     REXLOG_INFO("pdz_lab_power_return: power back {:.1f} s after the switch: {} lights fading in over {:.1f} s, ambient {}, "
                 "{} guards undarkened, flag 40 set (tannoy promises stop), Chandra LV05_SPEECH_CHAN_07",
@@ -1308,6 +1338,7 @@ REX_HOOK_RAW(sub_8231B778)
   {
     return;
   }
+  lab_stealth::LevelStartSignal(2); // stealth round 3c (fix 1): the stealth layer forgets the attempt before, too
   std::lock_guard<std::mutex> lock(g_mutex);
   g_state = State{};
   g_state.script = script;
@@ -1463,6 +1494,11 @@ namespace
   std::atomic<int64_t> g_tick_ms{0};
 } // namespace
 
+REXCVAR_DEFINE_STRING(pdz_test_lab_set_flag, "", "Testing",
+                      "TESTING TOOL: \"37\" or \"15,39\": these flags of the Laboratory script are set (41,130,29,37,132 = the "
+                      "generator switch as Rare's receiver sets it; 15 and 39 = the generator was blown up; 13 and 39 = the lockbot); "
+                      "Rare's own handler then does what the flags mean. Once per new value")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REX_HOOK_RAW(sub_8231F2E8)
 {
   const uint32_t script = ctx.r3.u32;
@@ -1474,6 +1510,49 @@ REX_HOOK_RAW(sub_8231F2E8)
   if (!IsGuestPointer(script))
   {
     return;
+  }
+  {
+    // TESTING (round 8): pdz_test_lab_set_flag "41,130,29,37,132" (the switch: Rare's receiver 82322B50-82322CD8) or "15,39": the Laboratory script's flags are set as Rare's own
+    // code sets them; Rare's flag-change handler sees the change on its next call. Once per new value.
+    static std::string done;
+    static std::mutex m;
+    const std::string want = REXCVAR_GET(pdz_test_lab_set_flag);
+    std::lock_guard<std::mutex> hold(m);
+    if (want != done)
+    {
+      done = want;
+      std::string list;
+      size_t i = 0;
+      while (i < want.size())
+      {
+        size_t used = 0;
+        int flag = -1;
+        try
+        {
+          flag = std::stoi(want.substr(i), &used);
+        }
+        catch (...)
+        {
+          break;
+        }
+        if (flag >= 0 && flag < 320)
+        {
+          SetFlag(base, script, unsigned(flag));
+          list += " " + std::to_string(flag);
+        }
+        i += used;
+        while (i < want.size() && (want[i] == ',' || want[i] == ' '))
+        {
+          ++i;
+        }
+      }
+      if (!list.empty())
+      {
+        REXLOG_INFO("pdz_test: Laboratory script flag(s) set:{} (41 130 29 37 132 = the generator switch, 15 + 39 = the generator blown "
+                    "up, 13 + 39 = the lockbot)",
+                    list);
+      }
+    }
   }
   const bool power = REXCVAR_GET(pdz_lab_power_return);
   const bool cut = REXCVAR_GET(pdz_lab_cut_lines);
@@ -1501,10 +1580,53 @@ REX_HOOK_RAW(sub_8231F2E8)
 // (type 7 byte 6, 82326A28) registers the prison guards' perception with the
 // light values and applies no darkness: with pdz_lab_blackout_coverage 3 and
 // the blackout on, they are darkened here, in the same call.
+REXCVAR_DEFINE_STRING(pdz_test_lab_message, "", "Testing",
+                      "TESTING TOOL: \"type,byte2,byte3\" (e.g. 7,4,0: Rare's wake-up of the security squads): the "
+                      "Laboratory script's level-message receiver is run once more with that message, right after the "
+                      "next real message it gets. Once per new value")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REX_HOOK_RAW(sub_823223F0)
 {
   const uint32_t script = ctx.r3.u32;
+  if (lab_stealth::HoldLevelMessage(base, ctx.r8.u32))
+  {
+    ctx.r3.u64 = 0; // a reinforcement wave held back during the first alarm (lab_stealth.cpp, alarm tiers)
+    return;
+  }
+  const PPCContext before = ctx;
   __imp__sub_823223F0(ctx, base);
+  {
+    // TESTING (round 7): pdz_test_lab_message: the same call again with the message's type and two bytes swapped for
+    // the wanted ones, in a copy. Rare's type 7 handlers read the script only.
+    static std::string done;
+    static std::mutex m;
+    const std::string want = REXCVAR_GET(pdz_test_lab_message);
+    std::unique_lock<std::mutex> lock(m);
+    const uint32_t message = before.r8.u32;
+    int t = 0, b2 = 0, b3 = 0;
+    if (want != done && IsGuestPointer(script) && IsGuestPointer(message) &&
+        std::sscanf(want.c_str(), "%d,%d,%d", &t, &b2, &b3) == 3)
+    {
+      done = want;
+      lock.unlock();
+      // (The real message lies in the level's read-only data: a copy on the guest stack, above a lowered frame.)
+      const uint8_t keep[3] = {base[message + 1], base[message + 2], base[message + 3]};
+      const uint32_t copy = (before.r1.u32 - 0x100) & ~0xFu;
+      std::memcpy(base + copy, base + message, 16);
+      base[copy + 1] = uint8_t(t);
+      base[copy + 2] = uint8_t(b2);
+      base[copy + 3] = uint8_t(b3);
+      const PPCContext after = ctx;
+      ctx = before;
+      ctx.r1.u64 = copy - 0x200;
+      ctx.r8.u64 = copy;
+      REXLOG_INFO("pdz_test: Laboratory level message sent: type {} bytes {} {} (after a real message of type {} bytes "
+                  "{} {})",
+                  t, b2, b3, int(keep[0]), int(keep[1]), int(keep[2]));
+      __imp__sub_823223F0(ctx, base);
+      ctx = after;
+    }
+  }
   if (!IsGuestPointer(script))
   {
     return;
@@ -1621,9 +1743,44 @@ namespace lab_restorations
     return false;
   }
 
+  int DarkenedBoxOf(const float pos[3])
+  {
+    for (const Box &b : kBoxes)
+    {
+      if (InBox(b, pos))
+      {
+        return b.group;
+      }
+    }
+    return 0;
+  }
+
   void BeforeLabMessage(PPCContext &ctx, uint8_t *base, uint32_t script, const Message &m)
   {
-    (void)ctx;
+    if (REXCVAR_GET(pdz_lab_power_return) && Changed(m, kFlagExplosives) && FlagSet(base, script, kFlagExplosives))
+    {
+      // Round 8: the generator is blown up after the power came back: Rare's own blackout runs again, in this call.
+      std::lock_guard<std::mutex> lock(g_mutex);
+      State &st = StateFor(script);
+      if (st.relit && !st.dark_again)
+      {
+        st.dark_again = true;
+        st.relit = false;
+        ctx.r5.u64 |= 0x40;                  // flag 38's message: Rare's lights branch (8232A264)
+        ctx.r7.u64 |= uint64_t(0x10) << 32;  // flag 132's message: Rare's darkness loop (823282D4)
+        const uint32_t words = Load32(base, script + kScriptFlags);
+        if (IsGuestPointer(words))
+        {
+          const uint32_t address = words + 4 * (kFlagPowerBack / 32);
+          Store32(base, address, Load32(base, address) & ~(1u << (kFlagPowerBack % 32)));
+        }
+        lab_dark::Resample();
+        REXLOG_INFO("pdz_lab_power_return: the generator was blown up {:.1f} s after the power came back: Rare's blackout is "
+                    "run again in this call (lights message and darkness message), flag 40 cleared: the power stays off "
+                    "for good",
+                    Clock(base) - st.arm_clock - float(REXCVAR_GET(pdz_lab_power_return_s)));
+      }
+    }
     if (!REXCVAR_GET(pdz_lab_power_return) || !Changed(m, kFlagLights))
     {
       return;

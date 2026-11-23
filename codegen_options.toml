@@ -22,3 +22,28 @@ stack_direct_access_verify = false
 local_registers = false
 local_registers_verify = false
 local_registers_exclude = [0x828A6490]  # LLVM 22 lld-link crash (Machine Instruction Scheduler) on its lockstep shadow
+
+# CPU performance study 2 (Thu 12 Nov, docs/CPU_STUDY_2.md).
+# iso_volatile: the generated code is built with standard volatile semantics (-fno-ms-volatile,
+# added by CMakeLists.txt from this line) instead of clang's Windows default, where every volatile
+# guest load / store is an atomic acquire / release access that the optimiser treats as touching
+# all memory: the guest registers are written to the context and re-read around every guest memory
+# access. The accesses that were not volatile (vector loads / stores, dcbz, the lwarx read) become
+# volatile, so every function makes the same guest accesses in the same order.
+iso_volatile = true
+
+# phys_offset_branch: the 0xE0000000 view's +0x1000 host offset on its own unlikely path (a
+# compare and a branch) instead of four instructions on every guest access. Same host address.
+phys_offset_branch = true
+
+# direct_calls: a generated function that no hook and no SDK routine replaces (every name not in
+# codegen_replaced.toml, made from a linker map by tools/perf/gen_replaced_functions.py) is a
+# strong alias of its own body and is called directly, so the optimiser may inline calls between
+# recompiled functions. A hook added later for such a function fails the link (duplicate symbol)
+# until the list is regenerated; it is never skipped silently.
+direct_calls = false
+
+# prefetch_hints: the game's own prefetch instructions (dcbt / dcbtst, 689 in the code, most of
+# them in the render thread's hot loops), which the recompiler otherwise drops, become host
+# prefetches of the same 128-byte line. A prefetch changes no register or memory and never faults.
+prefetch_hints = false

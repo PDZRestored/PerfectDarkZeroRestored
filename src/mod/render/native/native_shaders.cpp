@@ -2,6 +2,16 @@
 // dumps, coverage log. Hot path: two hash-map lookups per draw (pixel by hash, vertex by (object, decl)).
 #include "native_shaders.h"
 #include "../cpu_placement.h"
+#include "../../guest_readable_Sat21Nov.h" // Sun 22 Nov night (audit): pdz::guestmem::Ok
+
+namespace
+{
+  // Sun 22 Nov night (audit): [a, a + n) readable where shadow::GuestPtr reads it (the physical window's offset).
+  inline bool GuestOk(const uint8_t *base, uint32_t a, uint32_t n)
+  {
+    return a < 0xFFFF0000u && pdz::guestmem::Ok(base, a >= 0xE0000000u ? a + 0x1000u : a, n);
+  }
+} // namespace
 
 #include <algorithm>
 #include <cstdio>
@@ -1926,10 +1936,25 @@ namespace pdz::native
         auto it = im.loaded.find(entry->hash);
         const uint8_t *ucode =
             shadow::IsGuestPointer(entry->ucode_src) ? shadow::GuestPtr(base, entry->ucode_src) : nullptr;
+        // Sun 22 Nov night (audit): the create-time copy as the miss path below takes it (the container in the
+        // game's memory may be freed or reused by now); else the game's bytes only while they are still there.
+        if (const std::vector<uint8_t> *kept = shadow::FindPixelUcode(entry->object);
+            kept && kept->size() == entry->ucode_bytes && XXH3_64bits(kept->data(), kept->size()) == entry->hash)
+        {
+          ucode = kept->data();
+        }
+        else if (ucode && !GuestOk(base, entry->ucode_src, entry->ucode_bytes))
+        {
+          ucode = nullptr;
+        }
         if (it != im.loaded.end() && it->second == s)
         {
           const uint32_t bytes = entry->ucode_bytes <= kMaxUcodeBytes ? entry->ucode_bytes : 0;
-          const uint32_t container = ucode && bytes ? binder::FindContainer(base, *entry) : 0;
+          uint32_t container = ucode && bytes ? binder::FindContainer(base, *entry) : 0;
+          if (container && !GuestOk(base, container, entry->ucode_src - container + bytes))
+          {
+            container = 0; // Sun 22 Nov night (audit): not all of it is there any more
+          }
           coissue::Apply(*it->second, ucode, bytes, container ? shadow::GuestPtr(base, container) : nullptr,
                          container ? entry->ucode_src - container + bytes : 0);
         }
@@ -1949,6 +1974,20 @@ namespace pdz::native
                       im.first_use_ps_logged == kFirstUseLogLines
                           ? "; further ones only in the periodic shader cache line"
                           : "");
+        }
+        // pdz_frame_timing_item_ms: the patch check alone (the file load may have been done ahead of this frame).
+        if (pdz::timing::SlowItemWanted(patch_ms))
+        {
+          const uint32_t compiled = depth20e4::CompileCount() - compiles;
+          pdz::timing::SlowItem("pixel shader first use", patch_ms,
+                                fmt::format("ps {}: patch check {:.1f} ms, {} ({} bytes DXIL, {} bytes of patched "
+                                            "source; file load {:.1f} ms)",
+                                            HashName(entry->hash), patch_ms,
+                                            compiled ? fmt::format("{} COMPILE(S) on the render thread (not in the "
+                                                                   "disk cache)",
+                                                                   compiled)
+                                                     : std::string("no compile here"),
+                                            s->dxil.size(), s->coissue_hlsl.size(), s->load_ms));
         }
       }
       ++stats_.hits;
@@ -2080,7 +2119,10 @@ namespace pdz::native
       {
         return kept->data();
       }
-      return shadow::IsGuestPointer(entry->ucode_src) ? shadow::GuestPtr(base, entry->ucode_src) : nullptr;
+      // Sun 22 Nov night (audit): the create-time container only while it is there (it is freed after the create).
+      return shadow::IsGuestPointer(entry->ucode_src) && GuestOk(base, entry->ucode_src, entry->ucode_bytes)
+                 ? shadow::GuestPtr(base, entry->ucode_src)
+                 : nullptr;
     }
 
     // A bound copy is a variant of this VS only if its first control-flow triple (dwords 0-2) equals the created
@@ -2476,7 +2518,7 @@ namespace pdz::native
                                   _byteswap_ulong(decl->elements_be[e][1]), _byteswap_ulong(decl->elements_be[e][2]));
           }
         }
-        if (parent)
+        if (parent && GuestOk(base, entry->ucode_src - 48u, 48)) // Sun 22 Nov night (audit)
         {
           for (int32_t off = -48; off < 0; off += 4)
           {

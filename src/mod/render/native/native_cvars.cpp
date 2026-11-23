@@ -42,6 +42,17 @@ REXCVAR_DEFINE_INT32(pdz_native_scale, 1, "Render",
                      "and what is approximate.")
     .range(1, 4);
 
+REXCVAR_DEFINE_INT32(pdz_supersample, 100, "Render",
+                     "Native renderer as the only output: supersampling, in percent of the render scale (100 = off, "
+                     "150, 200). The game is drawn at a higher integer scale (the scale x this, rounded: at least one "
+                     "step up, at most 6) and the finished frame is shrunk to the normal size with an area filter "
+                     "before it is shown: sharper, smoother edges, at a large cost in GPU time and video memory. At "
+                     "the start the choice is checked against the graphics card's dedicated memory (an estimate) and "
+                     "lowered, with a warning in the log, if it would not fit. The Graphics tab's Render scale row "
+                     "writes it")
+    .range(100, 200)
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 REXCVAR_DEFINE_INT32(pdz_native_scale_follow, 1, "Render",
                      "Native renderer: take the resolution scale from the GPU plugin's resolution_scale (or "
                      "draw_resolution_scale_x / _y, as the plugin reads them) at startup, unless pdz_native_scale is "
@@ -213,6 +224,9 @@ namespace pdz::native
     // 0 = not latched yet. Written by ChooseScaleAtStartup (app setup, before any guest thread) or by the first
     // Scale() call (a game thread, the render mutex held).
     uint32_t g_scale = 0;
+    // The picture's scale (OutputScale): g_scale unless supersampling raised g_scale above it. Written with g_scale.
+    uint32_t g_output_scale = 0;
+    constexpr uint32_t kMaxRenderScale = 6; // supersampling only; pdz_native_scale itself stays 1..4
 
     void LogScaleDetail(uint32_t scale)
     {
@@ -242,15 +256,112 @@ namespace pdz::native
     }
   } // namespace
 
+  uint64_t DedicatedVideoMemoryBytes()
+  {
+    static const uint64_t bytes = GuessHardware().vram_mb * 1024ull * 1024ull;
+    return bytes;
+  }
+
+  namespace
+  {
+    // Supersampling's memory estimate (an estimate, calibrated on one measurement: 7.3 GB in use at 4K, scale 3, with
+    // 3.4 GB of shadow maps): 2 GB that does not scale (textures, buffers, shaders, the desktop) + 160 bytes per
+    // rendered pixel (every colour / depth target and resolve copy of a 1280 x 720 guest frame at the render scale)
+    // + the six shadow surfaces (4 bytes a texel).
+    uint64_t EstimateVideoBytes(uint32_t render, uint32_t output, uint32_t shadow_k)
+    {
+      constexpr uint64_t kFixed = 2048ull * 1024 * 1024, kBytesPerPixel = 160;
+      const uint64_t targets = 1280ull * 720ull * render * render * kBytesPerPixel;
+      const uint64_t side = uint64_t(kShadowMapSize) * std::min<uint32_t>(std::max(output * shadow_k, render), 12);
+      return kFixed + targets + 6ull * side * side * 4ull;
+    }
+
+    // The shadow map factor the session will most likely latch (pdz_shadow_map_scale, or the Long shadows preset's:
+    // sun_shadows.cpp raises it at the first shader; 3 on cards with 12 GB or more).
+    uint32_t LikelyShadowFactor(uint64_t vram)
+    {
+      uint32_t k = uint32_t(std::clamp(REXCVAR_GET(pdz_shadow_map_scale), 1, 4));
+      if (rex::cvar::GetFlagByName("pdz_long_shadows") == "true")
+      {
+        const int32_t preset = FlagInt("pdz_long_shadows_map_scale");
+        // As sun_shadows.cpp ApplyPreset: the player's own value if set, else 3 from 11.5 GiB of video memory, else 2.
+        const uint32_t automatic = vram >= (uint64_t(23) << 29) ? 3u : 2u;
+        k = std::max<uint32_t>(k, preset > 0 ? uint32_t(std::min(preset, 4)) : automatic);
+      }
+      return k;
+    }
+
+    // g_scale holds the picture's scale: latch g_output_scale, and raise g_scale for pdz_supersample when the native
+    // renderer is the only output and the estimate fits the graphics card.
+    void ApplySupersample()
+    {
+      g_output_scale = g_scale;
+      const int32_t percent = REXCVAR_GET(pdz_supersample);
+      if (percent <= 100)
+      {
+        return;
+      }
+      if (!pdz::gpusync::NullBackend())
+      {
+        REXLOG_WARN("pdz_native: supersampling (pdz_supersample {}) is only for the native renderer as the only output: "
+                    "off",
+                    percent);
+        return;
+      }
+      const uint32_t base = g_scale;
+      const uint32_t wanted =
+          std::min(std::max(base + 1, (base * uint32_t(percent) + 49) / 100), kMaxRenderScale);
+      const uint64_t vram = DedicatedVideoMemoryBytes();
+      const uint32_t k = LikelyShadowFactor(vram);
+      uint32_t chosen = wanted;
+      if (vram)
+      {
+        const uint64_t budget = vram / 10 * 8; // 80 %: the rest for the desktop and other programs
+        while (chosen > base && EstimateVideoBytes(chosen, base, k) > budget)
+        {
+          --chosen;
+        }
+        if (chosen != wanted)
+        {
+          REXLOG_WARN("pdz_native: supersampling: pdz_supersample {} asks for render scale {} over the picture's {} "
+                      "(about {} MB of video memory by estimate), more than 80 % of the graphics card's {} MB: {}",
+                      percent, wanted, base, EstimateVideoBytes(wanted, base, k) / (1024 * 1024), vram / (1024 * 1024),
+                      chosen > base ? fmt::format("render scale {} instead (about {} MB)", chosen,
+                                                  EstimateVideoBytes(chosen, base, k) / (1024 * 1024))
+                                    : std::string("supersampling off"));
+        }
+      }
+      if (chosen <= base)
+      {
+        return;
+      }
+      g_scale = chosen;
+      REXLOG_INFO("pdz_native: supersampling ON (pdz_supersample {}): the game is drawn at scale {} ({}x{} for a 1280x720 "
+                  "frame) and shrunk to scale {} ({}x{}, {:.0f} % a side) with an area filter before it is shown; "
+                  "estimate {} MB of video memory (shadow map factor {}), graphics card {} MB{}",
+                  percent, chosen, 1280 * chosen, 720 * chosen, base, 1280 * base, 720 * base,
+                  100.0 * double(chosen) / double(base), EstimateVideoBytes(chosen, base, k) / (1024 * 1024), k,
+                  vram / (1024 * 1024), vram ? "" : " (unknown: not checked)");
+      LogScaleDetail(g_scale);
+    }
+  } // namespace
+
   uint32_t Scale()
   {
     if (!g_scale)
     {
       g_scale = uint32_t(std::clamp(REXCVAR_GET(pdz_native_scale), 1, 4));
+      g_output_scale = g_scale; // no supersampling on this path (the GPU plugin renders too)
       REXLOG_INFO("pdz_native: resolution scale {} latched", g_scale);
       LogScaleDetail(g_scale);
     }
     return g_scale;
+  }
+
+  uint32_t OutputScale()
+  {
+    const uint32_t scale = Scale(); // latches both
+    return g_output_scale ? g_output_scale : scale;
   }
 
   uint32_t SurfaceScale(uint32_t width, uint32_t height)
@@ -258,6 +369,22 @@ namespace pdz::native
     const uint32_t scale = Scale();
     if (width != kShadowMapSize || height != kShadowMapSize)
     {
+      // D3D12's 16384 texture limit: only reachable with supersampling (scale 5 or 6) and a guest surface wider than
+      // 2730; such a surface gets the largest scale that fits.
+      const uint32_t side = std::max(width, height);
+      if (scale > 4 && side && side * scale > 16384)
+      {
+        const uint32_t fits = std::max<uint32_t>(16384 / side, 1);
+        static bool logged = false;
+        if (!logged)
+        {
+          logged = true;
+          REXLOG_WARN("pdz_native: supersampling: a {}x{} guest surface at scale {} would pass the 16384 texture limit: "
+                      "scale {} for surfaces of that size",
+                      width, height, scale, fits);
+        }
+        return fits;
+      }
       return scale;
     }
     // 0 = not latched yet; the first shadow surface or mirror latches it (render mutex held, like Scale()). The product
@@ -267,8 +394,11 @@ namespace pdz::native
     if (!shadow_scale)
     {
       const uint32_t k = uint32_t(std::clamp(REXCVAR_GET(pdz_shadow_map_scale), 1, 4));
-      shadow_scale = std::min(scale * k, kMaxShadowScale);
-      g_shadow_relative.store(float(shadow_scale) / float(scale), std::memory_order_relaxed);
+      // The picture's scale x the factor, never below the render scale (supersampling: OutputScale() < Scale(); the
+      // shadow maps then grow only as far as the frame they are drawn for). Without supersampling: scale x k, as before.
+      const uint32_t output = OutputScale();
+      shadow_scale = std::min(std::max(output * k, scale), kMaxShadowScale);
+      g_shadow_relative.store(float(shadow_scale) / float(output), std::memory_order_relaxed);
       if (k > 1)
       {
         const uint64_t side = uint64_t(kShadowMapSize) * shadow_scale;
@@ -294,7 +424,8 @@ namespace pdz::native
     // (log 130: the far bias was x8 for the first frames, then x4 once the surface latched).
     const uint32_t k = uint32_t(std::clamp(REXCVAR_GET(pdz_shadow_map_scale), 1, 4));
     constexpr uint32_t kMaxShadowScale = 16384 / kShadowMapSize; // 12, as SurfaceScale caps it
-    return float(std::min(g_scale * k, kMaxShadowScale)) / float(g_scale);
+    const uint32_t output = g_output_scale ? g_output_scale : g_scale;
+    return float(std::min(std::max(output * k, g_scale), kMaxShadowScale)) / float(output);
   }
 
   void ChooseScaleAtStartup()
@@ -313,6 +444,7 @@ namespace pdz::native
                   "GPU plugin's resolution_scale ({}) is not followed",
                   g_scale, why, rex::cvar::GetFlagByName("resolution_scale"));
       LogScaleDetail(g_scale);
+      ApplySupersample();
       return;
     }
     // The plugin's rule (TextureCache::GetConfigDrawResolutionScale): resolution_scale when it is not the default,
@@ -325,6 +457,7 @@ namespace pdz::native
                   "registered (no GPU plugin loaded?), pdz_native_scale used",
                   g_scale, why);
       LogScaleDetail(g_scale);
+      ApplySupersample();
       return;
     }
     const bool use_shared = rex::cvar::HasNonDefaultValue("resolution_scale");
@@ -346,5 +479,6 @@ namespace pdz::native
                   x != y ? "uneven" : "above the native renderer's 4", g_scale);
     }
     LogScaleDetail(g_scale);
+    ApplySupersample();
   }
 } // namespace pdz::native

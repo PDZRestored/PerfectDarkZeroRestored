@@ -28,11 +28,13 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <fmt/format.h>
 #include <fmt/xchar.h>
 #include <rex/cvar.h>
+#include <rex/graphics/video_mode_util.h> // the Resolution row reads a saved size as the game does
 #include <rex/logging.h>
 #include <rex/ui/keybinds.h>
 
@@ -260,6 +262,11 @@ namespace pdz::settings_ui
       return choice == 1 ? v75 : choice == 2 ? (v50 == v75 && v75 > 1 ? v75 - 1 : v50) : base;
     }
 
+    // The Render scale row's segments, left to right: 200%, 150%, 100%, 75%, 50%. A "choice" is the segment's
+    // distance from 100%: -2 and -1 = supersampling (pdz_supersample 200 / 150; pdz_native_scale stays the screen's
+    // own), 0 = 100%, 1 and 2 = ScaleForChoice.
+    constexpr int kScaleSeg100 = 2;
+
     std::wstring W(const std::string &s) { return std::wstring(s.begin(), s.end()); }
 
     // ---- the PC ----
@@ -351,6 +358,13 @@ namespace pdz::settings_ui
                                         : fmt::format(L"{}\u00B0", position);
     }
 
+    // Guard voices: pdz_guard_voice_db (voice_volume.cpp: every character's speech, XACT speech_characters), whole dB.
+    constexpr int kVoiceMinDb = -12, kVoiceMaxDb = 9, kVoiceDefaultDb = 3;
+    std::wstring VoiceText(int db)
+    {
+      return db == 0 ? std::wstring(L"0 dB (Rare's)") : fmt::format(L"{:+d} dB", db);
+    }
+
     std::wstring AutoNote(DWORD hz)
     {
       if (hz >= 239)
@@ -395,7 +409,9 @@ namespace pdz::settings_ui
     enum Tab
     {
       kTabDisplay,
+      kTabGraphics, // 0.9.5: what changes the look
       kTabFrameRate,
+      kTabGameplay, // 0.9.5: what changes play
       kTabPacks,
       kTabControls,
       kTabAdvanced,
@@ -405,7 +421,7 @@ namespace pdz::settings_ui
     enum Id
     {
       kTabs = 100,
-      kTabButton0 = 180, // ..184: the side bar's tabs (clear of every other id)
+      kTabButton0 = 180, // ..186: the side bar's tabs (clear of every other id)
       kMonitor = 101,
       kMode,
       kResolution,
@@ -460,6 +476,27 @@ namespace pdz::settings_ui
       kDontShow,
       kSafe,
       kPlay,
+      kVoiceVol = 600, // Gameplay (under Stealth): Guard voices slider (pdz_guard_voice_db)
+      kVoiceVolValue,
+      kVoiceVolDefault,
+      // Graphics (0.9.5). Render scale (kScale) is on this tab too.
+      kGfxUpscale = 640, // Smooth / Sharpen / FSR (present_effect)
+      kGfxAA,            // None / FXAA / SMAA (swap_post_effect)
+      kGfxMsaaUnused,    // was the 2x MSAA switch (native_2x_msaa does nothing in this game); the id stays reserved
+      kGfxAniso,         // Rare's / 2x / 4x / 8x / 16x (anisotropic_override)
+      kGfxFar,           // switch (pdz_far_lighting)
+      kGfxFarBeams,      // no control since the Visual preset row (pdz_far_lighting_beams: on with either preset); the id stays reserved
+      kGfxLongShadows,   // Off / 40 m / 60 m / 80 m (pdz_long_shadows, pdz_long_shadows_distance 2 / 3 / 4)
+      kGfxPreset,        // Visual preset: Performance / Quality / Custom (the four rows below show for Custom only)
+      kGfxBeamsFull,     // switch (pdz_far_lighting_beams_no_fade)
+      kGfxSpRate,        // Auto / 120 fps / 60 fps (pdz_sp_auto, pdz_sp_120: the same choices as the Frame rate tab's Campaign row; each follows the other)
+      // Gameplay (0.9.5).
+      kPlayPreset = 660, // Restored / Original / Custom (Thu 19 Nov): the gameplay switches at once; Custom shows them
+      kPlayNote,
+      kPlayCover,        // switch (pdz_ai_cover_fixes)
+      kPlayStealth,      // switch (pdz_lab_guard_stealth)
+      kPlayAim,          // switch (pdz_aim_still_lock, pdz_aim_respect_headshots, pdz_aim_assist_zoomed)
+      kPlaySounds,       // switch (pdz_restored_sounds) (Thu 19 Nov)
     };
 
     struct Ui
@@ -474,6 +511,7 @@ namespace pdz::settings_ui
       std::wstring tab_help[kTabCount];
       std::vector<Monitor> monitors;
       std::vector<std::pair<DWORD, DWORD>> modes;
+      bool res_extra = false; // modes' last entry is the settings file's size, not one this display lists
       Choice choice = Choice::kQuit;
       bool done = false;
       bool save_on_close = true; // the close box saves like Play (0.9.2); the capture test closes without saving
@@ -497,6 +535,14 @@ namespace pdz::settings_ui
       std::map<int, Segmented> segs;
       std::map<int, int> seg_group; // a segment button's id -> its group's id
       std::map<int, bool> toggles;  // a switch's id -> on
+      // Graphics, Visual preset: the Custom rows' controls (hidden for Performance / Quality), Custom picked by hand
+      // (it then stays whatever the rows say), the hidden-room beams' value (no row), and "a row was touched".
+      std::vector<HWND> gfx_custom;
+      bool gfx_custom_pick = false, gfx_far_beams = true, gfx_touched = false;
+      bool gfx_earlier_quality = false; // the saved values are the earlier Quality preset (Auto): opened as Quality (60)
+      // Gameplay (Thu 19 Nov): the rows shown for Custom only, and Custom picked by hand (kept while it is open).
+      std::vector<HWND> play_custom;
+      bool play_custom_pick = false;
       struct Drop
       {
         std::vector<std::wstring> items;
@@ -540,11 +586,24 @@ namespace pdz::settings_ui
       } dial;
       // The update check (update_check.h): the newer release, once known, shown in the side bar.
       std::string update_version, update_page;
+      // The help strip's height on each tab (logical px): the Graphics and Gameplay tabs' help lines are longer than
+      // two lines, so their strip is taller (their pages are short).
+      int help_h[kTabCount] = {};
+      // The Graphics and Gameplay rows as loaded: Save writes a row's lines only when the row was changed.
+      struct Extras
+      {
+        int upscale = 0, aa = 0, aniso = 0;
+        bool far_lighting = true, far_beams = true, cover = true, stealth = true, aim = true, sounds = true;
+        int long_shadows = 0; // 0 off, 1 / 2 / 3 = 40 / 60 / 80 m
+        bool beams_full = false, skip_none = false;
+        bool custom = false; // pdz_visual_custom: the saved values say the Visual preset row is on Custom
+      } loaded;
       int px(int v) const { return MulDiv(v, dpi, 96); }
     };
     // The layout (logical pixels at 96 dpi): side bar, content, help strip, footer. Page controls end above the help
     // strip: their y (from kContentDy) + height <= kWindowH - kFooterH - kHelpH - kContentDy = 460.
     constexpr int kWindowW = 880, kWindowH = 640, kSideW = 200, kFooterH = 72, kHelpH = 68;
+    constexpr int kHelpTallH = 124; // the Graphics and Gameplay tabs' strip: up to six lines
     // Page controls are laid out from (28, 48) as before; they sit right of the side bar and under the heading.
     constexpr int kContentDx = kSideW + 4, kContentDy = 40;
     constexpr COLORREF kPanelAlt = RGB(0x12, 0x22, 0x4F); // every other row of the key list
@@ -963,10 +1022,132 @@ namespace pdz::settings_ui
       return theme::ShowMessage(owner, text, caption, flags & MB_ICONMASK, flags & MB_TYPEMASK);
     }
 
+    // A switch with its bold label on the left; the switch itself reads On / Off.
+    HWND Switch(Ui &ui, int tab, const std::wstring &label, int x, int y, int label_w, int cx, int id, bool on,
+                const std::wstring &help, bool bold = true)
+    {
+      Label(ui, tab, label, x, y + 4, label_w, bold);
+      HWND b = Button(ui, tab, on ? L"On" : L"Off", cx, y, 110, id, help, BS_AUTOCHECKBOX);
+      ui.toggles[id] = on;
+      return b;
+    }
+
+    void SetSwitch(Ui &ui, int id, bool on)
+    {
+      SetWindowTextW(GetDlgItem(ui.window, id), on ? L"On" : L"Off");
+      SetChecked(ui, id, on);
+    }
+
+    // Gameplay (Thu 19 Nov): Restored (0) when every gameplay switch is on, Original (1) when all are off, Custom (2)
+    // when they are mixed or Custom was picked; the switches show for Custom only. No graphics setting is read or
+    // changed by it.
+    constexpr int kPlaySwitches[] = {kPlayCover, kPlayStealth, kPlayAim, kPlaySounds};
+    constexpr const wchar_t *kPlayPresetHelp[3] = {
+        L"Restored: the game as PDZ Restored intends it. Rare's bugs fixed, guard cover fixed, the stealth layer, aim "
+        L"enhancements and restored sounds, all on.",
+        L"Original: Rare's Xbox 360 game as it shipped. Everything on this tab off.",
+        L"Custom: choose each option below yourself."};
+    void ShowPlayRows(Ui &ui)
+    {
+      const bool show = ui.tab == kTabGameplay && Sel(ui, kPlayPreset) == 2;
+      for (HWND c : ui.play_custom)
+      {
+        ShowWindow(c, show ? SW_SHOW : SW_HIDE);
+      }
+    }
+    void RefreshPreset(Ui &ui)
+    {
+      int on = 0;
+      for (int sw : kPlaySwitches)
+      {
+        on += int(Checked(ui, sw));
+      }
+      const int all = int(std::size(kPlaySwitches));
+      const int preset = ui.play_custom_pick ? 2 : on == all ? 0 : on == 0 ? 1 : 2;
+      ui.play_custom_pick = preset == 2;
+      SetSel(ui, kPlayPreset, preset);
+      ShowPlayRows(ui);
+    }
+
+    // Graphics, the Visual preset row (Mon 16 Nov). Performance: far lighting with the hidden-room beams, Rare's
+    // shadows and beams, single player at 120 fps. Quality: the same plus long shadows to 60 m and full
+    // streetlight beams, single player at a fixed 60 fps on every level (Tue 17 Nov: the paced 60, pdz_sp_120 off;
+    // Auto is a Custom choice only). Custom: the four rows below it, shown only then. The presets set
+    // those rows (and the Frame rate tab's Campaign row), so Save writes the same lines whichever way a value was set.
+    constexpr const wchar_t *kVisualPresetHelp[3] = {
+        L"Rare's look with distant lights fixed, at up to 120 fps.",
+        L"Extra detail: longer shadows and full streetlight beams, at a steady 60 fps. Applies the next time you "
+        L"start the game.",
+        L"Choose each option below yourself."};
+
+    // What the rows say: 0 Performance, 1 Quality, 2 neither.
+    int VisualPresetOfRows(Ui &ui)
+    {
+      const int shadows = Sel(ui, kGfxLongShadows);
+      const bool full = Checked(ui, kGfxBeamsFull);
+      const int rate = Sel(ui, kCampaign); // 0 Auto, 1 120 fps, 2 60 fps
+      if (!Checked(ui, kGfxFar) || !ui.gfx_far_beams)
+      {
+        return 2;
+      }
+      return shadows == 0 && !full && rate == 1 ? 0 : shadows == 2 && full && rate == 2 ? 1 : 2; // Quality: 60 fps
+    }
+
+    void ShowVisualRows(Ui &ui)
+    {
+      const bool show = ui.tab == kTabGraphics && Sel(ui, kGfxPreset) == 2;
+      for (HWND c : ui.gfx_custom)
+      {
+        ShowWindow(c, show ? SW_SHOW : SW_HIDE);
+      }
+    }
+
+    // After a Custom row or the Frame rate tab's Campaign row was changed by hand: the two frame rate rows agree, and
+    // the preset shown follows the rows (Custom once they match neither preset, or once Custom was picked).
+    void RefreshVisualPreset(Ui &ui)
+    {
+      ui.gfx_touched = true;
+      SetSel(ui, kGfxSpRate, Sel(ui, kCampaign));
+      const int preset = VisualPresetOfRows(ui);
+      ui.gfx_custom_pick = ui.gfx_custom_pick || preset == 2;
+      SetSel(ui, kGfxPreset, ui.gfx_custom_pick ? 2 : preset);
+      ShowVisualRows(ui);
+    }
+
+    // A click on Performance / Quality / Custom (and Restore defaults: Performance).
+    void ApplyVisualPreset(Ui &ui, int preset, bool help = true)
+    {
+      ui.gfx_touched = true;
+      ui.gfx_custom_pick = preset == 2;
+      if (preset != 2)
+      {
+        const bool quality = preset == 1;
+        SetSwitch(ui, kGfxFar, true);
+        ui.gfx_far_beams = true;
+        SetSel(ui, kGfxLongShadows, quality ? 2 : 0);
+        SetSwitch(ui, kGfxBeamsFull, quality);
+        SetSel(ui, kGfxSpRate, quality ? 2 : 1); // Quality: a fixed 60 fps (Tue 17 Nov). Performance: 120 fps
+        SetSel(ui, kCampaign, quality ? 2 : 1);
+      }
+      SetSel(ui, kGfxPreset, preset);
+      ShowVisualRows(ui);
+      if (help)
+      {
+        SetHelp(ui, kVisualPresetHelp[preset]);
+      }
+    }
+
     void ShowTab(Ui &ui, int tab)
     {
       DialRelease(ui);
       ui.tab = tab;
+      if (ui.help)
+      {
+        // The help strip at this tab's height.
+        const int h = ui.help_h[tab] > 0 ? ui.help_h[tab] : kHelpH;
+        MoveWindow(ui.help, ui.px(kSideW + 60), ui.px(kWindowH - kFooterH - h + 4), ui.px(kWindowW - kSideW - 60 - 24),
+                   ui.px(h - 8), FALSE);
+      }
       for (HWND b : ui.tab_buttons)
       {
         InvalidateRect(b, nullptr, FALSE);
@@ -979,6 +1160,8 @@ namespace pdz::settings_ui
           ShowWindow(c, t == tab ? SW_SHOW : SW_HIDE);
         }
       }
+      ShowVisualRows(ui); // Graphics: the Custom rows only with Custom
+      ShowPlayRows(ui);   // Gameplay: the same (Thu 19 Nov)
       SetHelp(ui, ui.tab_help[tab]);
     }
 
@@ -1597,18 +1780,32 @@ namespace pdz::settings_ui
       const int mode = Sel(ui, kMode); // 0 borderless, 1 fullscreen, 2 windowed
       keys.push_back({"fullscreen", mode == 2 ? "false" : "true"});
       keys.push_back({"fullscreen_exclusive", mode == 1 ? "true" : "false"});
+      // Sun 22 Nov: the row is always written, so the file holds what the window shows. "Desktop resolution" removes
+      // the line (it wrote nothing before, and an old size stayed: exclusive fullscreen then ran at that size while
+      // the window said Desktop). A listed size is written in every screen mode (it applies in Fullscreen).
       const int res = Sel(ui, kResolution);
-      if (mode == 1 && res > 0 && size_t(res - 1) < ui.modes.size())
+      if (res > 0 && size_t(res - 1) < ui.modes.size())
       {
         keys.push_back({"resolution", fmt::format("\"{}x{}\"", ui.modes[size_t(res - 1)].first,
                                                   ui.modes[size_t(res - 1)].second)});
       }
+      else
+      {
+        keys.push_back({"resolution", ""});
+      }
       // Render scale: the native renderer's integer scale, from the desktop height as its auto profile (100% = auto).
       const Monitor &m = ui.monitors.empty() ? Monitor{} : ui.monitors[size_t(std::max(0, mon))];
-      const int scale_sel = Sel(ui, kScale);
+      const int scale_sel = Sel(ui, kScale) < 0 ? 0 : Sel(ui, kScale) - kScaleSeg100; // -2 .. 2, see kScaleSeg100
       keys.push_back({"pdz_native_scale",
-                      scale_sel == 0 ? std::string() : fmt::format("{}", ScaleForChoice(scale_sel, int(m.height)))});
-      if (scale_sel == 0 && rex::cvar::GetFlagSource("pdz_native_scale") == rex::cvar::Source::kConfig)
+                      scale_sel <= 0 ? std::string() : fmt::format("{}", ScaleForChoice(scale_sel, int(m.height)))});
+      // Above 100%: supersampling (the native renderer draws at a higher scale and shrinks the frame).
+      keys.push_back({"pdz_supersample", scale_sel == -1 ? std::string("150") : scale_sel == -2 ? std::string("200")
+                                                                                                : std::string()});
+      if (scale_sel >= 0 && rex::cvar::GetFlagSource("pdz_supersample") == rex::cvar::Source::kConfig)
+      {
+        rex::cvar::ResetToDefault("pdz_supersample"); // off for this start too, as the scale below
+      }
+      if (scale_sel <= 0 && rex::cvar::GetFlagSource("pdz_native_scale") == rex::cvar::Source::kConfig)
       {
         // 100%: the line is removed, and the value the file had is dropped for this start too, so the native
         // renderer's own pick applies now (not one start later). A command-line value is left alone.
@@ -1624,12 +1821,108 @@ namespace pdz::settings_ui
       keys.push_back({"vsync", vs == 2 ? "false" : "true"});
       const int fov_pos = int(SendMessageW(GetDlgItem(ui.window, kFov), TBM_GETPOS, 0, 0));
       keys.push_back({"pdz_fov_scale", fmt::format("{:.3f}", FovScaleOfPosition(fov_pos))});
-      const int fps = Sel(ui, kCampaign); // auto, 120, 60
+      const int voice_db = int(SendMessageW(GetDlgItem(ui.window, kVoiceVol), TBM_GETPOS, 0, 0));
+      keys.push_back({"pdz_guard_voice_db", fmt::format("{}.0", voice_db)});
+      const int fps = Sel(ui, kCampaign); // auto (120, the paced 60 on a level that cannot keep it), 120, 60
       keys.push_back({"pdz_sp_120", fps == 2 ? "false" : "true"});
+      keys.push_back({"pdz_sp_auto", fps == 0 ? "true" : "false"});
       const int split = Sel(ui, kSplitCap); // auto, 60, 40, 30 (pdz_splitscreen_cap: 0 = auto)
       keys.push_back({"pdz_splitscreen_cap", split == 1 ? "60" : split == 2 ? "40" : split == 3 ? "30" : "0"});
       keys.push_back({"pdz_settings_show", Checked(ui, kDontShow) ? "false" : "true"});
       keys.push_back({"pdz_update_check", Checked(ui, kUpdateCheck) ? "true" : "false"});
+      // Graphics and Gameplay (0.9.5): a row's lines are written only when the row was changed in the window, so a
+      // player who never touches a row gets no change in the file (and a hand-set value stays).
+      {
+        std::string changed;
+        auto set = [&](const char *key, const std::string &value)
+        {
+          keys.push_back({key, value});
+          changed += fmt::format("{}{} = {}", changed.empty() ? "" : ", ", key, value);
+        };
+        auto flag = [](bool on) { return std::string(on ? "true" : "false"); };
+        if (const int sel = Sel(ui, kGfxUpscale); sel >= 0 && sel != ui.loaded.upscale)
+        {
+          set("present_effect", sel == 0 ? "\"bilinear\"" : sel == 1 ? "\"cas\"" : "\"fsr\"");
+        }
+        if (const int sel = Sel(ui, kGfxAA); sel >= 0 && sel != ui.loaded.aa)
+        {
+          set("swap_post_effect", sel == 0 ? "\"none\"" : sel == 1 ? "\"fxaa\"" : "\"smaa\"");
+        }
+        if (const int sel = Sel(ui, kGfxAniso); sel >= 0 && sel != ui.loaded.aniso)
+        {
+          set("anisotropic_override", fmt::format("{}", sel == 0 ? -1 : sel + 1)); // Rare's -1, 2x 2 .. 16x 5
+        }
+        if (Checked(ui, kGfxFar) != ui.loaded.far_lighting)
+        {
+          set("pdz_far_lighting", flag(Checked(ui, kGfxFar)));
+        }
+        if (ui.gfx_far_beams != ui.loaded.far_beams)
+        {
+          set("pdz_far_lighting_beams", flag(ui.gfx_far_beams));
+        }
+        const int shadows = Sel(ui, kGfxLongShadows); // off, 40 m, 60 m, 80 m; -1: a hand-set distance, kept
+        if (shadows >= 0 && shadows != ui.loaded.long_shadows)
+        {
+          if ((shadows > 0) != (ui.loaded.long_shadows > 0) || ui.loaded.long_shadows < 0)
+          {
+            set("pdz_long_shadows", flag(shadows > 0));
+          }
+          if (shadows > 0)
+          {
+            set("pdz_long_shadows_distance", fmt::format("{}.0", shadows + 1));
+          }
+        }
+        if (Checked(ui, kGfxBeamsFull) != ui.loaded.beams_full)
+        {
+          set("pdz_far_lighting_beams_no_fade", flag(Checked(ui, kGfxBeamsFull)));
+        }
+        // Long shadows at 60 fps or on Auto: on every level, Outpost included (the 60 fps cap leaves the room, and
+        // Auto drops to it where 120 does not hold). At a fixed 120 the line is removed, so the default list (Outpost
+        // keeps Rare's shadows) applies. Only once a row was touched.
+        const bool skip_none = shadows > 0 && Sel(ui, kCampaign) != 1;
+        if (ui.gfx_touched && skip_none != ui.loaded.skip_none)
+        {
+          set("pdz_long_shadows_skip_levels", skip_none ? "\"\"" : "");
+          ui.loaded.skip_none = skip_none;
+        }
+        // Custom picked (or left): the line that tells saved Custom values from a preset's (pdz_visual_custom).
+        if (ui.gfx_custom_pick != ui.loaded.custom)
+        {
+          set("pdz_visual_custom", flag(ui.gfx_custom_pick));
+          ui.loaded.custom = ui.gfx_custom_pick;
+        }
+        if (Checked(ui, kPlayCover) != ui.loaded.cover)
+        {
+          set("pdz_ai_cover_fixes", flag(Checked(ui, kPlayCover)));
+        }
+        if (Checked(ui, kPlayStealth) != ui.loaded.stealth)
+        {
+          set("pdz_lab_guard_stealth", flag(Checked(ui, kPlayStealth)));
+        }
+        if (Checked(ui, kPlayAim) != ui.loaded.aim)
+        {
+          for (const char *key : {"pdz_aim_still_lock", "pdz_aim_respect_headshots", "pdz_aim_assist_zoomed"})
+          {
+            set(key, flag(Checked(ui, kPlayAim)));
+          }
+        }
+        if (Checked(ui, kPlaySounds) != ui.loaded.sounds)
+        {
+          set("pdz_restored_sounds", flag(Checked(ui, kPlaySounds))); // (Thu 19 Nov)
+        }
+        Note(fmt::format("pdz_settings: graphics / gameplay rows changed: {}", changed.empty() ? "none" : changed));
+        ui.loaded.upscale = Sel(ui, kGfxUpscale) >= 0 ? Sel(ui, kGfxUpscale) : ui.loaded.upscale;
+        ui.loaded.aa = Sel(ui, kGfxAA) >= 0 ? Sel(ui, kGfxAA) : ui.loaded.aa;
+        ui.loaded.aniso = Sel(ui, kGfxAniso) >= 0 ? Sel(ui, kGfxAniso) : ui.loaded.aniso;
+        ui.loaded.far_lighting = Checked(ui, kGfxFar);
+        ui.loaded.far_beams = ui.gfx_far_beams;
+        ui.loaded.long_shadows = shadows >= 0 ? shadows : ui.loaded.long_shadows;
+        ui.loaded.beams_full = Checked(ui, kGfxBeamsFull);
+        ui.loaded.cover = Checked(ui, kPlayCover);
+        ui.loaded.stealth = Checked(ui, kPlayStealth);
+        ui.loaded.aim = Checked(ui, kPlayAim);
+        ui.loaded.sounds = Checked(ui, kPlaySounds);
+      }
       WriteKeys(ui.ctx.settings_file, keys);
       wchar_t sens[32] = {};
       GetWindowTextW(GetDlgItem(ui.window, kSensitivity), sens, 32);
@@ -1678,7 +1971,15 @@ namespace pdz::settings_ui
       // And for this start.
       for (const auto &kv : keys)
       {
-        if (!kv.second.empty())
+        if (kv.second.empty())
+        {
+          // A removed line: the value the file had is dropped for this start too (a command-line value is kept).
+          if (rex::cvar::GetFlagInfo(kv.first) && rex::cvar::GetFlagSource(kv.first) == rex::cvar::Source::kConfig)
+          {
+            rex::cvar::ResetToDefault(kv.first);
+          }
+        }
+        else
         {
           std::string v = kv.second;
           if (v.size() >= 2 && v.front() == '"')
@@ -1708,9 +2009,11 @@ namespace pdz::settings_ui
     void ResetDefaults(Ui &ui)
     {
       WriteKeys(ui.ctx.settings_file, {{"monitor", ""}, {"fullscreen_exclusive", ""}, {"resolution", ""},
-                                       {"pdz_native_scale", ""}, {"pdz_present_pacing", ""}, {"vsync", ""},
-                                       {"pdz_sp_120", ""}, {"pdz_splitscreen_cap", ""}, {"pdz_settings_show", ""},
-                                       {"pdz_update_check", ""}});
+                                       {"pdz_native_scale", ""}, {"pdz_supersample", ""}, {"pdz_present_pacing", ""},
+                                       {"vsync", ""},
+                                       {"pdz_sp_120", ""}, {"pdz_sp_auto", ""}, {"pdz_splitscreen_cap", ""}, {"pdz_settings_show", ""},
+                                       {"pdz_update_check", ""}, {"pdz_visual_custom", ""}});
+      ui.loaded.custom = false;
       ResetBinds(ui);
       std::vector<std::pair<std::string, std::string>> mapping = {{"pdz_mouse_sensitivity", "2.0"},
                                                                   {"pdz_mouse_invert", "false"}};
@@ -1723,13 +2026,17 @@ namespace pdz::settings_ui
       SetSel(ui, kMonitor, 0);
       SetSel(ui, kMode, 0);
       SetSel(ui, kResolution, 0);
-      SetSel(ui, kScale, 0);
+      SetSel(ui, kScale, kScaleSeg100);
       SetSel(ui, kVsync, 0);
       SendMessageW(GetDlgItem(ui.window, kFov), TBM_SETPOS, TRUE, kFovMinDegrees);
       SetWindowTextW(GetDlgItem(ui.window, kFovValue), FovText(kFovMinDegrees).c_str());
       WriteKeys(ui.ctx.settings_file, {{"pdz_fov_scale", "1.000"}});
       rex::cvar::SetFlagByName("pdz_fov_scale", "1.0");
-      SetSel(ui, kCampaign, 0);
+      SendMessageW(GetDlgItem(ui.window, kVoiceVol), TBM_SETPOS, TRUE, kVoiceDefaultDb);
+      SetWindowTextW(GetDlgItem(ui.window, kVoiceVolValue), VoiceText(kVoiceDefaultDb).c_str());
+      WriteKeys(ui.ctx.settings_file, {{"pdz_guard_voice_db", fmt::format("{}.0", kVoiceDefaultDb)}});
+      rex::cvar::SetFlagByName("pdz_guard_voice_db", fmt::format("{}.0", kVoiceDefaultDb));
+      SetSel(ui, kCampaign, 1);
       SetSel(ui, kSplitCap, 0);
       rex::cvar::SetFlagByName("pdz_splitscreen_cap", "0");
       SetWindowTextW(GetDlgItem(ui.window, kSensitivity), L"2.00");
@@ -1742,6 +2049,18 @@ namespace pdz::settings_ui
       rex::cvar::SetFlagByName("pdz_minigame_mouse_counts", "400");
       SetChecked(ui, kUpdateCheck, true);
       rex::cvar::SetFlagByName("pdz_update_check", "true");
+      // Graphics and Gameplay: the release's defaults (FSR, SMAA, 16x, the Performance preset, Restored);
+      // the rows that this changes are written with Play or the close box, like any change made by hand.
+      SetSel(ui, kGfxUpscale, 2);
+      SetSel(ui, kGfxAA, 2);
+      SetSel(ui, kGfxAniso, 4);
+      for (int sw : kPlaySwitches)
+      {
+        SetSwitch(ui, sw, true);
+      }
+      ui.play_custom_pick = false; // (Thu 19 Nov: Restored)
+      ApplyVisualPreset(ui, 0, false); // Performance: far lighting, Rare's shadows and beams (Campaign is 120 fps above)
+      RefreshPreset(ui);
       if (rex::cvar::GetFlagByName("pdz_zoom_steps") == "true")
       {
         WriteKeys(ui.ctx.mapping_file, {{"pdz_zoom_steps", "false"}});
@@ -2527,6 +2846,17 @@ namespace pdz::settings_ui
       if (auto t = ui.toggles.find(id); t != ui.toggles.end() && code == BN_CLICKED)
       {
         SetChecked(ui, id, !t->second);
+        if ((id >= kGfxUpscale && id <= kGfxSpRate) || (id >= kPlayPreset && id <= kPlaySounds))
+        {
+          // The Graphics and Gameplay switches read On / Off; Restored / Original follows the three it covers, the
+          // Visual preset the Graphics rows.
+          SetSwitch(ui, id, Checked(ui, id));
+          RefreshPreset(ui);
+          if (id <= kGfxSpRate)
+          {
+            RefreshVisualPreset(ui);
+          }
+        }
         if (id == kUpdateCheck && Checked(ui, kUpdateCheck))
         {
           update_check::Start(); // ticked now: ask now (once per start)
@@ -2547,6 +2877,42 @@ namespace pdz::settings_ui
         Save(ui);
         ui.choice = id == kPlay ? Choice::kPlay : Choice::kSafeMode;
         DestroyWindow(ui.window);
+        return;
+      }
+      if (id == kPlayPreset && code == CBN_SELCHANGE)
+      {
+        // Restored: every gameplay switch on. Original: all off. Custom: the switches as they are, shown. Graphics
+        // settings are not touched.
+        const int preset = std::clamp(Sel(ui, kPlayPreset), 0, 2);
+        ui.play_custom_pick = preset == 2;
+        Note(fmt::format("pdz_settings: Gameplay preset picked: {}", preset == 0 ? "Restored" : preset == 1 ? "Original" : "Custom"));
+        if (preset != 2)
+        {
+          for (int sw : kPlaySwitches)
+          {
+            SetSwitch(ui, sw, preset == 0);
+          }
+        }
+        SetSel(ui, kPlayPreset, preset);
+        ShowPlayRows(ui);
+        SetHelp(ui, kPlayPresetHelp[preset]);
+        return;
+      }
+      if (id == kGfxPreset && code == CBN_SELCHANGE)
+      {
+        ApplyVisualPreset(ui, std::clamp(Sel(ui, kGfxPreset), 0, 2));
+        return;
+      }
+      if (id == kGfxSpRate && code == CBN_SELCHANGE)
+      {
+        // The Custom row is the Frame rate tab's Campaign row: the same three choices.
+        SetSel(ui, kCampaign, Sel(ui, kGfxSpRate));
+        RefreshVisualPreset(ui);
+        return;
+      }
+      if ((id == kGfxLongShadows || id == kCampaign) && code == CBN_SELCHANGE)
+      {
+        RefreshVisualPreset(ui); // Campaign changed on the Frame rate tab: the preset follows (Custom if it fits neither)
         return;
       }
       if (id == kVsync && code == CBN_SELCHANGE)
@@ -2601,6 +2967,10 @@ namespace pdz::settings_ui
       case kFovDefault:
         SendMessageW(GetDlgItem(ui.window, kFov), TBM_SETPOS, TRUE, kFovMinDegrees);
         SetWindowTextW(GetDlgItem(ui.window, kFovValue), FovText(kFovMinDegrees).c_str());
+        break;
+      case kVoiceVolDefault:
+        SendMessageW(GetDlgItem(ui.window, kVoiceVol), TBM_SETPOS, TRUE, kVoiceDefaultDb);
+        SetWindowTextW(GetDlgItem(ui.window, kVoiceVolValue), VoiceText(kVoiceDefaultDb).c_str());
         break;
       case kBindChange1:
       case kBindChange2:
@@ -2871,7 +3241,8 @@ namespace pdz::settings_ui
           HDC dc = CreateCompatibleDC(target);
           HBITMAP bmp = CreateCompatibleBitmap(target, rc.right, rc.bottom);
           HGDIOBJ old = SelectObject(dc, bmp);
-          const int side = ui->px(kSideW), footer = rc.bottom - ui->px(kFooterH), help = footer - ui->px(kHelpH);
+          const int help_h = ui->px(ui->help_h[ui->tab] > 0 ? ui->help_h[ui->tab] : kHelpH);
+          const int side = ui->px(kSideW), footer = rc.bottom - ui->px(kFooterH), help = footer - help_h;
           theme::FillRect(dc, rc, theme::kBackground);
           theme::FillRect(dc, RECT{0, 0, side, footer}, theme::kSideBar);
           theme::FillRect(dc, RECT{side - 1, 0, side, footer}, theme::kBorder);
@@ -2884,12 +3255,13 @@ namespace pdz::settings_ui
                         RECT{ui->px(14), ui->px(456), side - ui->px(8), ui->px(490)}, ui->tf.note, theme::kCyan,
                         DT_LEFT | DT_WORDBREAK);
           }
-          const wchar_t *headings[kTabCount] = {L"DISPLAY", L"FRAME RATE", L"MAP PACKS", L"CONTROLS", L"ADVANCED"};
+          const wchar_t *headings[kTabCount] = {L"DISPLAY",   L"GRAPHICS", L"FRAME RATE", L"GAMEPLAY",
+                                                L"MAP PACKS", L"CONTROLS", L"ADVANCED"};
           theme::Text(dc, headings[ui->tab], RECT{side + ui->px(32), ui->px(22), rc.right, ui->px(60)}, ui->tf.display,
                       theme::kText, DT_LEFT | DT_SINGLELINE, ui->px(2));
           theme::FillRect(dc, RECT{side, help, rc.right, footer}, theme::kSideBar);
           theme::FillRect(dc, RECT{side, help, rc.right, help + 1}, theme::kBorder);
-          theme::DrawInfoIcon(dc, side + ui->px(32), help + (ui->px(kHelpH) - ui->px(18)) / 2, ui->px(18),
+          theme::DrawInfoIcon(dc, side + ui->px(32), help + (help_h - ui->px(18)) / 2, ui->px(18),
                               theme::kCyan);
           theme::FillRect(dc, RECT{0, footer, rc.right, rc.bottom}, theme::kSideBar);
           theme::FillRect(dc, RECT{0, footer, rc.right, footer + 1}, theme::kBorder);
@@ -2909,7 +3281,8 @@ namespace pdz::settings_ui
           HWND b = di->hwndItem;
           if (di->CtlType == ODT_STATIC && id == kHelp)
           {
-            // The help strip's text: up to two lines (longer text is cut at the second), centred on the info icon.
+            // The help strip's text: up to two lines (six on the Graphics and Gameplay tabs' taller strip; longer
+            // text is cut at the last), centred on the info icon.
             wchar_t help_text[1024] = {};
             GetWindowTextW(b, help_text, 1024);
             theme::FillRect(di->hDC, di->rcItem, theme::kSideBar);
@@ -3001,9 +3374,9 @@ namespace pdz::settings_ui
       case WM_NOTIFY:
       {
         const NMHDR *nm = reinterpret_cast<NMHDR *>(lp);
-        if (ui && nm->code == NM_CUSTOMDRAW && (nm->idFrom == kFov || nm->idFrom == kLockSens))
+        if (ui && nm->code == NM_CUSTOMDRAW && (nm->idFrom == kFov || nm->idFrom == kVoiceVol || nm->idFrom == kLockSens))
         {
-          // The field of view slider in the theme: a panel channel, a blue thumb with a cyan edge, no ticks.
+          // The field of view and guard voices sliders in the theme: a panel channel, a blue thumb with a cyan edge, no ticks.
           NMCUSTOMDRAW *cd = reinterpret_cast<NMCUSTOMDRAW *>(lp);
           if (cd->dwDrawStage == CDDS_PREPAINT)
           {
@@ -3146,9 +3519,18 @@ namespace pdz::settings_ui
             if (auto seg = ui->seg_group.find(focus_id); seg != ui->seg_group.end())
             {
               const Ui::Segmented &g = ui->segs[seg->second];
-              const int next = std::clamp(g.sel + (vk == VK_RIGHT ? 1 : -1), 0, int(g.parts.size()) - 1);
+              // Fri 20 Nov (round 16, item 13): the Gameplay preset changes every gameplay row at once, so on a
+              // controller left / right only move the focus along it and A picks: one stray D-pad or stick push
+              // after LB / RB used to pick Original (every row off) by itself. Every other choice changes at once.
+              const bool preset = seg->second == kPlayPreset;
+              const int from = preset ? std::clamp(focus_id - (2000 + seg->second * 8), 0, int(g.parts.size()) - 1)
+                                      : g.sel;
+              const int next = std::clamp(from + (vk == VK_RIGHT ? 1 : -1), 0, int(g.parts.size()) - 1);
               SetFocus(g.parts[size_t(next)]);
-              SendMessageW(g.parts[size_t(next)], BM_CLICK, 0, 0);
+              if (!preset)
+              {
+                SendMessageW(g.parts[size_t(next)], BM_CLICK, 0, 0);
+              }
             }
           }
           else if (vk == VK_ESCAPE && ui->cap_row >= 0)
@@ -3203,6 +3585,11 @@ namespace pdz::settings_ui
           const int pos = int(SendMessageW(reinterpret_cast<HWND>(lp), TBM_GETPOS, 0, 0));
           SetWindowTextW(GetDlgItem(hwnd, kFovValue), FovText(pos).c_str());
         }
+        if (ui && reinterpret_cast<HWND>(lp) == GetDlgItem(hwnd, kVoiceVol))
+        {
+          const int pos = int(SendMessageW(reinterpret_cast<HWND>(lp), TBM_GETPOS, 0, 0));
+          SetWindowTextW(GetDlgItem(hwnd, kVoiceVolValue), VoiceText(pos).c_str());
+        }
         return 0;
       case WM_CTLCOLORSTATIC:
       {
@@ -3225,7 +3612,7 @@ namespace pdz::settings_ui
           text = theme::kCyan;
         }
         else if (id == kMultiplayerNote || id == kSplitCapNote || (id >= kPackMaps0 && id < kPackMaps0 + 10) ||
-                 id == kWindowedNote)
+                 id == kWindowedNote || id == kPlayNote)
         {
           text = theme::kTextDim;
         }
@@ -3305,8 +3692,11 @@ namespace pdz::settings_ui
         MapWindowPoints(nullptr, ui.window, reinterpret_cast<POINT *>(&r), 2);
         return r;
       };
+      const int normal_strip_top = strip_top;
       for (int t = 0; t < kTabCount; ++t)
       {
+        // This tab's help strip (taller on the Graphics and Gameplay tabs).
+        const int strip_top = ui.help_h[t] > 0 ? client.bottom - ui.px(kFooterH) - ui.px(ui.help_h[t]) : normal_strip_top;
         std::vector<std::pair<HWND, RECT>> rects;
         for (HWND c : ui.page[t])
         {
@@ -3416,35 +3806,60 @@ namespace pdz::settings_ui
           ++problems;
         }
       }
-      // Help lines: two at most on the strip.
+      // Help lines: two at most on the strip; on the Graphics and Gameplay tabs' taller strip, as many as it holds.
       RECT hr;
       GetClientRect(ui.help, &hr);
       const int line = text_height(L"Ag", ui.tf.note, hr.right, DT_NOPREFIX);
-      std::set<std::wstring> helps;
+      const int tall_lines = std::max(2, ui.px(kHelpTallH - 8) / std::max(1, line));
+      std::map<std::wstring, int> helps; // text -> the lines its strip holds
+      auto add_help = [&](const std::wstring &text, int lines)
+      {
+        auto it = helps.find(text);
+        if (it == helps.end())
+        {
+          helps[text] = lines;
+        }
+        else
+        {
+          it->second = std::min(it->second, lines);
+        }
+      };
       for (const auto &kv : ui.help_of)
       {
-        helps.insert(kv.second);
+        int lines = 2;
+        for (int t = 0; t < kTabCount; ++t)
+        {
+          if (ui.help_h[t] > kHelpH && std::find(ui.page[t].begin(), ui.page[t].end(), kv.first) != ui.page[t].end())
+          {
+            lines = tall_lines;
+          }
+        }
+        add_help(kv.second, lines);
       }
       for (int t = 0; t < kTabCount; ++t)
       {
-        helps.insert(ui.tab_help[t]);
+        add_help(ui.tab_help[t], ui.help_h[t] > kHelpH ? tall_lines : 2);
       }
       for (int r = 0; r < kBindRowCount; ++r)
       {
-        helps.insert(std::wstring(kBindRows[r].help) + L" Click Key 1 or Key 2 (or press Enter) to change it.");
+        add_help(std::wstring(kBindRows[r].help) + L" Click Key 1 or Key 2 (or press Enter) to change it.", 2);
       }
       for (const wchar_t *v : kVsyncHelp)
       {
-        helps.insert(v);
+        add_help(v, 2);
       }
-      helps.insert(kWaiting);
-      for (const std::wstring &h : helps)
+      for (const wchar_t *v : kVisualPresetHelp)
+      {
+        add_help(v, tall_lines);
+      }
+      add_help(kWaiting, 2);
+      for (const auto &[h, lines] : helps)
       {
         const int need = text_height(h, ui.tf.note, hr.right, DT_NOPREFIX);
-        if (need > 2 * line || need > hr.bottom)
+        if (need > lines * line)
         {
-          Note(fmt::format("pdz_settings: layout check: help line '{}' is {} lines (two at most)", narrow(h),
-                           (need + line - 1) / line));
+          Note(fmt::format("pdz_settings: layout check: help line '{}' is {} lines ({} at most)", narrow(h),
+                           (need + line - 1) / line, lines));
           ++problems;
         }
       }
@@ -3481,6 +3896,69 @@ namespace pdz::settings_ui
         }
       }
     };
+
+    // Wed 18 Nov night: after Play the settings window is gone before the game window exists, so Windows hands the
+    // foreground to whatever lies behind and the game window then opens BEHIND it (focus-stealing prevention). While
+    // this process still has the foreground it allows itself to set it again, and a helper thread brings the game's
+    // own window to the front once, as soon as it shows (30 s at most; nothing after that).
+    void GameWindowToFront()
+    {
+      AllowSetForegroundWindow(GetCurrentProcessId());
+      std::thread([] {
+        struct Find
+        {
+          HWND window = nullptr;
+        };
+        for (int i = 0; i < 300; ++i)
+        {
+          Sleep(100);
+          Find f;
+          EnumWindows(
+              [](HWND w, LPARAM p) -> BOOL {
+                DWORD pid = 0;
+                GetWindowThreadProcessId(w, &pid);
+                RECT r{};
+                // Sun 22 Nov: only the game's own (SDL) window; after a new build the renderer's progress window
+                // came first and was brought to the front instead.
+                wchar_t cls[64] = {};
+                if (pid == GetCurrentProcessId() && IsWindowVisible(w) && GetWindow(w, GW_OWNER) == nullptr &&
+                    GetClassNameW(w, cls, 64) > 0 && std::wstring(cls) == L"SDL_app" &&
+                    GetWindowTextLengthW(w) > 0 && GetWindowRect(w, &r) && r.right - r.left >= 320 && r.bottom - r.top >= 200)
+                {
+                  reinterpret_cast<Find *>(p)->window = w;
+                  return FALSE;
+                }
+                return TRUE;
+              },
+              reinterpret_cast<LPARAM>(&f));
+          if (!f.window)
+          {
+            continue;
+          }
+          const HWND front = GetForegroundWindow();
+          bool ok = front == f.window;
+          if (!ok)
+          {
+            ok = SetForegroundWindow(f.window) != FALSE;
+          }
+          if (!ok && front)
+          {
+            // (The right has lapsed: join the foreground window's input queue for the one call, as Windows allows.)
+            const DWORD theirs = GetWindowThreadProcessId(front, nullptr), mine = GetCurrentThreadId();
+            if (theirs && theirs != mine && AttachThreadInput(mine, theirs, TRUE))
+            {
+              BringWindowToTop(f.window);
+              ok = SetForegroundWindow(f.window) != FALSE;
+              AttachThreadInput(mine, theirs, FALSE);
+            }
+          }
+          REXLOG_INFO("pdz_settings: the game window is brought to the front after the settings window ({}, {:.1f} s after "
+                      "Play)",
+                      ok ? "done" : "Windows refused: it may open behind another window", 0.1 * (i + 1));
+          return;
+        }
+      }).detach();
+    }
 
     Choice Run(const Context &ctx, bool packs_tab)
     {
@@ -3537,7 +4015,9 @@ namespace pdz::settings_ui
 
       theme::ThemeTitleBar(ui.window);
       // The side bar: the title (painted), then the tabs.
-      const wchar_t *names[kTabCount] = {L"Display", L"Frame rate", L"Map packs", L"Controls", L"Advanced"};
+      const wchar_t *names[kTabCount] = {L"Display",   L"Graphics", L"Frame rate", L"Gameplay",
+                                         L"Map packs", L"Controls", L"Advanced"};
+      ui.help_h[kTabGraphics] = ui.help_h[kTabGameplay] = kHelpTallH;
       for (int t = 0; t < kTabCount; ++t)
       {
         ui.tab_buttons[t] = Add(ui, -1, L"BUTTON", names[t], BS_OWNERDRAW | WS_TABSTOP, 12, 96 + t * 48, kSideW - 24,
@@ -3576,13 +4056,39 @@ namespace pdz::settings_ui
                                                            : fmt::format(L"Desktop resolution ({} x {})",
                                                                          ui.monitors[primary].width,
                                                                          ui.monitors[primary].height)};
+      // Sun 22 Nov: the saved size is shown (it always showed Desktop). A size this display does not list is added
+      // at the end, so it is shown and kept as it is; a value that is no size shows Desktop (the game ignores it).
+      int res_sel = 0;
+      {
+        const std::string saved = SavedValue(ui.ctx.settings_file, "resolution");
+        int32_t sw = 0, sh = 0;
+        if (!saved.empty() && rex::graphics::video_mode_util::TryParseResolutionPreset(saved, sw, sh) && sw > 0 &&
+            sh > 0)
+        {
+          const std::pair<DWORD, DWORD> want{DWORD(sw), DWORD(sh)};
+          auto at = std::find(ui.modes.begin(), ui.modes.end(), want);
+          if (at == ui.modes.end())
+          {
+            ui.modes.push_back(want);
+            at = ui.modes.end() - 1;
+            ui.res_extra = true;
+          }
+          res_sel = int(at - ui.modes.begin()) + 1;
+        }
+        Note(fmt::format("pdz_settings: Resolution: the settings file has {}: shown as {}", saved.empty() ? std::string("none") : "\"" + saved + "\"",
+                         res_sel == 0 ? std::string(saved.empty() ? "Desktop resolution" : "Desktop resolution (not a size)")
+                                      : fmt::format("{} x {}{}", sw, sh, ui.res_extra ? " (added: not a mode this display lists)" : "")));
+      }
       for (const auto &[w, h] : ui.modes)
       {
-        res.push_back(fmt::format(L"{} x {}", w, h));
+        res.push_back(ui.res_extra && std::make_pair(w, h) == ui.modes.back()
+                          ? fmt::format(L"{} x {} (from your settings file)", w, h)
+                          : fmt::format(L"{} x {}", w, h));
       }
-      Combo(ui, kTabDisplay, cx, 154, cw, kResolution, res, 0,
+      Combo(ui, kTabDisplay, cx, 154, cw, kResolution, res, res_sel,
             L"Leave this on your desktop resolution unless you have a reason. Other sizes only apply in Fullscreen.");
-      Label(ui, kTabDisplay, L"Render scale", x, 198, lw, true);
+      // Render scale: on the Graphics tab since 0.9.5 (it changes the look).
+      Label(ui, kTabGraphics, L"Render scale", x, 52, lw, true);
       // The saved choice (no line = 100%), matched against the choices for the screen Play saves for.
       int scale_sel = 0;
       {
@@ -3597,28 +4103,43 @@ namespace pdz::settings_ui
                            "as 100%",
                            value));
         }
+        // Supersampling (pdz_supersample 150 / 200) shows as the 150% / 200% segment; it wins over a lower scale.
+        const std::string super_saved = SavedValue(ui.ctx.settings_file, "pdz_supersample");
+        const int super_percent = super_saved.empty() ? 0 : std::atoi(super_saved.c_str());
+        if (super_percent > 100)
+        {
+          scale_sel = super_percent >= 175 ? -2 : -1;
+        }
       }
-      Segments(ui, kTabDisplay, cx, 194, 70, kScale, {L"100%", L"75%", L"50%"}, scale_sel,
-            L"Draws the game at a lower resolution and scales it up. Lower is faster on weaker graphics cards, but a "
-            L"bit softer.");
-      Label(ui, kTabDisplay, L"VSync / VRR", x, 238, lw, true);
+      Segments(ui, kTabGraphics, cx, 48, 70, kScale, {L"200%", L"150%", L"100%", L"75%", L"50%"},
+               scale_sel + kScaleSeg100,
+               L"Draws the game at a lower resolution and scales it up. Lower is faster on weaker graphics cards, but a "
+               L"bit softer.");
+      for (int i = 0; i < kScaleSeg100; ++i)
+      {
+        // Above 100%: each of the two explains itself.
+        ui.help_of[ui.segs[kScale].parts[size_t(i)]] =
+            L"Draws the game at a higher resolution and shrinks it to fit your screen: sharper and smoother edges, at "
+            L"a large performance cost.";
+      }
+      Label(ui, kTabDisplay, L"VSync / VRR", x, 198, lw, true);
       const std::string pacing = rex::cvar::GetFlagByName("pdz_present_pacing");
       // vsync is the GPU plugin's: not registered yet when the window opens, so it is read from the settings file.
       const bool vsync = SavedValue(ui.ctx.settings_file, "vsync") != "false";
       // On = fixed (the default; an old "auto" reads as fixed), VRR = vrr, Off = vsync off. No Auto (2026-11-06): the
       // EDID says whether a display can do VRR, not whether the driver has it on (a FreeSync EDID with VRR off in the
       // driver juddered at 117 fps Present(0) on a fixed 120 Hz display).
-      Segments(ui, kTabDisplay, cx, 234, 70, kVsync, {L"On", L"VRR (G-Sync / FreeSync)", L"Off"},
+      Segments(ui, kTabDisplay, cx, 194, 70, kVsync, {L"On", L"VRR (G-Sync / FreeSync)", L"Off"},
                !vsync ? 2 : pacing == "vrr" ? 1 : 0, kVsyncHelp[0], false, {70, 200, 70});
       for (size_t i = 0; i < ui.segs[kVsync].parts.size(); ++i)
       {
         ui.help_of[ui.segs[kVsync].parts[i]] = kVsyncHelp[i]; // each choice explains itself
       }
-      Label(ui, kTabDisplay, L"Field of view", x, 278, lw, true);
+      Label(ui, kTabDisplay, L"Field of view", x, 238, lw, true);
       {
         const std::wstring help = L"How much you can see around you. Rare's default is 73\u00B0. Scopes keep the same "
                                   L"zoom. Vehicles, turrets and cutscenes always use Rare's view.";
-        HWND fov = Add(ui, kTabDisplay, TRACKBAR_CLASSW, L"", TBS_HORZ | TBS_AUTOTICKS | WS_TABSTOP, cx, 272, 200, 30,
+        HWND fov = Add(ui, kTabDisplay, TRACKBAR_CLASSW, L"", TBS_HORZ | TBS_AUTOTICKS | WS_TABSTOP, cx, 232, 200, 30,
                        kFov, help);
         SendMessageW(fov, TBM_SETRANGE, FALSE, MAKELPARAM(kFovMinDegrees, kFovMaxDegrees));
         SendMessageW(fov, TBM_SETTICFREQ, 5, 0);
@@ -3630,18 +4151,190 @@ namespace pdz::settings_ui
                             ? kFovMinDegrees
                             : FovPositionOfScale(std::atof(rex::cvar::GetFlagByName("pdz_fov_scale").c_str()));
         SendMessageW(fov, TBM_SETPOS, TRUE, pos);
-        Add(ui, kTabDisplay, L"STATIC", FovText(pos), SS_LEFT, cx + 206, 278, 130, 22, kFovValue, help);
-        Button(ui, kTabDisplay, L"Default (Rare's)", cx + 240, 302, 140, kFovDefault,
+        Add(ui, kTabDisplay, L"STATIC", FovText(pos), SS_LEFT, cx + 206, 238, 130, 22, kFovValue, help);
+        Button(ui, kTabDisplay, L"Default (Rare's)", cx + 240, 262, 140, kFovDefault,
                L"Back to Rare's 73\u00B0.");
       }
       ui.tab_help[kTabDisplay] = L"Point at a setting to see what it does.";
 
+      // Graphics (0.9.5): what changes the look. Render scale (above) is its first row. swap_post_effect
+      // and anisotropic_override are the GPU plugin's (not registered while the window is open): they
+      // are read from the settings file, like vsync. A value set by hand that is none of a row's choices shows no
+      // choice and is kept unless one is picked.
+      {
+        const std::string effect = SavedValue(ui.ctx.settings_file, "present_effect");
+        ui.loaded.upscale = effect.empty() || effect == "bilinear" ? 0 : effect == "cas" ? 1 : effect == "fsr" ? 2 : -1;
+        Label(ui, kTabGraphics, L"Upscaling", x, 92, lw, true);
+        Segments(ui, kTabGraphics, cx, 88, 100, kGfxUpscale, {L"Smooth", L"Sharpen", L"FSR"}, ui.loaded.upscale,
+                 L"How the picture is fitted to your screen. FSR gives the sharpest picture, most of all with Render "
+                 L"scale at 75% or 50%. Sharpen is a lighter sharpening pass. Smooth: plain scaling, as on the Xbox "
+                 L"360.");
+        const std::string aa = SavedValue(ui.ctx.settings_file, "swap_post_effect");
+        ui.loaded.aa = aa.empty() || aa == "none" ? 0 : aa == "fxaa" ? 1 : aa == "smaa" ? 2 : -1;
+        Label(ui, kTabGraphics, L"Anti-aliasing", x, 132, lw, true);
+        Segments(ui, kTabGraphics, cx, 128, 100, kGfxAA, {L"None", L"FXAA", L"SMAA"}, ui.loaded.aa,
+                 L"Smooths jagged edges. SMAA is the cleanest. FXAA is cheaper and a little softer. None: no "
+                 L"smoothing, as on the Xbox 360.");
+        // No 2x MSAA row: native_2x_msaa does nothing in this game (it draws no multisampled surfaces). The line stays
+        // in the settings file and is never written by the window.
+        const std::string aniso = SavedValue(ui.ctx.settings_file, "anisotropic_override");
+        const int aniso_value = aniso.empty() ? 3 : std::atoi(aniso.c_str());
+        ui.loaded.aniso = aniso_value == -1 ? 0 : aniso_value >= 2 && aniso_value <= 5 ? aniso_value - 1 : -1;
+        Label(ui, kTabGraphics, L"Anisotropic filtering", x, 172, lw, true);
+        Segments(ui, kTabGraphics, cx, 168, 64, kGfxAniso, {L"Rare's", L"2x", L"4x", L"8x", L"16x"}, ui.loaded.aniso,
+                 L"Keeps floors, walls and roads sharp when you see them at a shallow angle. 16x is the sharpest and "
+                 L"costs little on a recent graphics card. Rare's: the game's own texture filtering, as on the Xbox "
+                 L"360.");
+        // Visual preset, then the rows it sets (shown for Custom only: ShowVisualRows). The preset shown on opening
+        // is what the saved values say; anything that fits neither preset is Custom.
+        ui.loaded.far_lighting = rex::cvar::GetFlagByName("pdz_far_lighting") != "false";
+        ui.loaded.far_beams = ui.gfx_far_beams = rex::cvar::GetFlagByName("pdz_far_lighting_beams") != "false";
+        {
+          const bool on = rex::cvar::GetFlagByName("pdz_long_shadows") == "true";
+          const double d = std::atof(rex::cvar::GetFlagByName("pdz_long_shadows_distance").c_str());
+          ui.loaded.long_shadows = !on ? 0 : d == 2.0 ? 1 : d == 3.0 || d == 0.0 ? 2 : d == 4.0 ? 3 : -1;
+        }
+        ui.loaded.beams_full = rex::cvar::GetFlagByName("pdz_far_lighting_beams_no_fade") == "true";
+        ui.loaded.skip_none = rex::cvar::GetFlagByName("pdz_long_shadows_skip_levels").empty();
+        // 0 Auto (pdz_sp_auto), 1 120 fps, 2 60 fps: the Frame rate tab's Campaign row reads the same below.
+        int sp_rate = rex::cvar::GetFlagByName("pdz_sp_120") == "false"  ? 2
+                      : rex::cvar::GetFlagByName("pdz_sp_auto") == "true" ? 0
+                                                                          : 1;
+        // Tue 17 Nov: saved values that are the earlier Quality preset (Auto with 60 m shadows and full beams) and do
+        // not say Custom open as Quality, which is a fixed 60 now (the game runs them the same way: game_pace.cpp
+        // MigrateEarlierQuality). Save then writes the 60 fps lines.
+        ui.loaded.custom = rex::cvar::GetFlagByName("pdz_visual_custom") == "true";
+        ui.gfx_earlier_quality = !ui.loaded.custom && sp_rate == 0 && ui.loaded.far_lighting && ui.loaded.far_beams &&
+                                 ui.loaded.long_shadows == 2 && ui.loaded.beams_full;
+        if (ui.gfx_earlier_quality)
+        {
+          sp_rate = 2;
+        }
+        Label(ui, kTabGraphics, L"Visual preset", x, 212, lw, true);
+        Segments(ui, kTabGraphics, cx, 208, 120, kGfxPreset, {L"Performance", L"Quality", L"Custom"}, 0,
+                 kVisualPresetHelp[0]);
+        for (int i = 0; i < 3; ++i)
+        {
+          ui.help_of[ui.segs[kGfxPreset].parts[size_t(i)]] = kVisualPresetHelp[i]; // each choice explains itself
+        }
+        const size_t custom_from = ui.page[kTabGraphics].size();
+        Switch(ui, kTabGraphics, L"Far lighting", x, 246, lw, cx, kGfxFar, ui.loaded.far_lighting,
+               L"Keeps distant lights and windows lit. Off: as on the Xbox 360, where far lights only switch on as you "
+               L"get close.");
+        Label(ui, kTabGraphics, L"Long shadows", x, 286, lw, true);
+        Segments(ui, kTabGraphics, cx, 282, 80, kGfxLongShadows, {L"Off", L"40 m", L"60 m", L"80 m"},
+                 std::max(0, ui.loaded.long_shadows),
+                 L"Shadows reach further, so trees and buildings don't suddenly turn dark as you walk up to them. "
+                 L"Longer costs more performance. Off: as on the Xbox 360. Applies the next time you start the game.");
+        Switch(ui, kTabGraphics, L"Full streetlight beams", x, 318, lw, cx, kGfxBeamsFull, ui.loaded.beams_full,
+               L"Draws every light beam at full size instead of shrinking the distant ones. Costs some performance. "
+               L"Off: as on the Xbox 360.");
+        Label(ui, kTabGraphics, L"Single-player frame rate", x, 358, lw + 8, true);
+        Segments(ui, kTabGraphics, cx, 354, 90, kGfxSpRate, {L"Auto", L"120 fps", L"60 fps"}, sp_rate,
+                 L"120 fps is smoother. 60 fps leaves more room for extra detail.");
+        // Auto explains itself (the other two keep the row's line).
+        ui.help_of[ui.segs[kGfxSpRate].parts[0]] =
+            L"Aims for 120 fps. If a level keeps missing it, that level drops to 60.";
+        ui.gfx_custom.assign(ui.page[kTabGraphics].begin() + std::ptrdiff_t(custom_from), ui.page[kTabGraphics].end());
+        if (ui.loaded.long_shadows < 0)
+        {
+          SetSel(ui, kGfxLongShadows, -1); // a hand-set distance: nothing selected, kept unless one is picked
+        }
+        {
+          // The preset the saved values are (the Campaign row is made further down: sp_rate stands in for it here).
+          const int rows = ui.loaded.custom || !ui.loaded.far_lighting || !ui.loaded.far_beams         ? 2
+                           : ui.loaded.long_shadows == 0 && !ui.loaded.beams_full && sp_rate == 1     ? 0
+                           : ui.loaded.long_shadows == 2 && ui.loaded.beams_full && sp_rate == 2      ? 1
+                                                                                                        : 2;
+          ui.gfx_custom_pick = rows == 2;
+          SetSel(ui, kGfxPreset, rows);
+        }
+        // A hand-set value outside a row's choices: nothing selected.
+        if (ui.loaded.upscale < 0)
+        {
+          SetSel(ui, kGfxUpscale, -1);
+        }
+        if (ui.loaded.aa < 0)
+        {
+          SetSel(ui, kGfxAA, -1);
+        }
+        if (ui.loaded.aniso < 0)
+        {
+          SetSel(ui, kGfxAniso, -1);
+        }
+      }
+      ui.tab_help[kTabGraphics] = L"Point at a setting to see what it does. Changes apply from the next start of the "
+                                  L"game.";
+
+      // Gameplay (0.9.5): what changes play. Restored / Original sets the three switches below (no graphics setting).
+      {
+        auto on = [](const char *name) { return rex::cvar::GetFlagByName(name) != "false"; };
+        ui.loaded.cover = on("pdz_ai_cover_fixes");
+        // The stealth layer's master switch (lab_stealth.cpp): off = every part of the layer off on all four levels.
+        ui.loaded.stealth = on("pdz_lab_guard_stealth");
+        ui.loaded.aim = on("pdz_aim_still_lock") && on("pdz_aim_respect_headshots") && on("pdz_aim_assist_zoomed");
+        ui.loaded.sounds = on("pdz_restored_sounds");
+        // Thu 19 Nov: three choices, like the Visual preset. The switches show for Custom only (ShowPlayRows); saved
+        // values that match neither Restored nor Original open as Custom (RefreshPreset).
+        Label(ui, kTabGameplay, L"Game", x, 52, lw, true);
+        Segments(ui, kTabGameplay, cx, 48, 120, kPlayPreset, {L"Restored", L"Original", L"Custom"}, 0, kPlayPresetHelp[0]);
+        for (int i = 0; i < 3; ++i)
+        {
+          ui.help_of[ui.segs[kPlayPreset].parts[size_t(i)]] = kPlayPresetHelp[i]; // each choice explains itself
+        }
+        Add(ui, kTabGameplay, L"STATIC", L"Changes on this tab take effect when a level starts.", SS_LEFT, cx, 84, cw,
+            22, kPlayNote);
+        // Guard voices (0.9.5 rc: moved here from the Display tab; the same control ids, setting, default and help).
+        // Always shown: it is a volume, not part of Restored / Original.
+        Label(ui, kTabGameplay, L"Guard voices", x, 126, lw, true);
+        {
+          const std::wstring help = L"How loud guards and other characters speak, on top of the game's sound volume. "
+                                    L"0 dB is Rare's level; the default +3 dB makes guards easier to hear over the music.";
+          HWND vol = Add(ui, kTabGameplay, TRACKBAR_CLASSW, L"", TBS_HORZ | TBS_AUTOTICKS | WS_TABSTOP, cx, 120, 200, 30,
+                         kVoiceVol, help);
+          SendMessageW(vol, TBM_SETRANGE, FALSE, MAKELPARAM(kVoiceMinDb, kVoiceMaxDb));
+          SendMessageW(vol, TBM_SETTICFREQ, 3, 0);
+          SendMessageW(vol, TBM_SETPAGESIZE, 0, 3);
+          const std::string saved = rex::cvar::GetFlagByName("pdz_guard_voice_db");
+          const int pos = saved.empty() ? kVoiceDefaultDb
+                                        : std::clamp(int(std::lround(std::atof(saved.c_str()))), kVoiceMinDb, kVoiceMaxDb);
+          SendMessageW(vol, TBM_SETPOS, TRUE, pos);
+          Add(ui, kTabGameplay, L"STATIC", VoiceText(pos), SS_LEFT, cx + 206, 126, 130, 22, kVoiceVolValue, help);
+          Button(ui, kTabGameplay, L"Default (+3 dB)", cx + 240, 150, 140, kVoiceVolDefault, L"Back to +3 dB.");
+        }
+        const size_t custom_from = ui.page[kTabGameplay].size();
+        Switch(ui, kTabGameplay, L"Guard cover fixes", x, 206, lw, cx, kPlayCover, ui.loaded.cover,
+               L"Fixes bugs in how enemies use cover in Rare's original code: guards no longer snap out of cover, get "
+               L"stuck peeking, or leave cover too soon. Off: guards use cover exactly as on the Xbox 360.");
+        Switch(ui, kTabGameplay, L"Stealth", x, 246, lw, cx, kPlayStealth, ui.loaded.stealth,
+               L"An optional layer for the quiet part of Nightclub, Subway, Mansion and the Laboratory. While guards "
+               L"are calm they notice you more slowly in the dark at a distance, investigate noises, lamps and "
+               L"bodies, and can be crept up on from behind. The moment a guard sees you in plain view or you go "
+               L"loud (an unsilenced shot, an explosion, an alarm, a fight near him) he is Rare's own guard again "
+               L"and fights exactly as on the Xbox 360. Off: guards behave as on the Xbox 360 all the time.");
+        Switch(ui, kTabGameplay, L"Aim enhancements", x, 286, lw, cx, kPlayAim, ui.loaded.aim,
+               L"Aim assist keeps working while zoomed in, auto-aim holds while you stand still, and headshots stay at "
+               L"head height. Designed for controller play. Off: aiming as on the Xbox 360.");
+        Switch(ui, kTabGameplay, L"Restored sounds", x, 326, lw, cx, kPlaySounds, ui.loaded.sounds,
+               L"Sounds Rare recorded for things in the game that the Xbox 360 game never plays. Off: only the sounds "
+               L"the Xbox 360 game plays.");
+        ui.play_custom.assign(ui.page[kTabGameplay].begin() + std::ptrdiff_t(custom_from), ui.page[kTabGameplay].end());
+        ui.play_custom_pick = false;
+        RefreshPreset(ui);
+        // Diagnostic (Fri 20 Nov): what the saved file made of the tab when it opened; a later change is logged by the preset click.
+        Note(fmt::format("pdz_settings: Gameplay tab opened: preset {} (cover {}, stealth {}, aim {}, sounds {})",
+                         Sel(ui, kPlayPreset) == 0 ? "Restored" : Sel(ui, kPlayPreset) == 1 ? "Original" : "Custom",
+                         ui.loaded.cover, ui.loaded.stealth, ui.loaded.aim, ui.loaded.sounds));
+      }
+      ui.tab_help[kTabGameplay] = L"Point at a setting to see what it does.";
+
       // Frame rate.
-      const bool sp120 = rex::cvar::GetFlagByName("pdz_sp_120") != "false";
+      const int campaign_sel = rex::cvar::GetFlagByName("pdz_sp_120") == "false" || ui.gfx_earlier_quality ? 2
+                               : rex::cvar::GetFlagByName("pdz_sp_auto") == "true"                          ? 0
+                                                                                                            : 1;
       Label(ui, kTabFrameRate, L"Campaign", x, 52, lw, true);
-      Segments(ui, kTabFrameRate, cx, 48, 90, kCampaign, {L"Auto", L"120 fps", L"60 fps"}, sp120 ? 0 : 2,
-               L"The frame rate for single player. Auto picks 120 fps on 120 Hz screens and 60 on others. Pick 60 if "
-               L"your PC struggles to hold 120.");
+      Segments(ui, kTabFrameRate, cx, 48, 90, kCampaign, {L"Auto", L"120 fps", L"60 fps"}, campaign_sel,
+               L"The frame rate for single player. Auto aims for 120 fps; a level that keeps missing it drops to 60.");
       Add(ui, kTabFrameRate, L"STATIC",
           CampaignNote(ui.monitors.empty()
                            ? 60
@@ -3925,6 +4618,7 @@ namespace pdz::settings_ui
         };
         std::stringstream items(rebind);
         std::string item;
+        bool close_after = false;
         while (std::getline(items, item, ';'))
         {
           const size_t eq = item.find('=');
@@ -3939,13 +4633,25 @@ namespace pdz::settings_ui
             slot = 1;
             cvar.resize(cvar.size() - 2);
           }
+          if (cvar == "close")
+          {
+            // close=1: the script ends with the close box (saves, the game doesn't start) instead of Play.
+            close_after = true;
+            continue;
+          }
           if (cvar == "click")
           {
             // click=<control id>: a mouse click on that control (a segment's own id is 2000 + group x 8 + index).
             const int id = std::atoi(input.c_str());
             SendMessageW(GetDlgItem(ui.window, id), BM_CLICK, 0, 0);
-            Note(fmt::format("pdz_settings: test: clicked control {}: tab now {}, Screen mode {}, Render scale {}", id,
-                             ui.tab, Sel(ui, kMode), Sel(ui, kScale)));
+            Note(fmt::format("pdz_settings: test: clicked control {}: tab now {}, Screen mode {}, Render scale {}; "
+                             "graphics: upscaling {} aa {} aniso {} far lighting {} beams {}; gameplay: "
+                             "preset {} cover {} stealth {} aim {} sounds {} (rows shown {})",
+                             id, ui.tab, Sel(ui, kMode), Sel(ui, kScale), Sel(ui, kGfxUpscale), Sel(ui, kGfxAA),
+                             Sel(ui, kGfxAniso), Checked(ui, kGfxFar),
+                             ui.gfx_far_beams, Sel(ui, kPlayPreset), Checked(ui, kPlayCover),
+                             Checked(ui, kPlayStealth), Checked(ui, kPlayAim), Checked(ui, kPlaySounds),
+                             IsWindowVisible(GetDlgItem(ui.window, kPlayCover)) ? "yes" : "no"));
             continue;
           }
           if (cvar == "lock_inputs" || cvar == "lock_sens")
@@ -3977,6 +4683,17 @@ namespace pdz::settings_ui
             Note(fmt::format("pdz_settings: test: field of view slider {} -> \"{}\", pdz_fov_scale {:.3f}",
                              int(SendMessageW(fov, TBM_GETPOS, 0, 0)), std::string(shown, shown + wcslen(shown)),
                              FovScaleOfPosition(int(SendMessageW(fov, TBM_GETPOS, 0, 0)))));
+            continue;
+          }
+          if (cvar == "resolution")
+          {
+            // resolution=<entry>: the Resolution list's entry picked the way a player picks it (0 = Desktop).
+            SetSel(ui, kResolution, std::atoi(input.c_str()));
+            SendMessageW(ui.window, WM_COMMAND, MAKEWPARAM(kResolution, CBN_SELCHANGE),
+                         reinterpret_cast<LPARAM>(GetDlgItem(ui.window, kResolution)));
+            const std::wstring &shown = ui.drops[kResolution].items[size_t(Sel(ui, kResolution))];
+            Note(fmt::format("pdz_settings: test: Resolution entry {} picked: \"{}\"", Sel(ui, kResolution),
+                             std::string(shown.begin(), shown.end())));
             continue;
           }
           if (cvar == "pdz_zoom_steps")
@@ -4079,7 +4796,14 @@ namespace pdz::settings_ui
         // closes without saving; else Play saves and starts.
         if (!capture_too)
         {
-          PostMessageW(ui.window, WM_COMMAND, MAKEWPARAM(kPlay, BN_CLICKED), 0);
+          if (close_after)
+          {
+            PostMessageW(ui.window, WM_CLOSE, 0, 0);
+          }
+          else
+          {
+            PostMessageW(ui.window, WM_COMMAND, MAKEWPARAM(kPlay, BN_CLICKED), 0);
+          }
         }
       }
       // pdz_settings_test_dial: the practice dial played by its own test steering (logged), each run captured.
@@ -4216,6 +4940,10 @@ namespace pdz::settings_ui
       theme::FreeFonts(ui.tf);
       g_ui = nullptr;
       UnregisterClassW(wc.lpszClassName, wc.hInstance);
+      if (ui.choice == Choice::kPlay)
+      {
+        GameWindowToFront(); // (Wed 18 Nov night: the game window used to open behind other windows after this one)
+      }
       return ui.choice;
     }
   } // namespace

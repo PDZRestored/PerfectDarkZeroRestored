@@ -85,6 +85,18 @@ REXCVAR_DEFINE_BOOL(pdz_fix_ramp_step_walls, false, "Gameplay",
                     "when she runs into a wall above 30 fps)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(pdz_fix_ramp_step_edge_hold, false, "Gameplay",
+                    "With pdz_fix_ramp_step: for 1/30 s after Jo touched a low edge, a touch that reads as a wall (a "
+                    "post beside the edge, as at the door of Subway's end train) keeps the carried move and the "
+                    "earlier start instead of dropping them. Off = the 0.9.4 rule. Untested by hand")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(pdz_ladder_log, false, "Diagnostics",
+                    "Log player 1's view yaw and her mover's yaw values every frame while she is on a ladder or in an "
+                    "animated move (mount, dismount), with what pdz_fix_ramp_step did in that frame: for the ladder "
+                    "dismount view turn. No behaviour change")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_INT32(pdz_step_marker, 0, "Diagnostics",
                      "Testing: a number written into the step log when it changes (input scripts label attempts)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -173,6 +185,7 @@ namespace
     uint64_t updates = 0, last_use = 0;
     float pending[2] = {0, 0}; // the blocked part of earlier moves (x, z), carried into the next resolve
     float speed_ref = 0.0f;    // cm/s of the last move that wasn't blocked (the speed Jo reached the obstacle with)
+    float edge_age = 1.0f;     // s since the last real low-edge touch (pdz_fix_ramp_step_edge_hold)
     Resolved ring[kRing];
     int ring_head = 0, ring_n = 0; // head = index of the newest entry
     const Resolved &Back(int back) const // back = 1: the previous frame
@@ -279,6 +292,30 @@ namespace
     }
     return back;
   }
+
+  // pdz_ladder_log: one line per frame while the player's mover is on a ladder or in an animated move (the top
+  // climb-off is mode 2 of the animated-move record, sub_82695550). Offsets from the 15-16 Nov reading of
+  // sub_82695EC0 / sub_8269A7C8 / sub_82697B88: +408 / +412 the ladder, +605 the mode byte, +504 the blend, +320 the
+  // body yaw, +428 the animation yaw, +520 the target yaw, +456 a yaw offset added whole in one frame. Character
+  // +0x1670 = the view yaw in degrees; +0xF50 + 0x49 = the game's own eased view turn (the Locktopus's).
+  void LadderLog(const uint8_t *base, uint32_t character, uint32_t mover, const Frame &f)
+  {
+    const uint32_t ladder_a = Load32(base, mover + 408), ladder_b = Load32(base, mover + 412);
+    const uint8_t mode = base[mover + 605];
+    const float blend = LoadF(base, mover + 504);
+    if (ladder_a == 0 && ladder_b == 0 && mode == 0 && !(blend > 0.0f))
+    {
+      return;
+    }
+    const V3 pos = LoadV(base, mover + kMoverPosition);
+    REXLOG_INFO("pdz_ladder: dt {:.4f} mode {} ladder {:08X} / {:08X} | view yaw {:.2f} deg | body yaw {:.4f} anim yaw "
+                "{:.4f} target yaw {:.4f} blend {:.3f} pending yaw {:.4f} | pos ({:.1f}, {:.1f}, {:.1f}) | game turn {} | "
+                "ramp fix: resolved {} carried {:.2f} cm start -{}f{}",
+                f.dt, int(mode), ladder_a, ladder_b, LoadF(base, character + 0x1670), LoadF(base, mover + 320),
+                LoadF(base, mover + 428), LoadF(base, mover + 520), blend, LoadF(base, mover + 456), pos.x, pos.y, pos.z,
+                int(base[character + 0xF50 + 0x49]), f.resolved ? 1 : 0, f.carried, f.start_back > 0 ? f.start_back : 1,
+                f.held ? " HELD" : "");
+  }
 } // namespace
 
 // sub_8269C688(r3 = &offset out, r4 = &centre out, r5 = character, r6 = type, r7) -> r3 = the offset of the sweep
@@ -293,8 +330,14 @@ REX_HOOK_RAW(sub_8269C688)
   }
 }
 
+#ifdef PDZ_COUNTEROP
+bool PdzCounterOpSpiderFlatProbe(PPCContext &ctx, uint8_t *base); // counter_op_spider.cpp (round 13 b)
+#endif
 REX_HOOK_RAW(sub_8269CEF0)
 {
+#ifdef PDZ_COUNTEROP
+  if (PdzCounterOpSpiderFlatProbe(ctx, base)) return; // round 13 b: the spiderbot player 2 drives (false at once for anything else)
+#endif
   const uint32_t position = ctx.r3.u32, character = ctx.r4.u32;
   const bool mine = t_frame.in_update && IsGuestPointer(character) && Load32(base, character) == kPlayerVtable;
   const float in_y = mine ? LoadF(base, position + 4) : 0.0f;
@@ -442,6 +485,10 @@ REX_HOOK_RAW(sub_8269C580)
   }
   __imp__sub_8269C580(ctx, base);
   f.resolve = ctx.r3.u32 & 0xFF;
+  // pdz_fix_ramp_step_edge_hold (off): within 1/30 s of a real low-edge touch, a touch that reads as a wall (a post
+  // beside the edge) does not end the fix: the carry stays and the next frame may still start early.
+  m->edge_age = f.edge ? 0.0f : std::min(1.0f, m->edge_age + dt);
+  const bool edge_held = fix && REXCVAR_GET(pdz_fix_ramp_step_edge_hold) && !f.edge && m->edge_age <= 1.0f / kRareRate;
   {
     // The ring of resolved positions for pdz_fix_ramp_step_start (kept whether or not the fix is on, so a switch-on has
     // history). touched / lifted: the sweep moved the position (3D) / raised it; edge: a low-edge touch (EdgeTouch).
@@ -455,7 +502,7 @@ REX_HOOK_RAW(sub_8269C580)
       const float moved = std::hypot(Horizontal(f.sweep_in, f.sweep_out), f.sweep_out.y - f.sweep_in.y);
       r.touched = moved >= 0.02f;
       r.lifted = r.touched && f.sweep_out.y - f.sweep_in.y >= 0.02f;
-      r.edge = f.edge;
+      r.edge = f.edge || (edge_held && r.touched);
     }
     m->Push(r);
   }
@@ -467,7 +514,7 @@ REX_HOOK_RAW(sub_8269C580)
     const float got = std::hypot(ax, az);
     const bool blocked =
         tried >= 0.01f && f.swept && Horizontal(f.sweep_in, f.sweep_out) >= 0.1f * tried && got < tried;
-    if (blocked && (f.edge || REXCVAR_GET(pdz_fix_ramp_step_walls)))
+    if (blocked && (f.edge || edge_held || REXCVAR_GET(pdz_fix_ramp_step_walls)))
     {
       m->pending[0] = mx - ax, m->pending[1] = mz - az; // a low edge took part of the move: keep that part
     }
@@ -491,6 +538,12 @@ REX_HOOK_RAW(sub_8269C580)
   }
 }
 
+namespace pdz::camblend
+{
+  // camera_blend_60_Tue17Nov.cpp (pdz_camera_blend_log): the zoom slide and the ladder camera, frame by frame.
+  void OnPlayerMove(const uint8_t *base, uint32_t character, uint32_t mover, float dt);
+}
+
 REX_HOOK_RAW(sub_82697088)
 {
   const uint32_t character = ctx.r3.u32, mover = ctx.r4.u32;
@@ -509,6 +562,11 @@ REX_HOOK_RAW(sub_82697088)
     t_frame.dt = float(ctx.f1.f64);
     t_mover = m;
     __imp__sub_82697088(ctx, base);
+    pdz::camblend::OnPlayerMove(base, character, mover, t_frame.dt); // one cvar load while its log is off
+    if (REXCVAR_GET(pdz_ladder_log))
+    {
+      LadderLog(base, character, mover, t_frame);
+    }
     t_frame = Frame{};
     t_mover = nullptr;
     return;
@@ -530,6 +588,11 @@ REX_HOOK_RAW(sub_82697088)
   const Frame f = t_frame;
   t_frame = Frame{};
   t_mover = nullptr;
+  pdz::camblend::OnPlayerMove(base, character, mover, dt);
+  if (REXCVAR_GET(pdz_ladder_log))
+  {
+    LadderLog(base, character, mover, f);
+  }
   ++g_frames;
   const V3 after = LoadV(base, mover + kMoverPosition);
   const float achieved = Horizontal(before, after);

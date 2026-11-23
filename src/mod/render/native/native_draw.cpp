@@ -31,6 +31,7 @@
 #include "native_depth20e4.h"
 #include "native_device.h"
 #include "native_drawdump.h"
+#include "native_labdark.h"
 #include "native_pipeline.h"
 #include "native_shaders.h"
 #include "native_surfaces.h"
@@ -126,6 +127,21 @@ REXCVAR_DEFINE_BOOL(pdz_native_geometry_shrink, true, "Render",
                     "at least 2; its cached ranges are dropped first. Checked every 600 frames. A range of such a chunk "
                     "drawn again is copied again, as on a cache miss (same bytes). Off = chunks are kept for the session "
                     "(up to 256 MB, recycled whole only once all 8 exist).");
+REXCVAR_DEFINE_INT32(pdz_native_draw_memo, 1, "Render",
+                     "Native renderer (13 Nov, docs/CPU_STUDY_2.md): 1 = a draw whose register copy equals the "
+                     "previous draw's byte for byte reuses that draw's decoded render state and host viewport "
+                     "(both are worked out from the register copy alone), and a pipeline lookup with the same "
+                     "inputs as the previous one in the same frame returns the same pipeline without building and "
+                     "hashing its key. 2 = verify: everything is worked out as before and compared with what "
+                     "would have been reused (counted in the draw stats). 0 = off. On by default since Sat 14 Nov (kept by the study's timing table)");
+REXCVAR_DEFINE_INT32(pdz_native_geometry_front, 0, "Render",
+                     "Native renderer (13 Nov, docs/CPU_STUDY_2.md): 1 = a draw's vertex and index ranges are found "
+                     "through a small direct-mapped table in front of the geometry cache's map (two map lookups a "
+                     "draw, each a hash and a cold bucket walk, were the record thread's largest single item). The "
+                     "table only ever holds the map's own entries and loses a key whenever the map does, so the "
+                     "entry found is the same. 2 = verify: both are looked up and compared (counted in the draw "
+                     "stats). 0 = off, as before")
+    .range(0, 2);
 REXCVAR_DEFINE_BOOL(pdz_native_indexed_up, true, "Render",
                     "Native renderer: draw D3DDevice_DrawIndexedVerticesUP (sub_826E9E18, hooked since stage1/subagents/"
                     "hud.md): the UI's indexed shapes (sub_827B5890: TRILIST, 16-bit indices), i.e. the framed top bar "
@@ -188,6 +204,9 @@ namespace pdz::native
 {
   namespace reg = rex::graphics::reg;
   namespace xenos = rex::graphics::xenos;
+
+  // Sun 22 Nov night (audit): native_textures.cpp, the guarded probe of a guest range's first and last byte.
+  bool GuardedRangeTouch(const uint8_t *p, uint32_t bytes);
 
   bool VolumeViewFor(const FetchDecoded &fetch)
   {
@@ -658,18 +677,19 @@ namespace pdz::native
       // `frame` stamps the entry and its chunk (recycling), `stamp` the check window (FindChecked).
       GeometryEntry *Find(uint64_t key, uint64_t content_hash, uint64_t frame, uint64_t stamp, uint32_t &chunk_touched)
       {
-        auto it = entries_.find(key);
-        if (it == entries_.end())
+        GeometryEntry *found = Lookup(key);
+        if (!found)
         {
           return nullptr;
         }
-        GeometryEntry &e = it->second;
+        GeometryEntry &e = *found;
         if (e.content_hash != content_hash)
         {
           // Stale copy: the space stays allocated until the chunk is recycled; a new copy is made. Drawn earlier in this
           // frame with other bytes: rewritten between two passes (split screen) or two draws (hash once off / verify).
           in_frame_changes_ += e.last_frame == frame ? 1 : 0;
-          entries_.erase(it);
+          Forget(key);
+          entries_.erase(key);
           return nullptr;
         }
         e.last_frame = frame;
@@ -680,11 +700,7 @@ namespace pdz::native
       }
 
       // pdz_native_geometry_watch: the entry for `key` (any content), and a hit's bookkeeping without a hash.
-      GeometryEntry *FindKey(uint64_t key)
-      {
-        auto it = entries_.find(key);
-        return it != entries_.end() ? &it->second : nullptr;
-      }
+      GeometryEntry *FindKey(uint64_t key) { return Lookup(key); }
       void Touch(GeometryEntry &e, uint64_t frame, uint64_t stamp)
       {
         e.last_frame = frame;
@@ -696,9 +712,13 @@ namespace pdz::native
       // last_frame and its chunk's are this frame already (a window never spans frames), so nothing else changes.
       GeometryEntry *FindChecked(uint64_t key, uint64_t stamp)
       {
-        auto it = entries_.find(key);
-        return it != entries_.end() && it->second.checked_stamp == stamp ? &it->second : nullptr;
+        GeometryEntry *e = Lookup(key);
+        return e && e->checked_stamp == stamp ? e : nullptr;
       }
+
+      // pdz_native_geometry_front verify: lookups compared with the map / lookups whose answers differed.
+      uint64_t front_checked() const { return front_checked_; }
+      uint64_t front_differ() const { return front_differ_; }
 
       // Ranges found with other bytes than their copy made earlier in the same frame (Find).
       uint64_t in_frame_changes() const { return in_frame_changes_; }
@@ -900,6 +920,62 @@ namespace pdz::native
         return int(slot);
       }
 
+      // pdz_native_geometry_front (13 Nov, docs/CPU_STUDY_2.md): a direct-mapped table in front of the map, key ->
+      // the map's own entry. A slot is only ever filled from a map lookup and is emptied whenever that key leaves the
+      // map (Forget, at both erase sites, whatever the switch says), and the map's entries do not move (node-based,
+      // also across a rehash), so a slot that holds a key holds exactly what entries_.find(key) returns. 2 = verify:
+      // both are looked up and compared.
+      static constexpr uint32_t kFrontBits = 13;
+      struct FrontSlot
+      {
+        uint64_t key = 0;
+        GeometryEntry *entry = nullptr; // nullptr = empty
+      };
+      static uint32_t FrontIndex(uint64_t key) { return uint32_t((key * 0x9E3779B97F4A7C15ull) >> (64 - kFrontBits)); }
+      void Forget(uint64_t key)
+      {
+        FrontSlot &f = front_[FrontIndex(key)];
+        if (f.entry && f.key == key)
+        {
+          f.entry = nullptr;
+        }
+      }
+      GeometryEntry *Lookup(uint64_t key)
+      {
+        const int32_t mode = REXCVAR_GET(pdz_native_geometry_front);
+        if (mode == 0)
+        {
+          auto found = entries_.find(key); // as before: the front table is neither read nor filled
+          return found != entries_.end() ? &found->second : nullptr;
+        }
+        FrontSlot &f = front_[FrontIndex(key)];
+        if (mode == 1 && f.entry && f.key == key)
+        {
+          return f.entry;
+        }
+        auto it = entries_.find(key);
+        GeometryEntry *e = it != entries_.end() ? &it->second : nullptr;
+        if (mode == 2)
+        {
+          ++front_checked_;
+          if (f.entry && f.key == key && f.entry != e)
+          {
+            if (front_differ_++ < 8)
+            {
+              REXLOG_WARN("pdz_native: geometry front verify: key {:016X}: the front table holds another entry than "
+                          "the map",
+                          key);
+            }
+          }
+        }
+        if (e)
+        {
+          f.key = key;
+          f.entry = e;
+        }
+        return e;
+      }
+
       // Forgets every cached range in `chunk` (before its space is reused or released).
       void DropEntries(uint32_t chunk)
       {
@@ -907,6 +983,7 @@ namespace pdz::native
         {
           if (it->second.chunk == chunk)
           {
+            Forget(it->first);
             it = entries_.erase(it);
           }
           else
@@ -943,6 +1020,8 @@ namespace pdz::native
 
       std::vector<Chunk> chunks_;
       std::unordered_map<uint64_t, GeometryEntry> entries_;
+      FrontSlot front_[1u << kFrontBits];
+      uint64_t front_checked_ = 0, front_differ_ = 0;
       uint32_t recycles_ = 0;
       uint64_t released_ = 0;
       uint32_t released_logged_ = 0;
@@ -1070,6 +1149,19 @@ namespace pdz::native
       bool logged_endian[4] = {};
     };
     FrameState g_frame;
+
+    // pdz_native_draw_memo: the previous draw's register copy with what was decoded from it. Forgotten at every
+    // new frame (NewFrame), where the cvar is latched too.
+    struct DrawStateMemo
+    {
+      bool rs_valid = false, hv_valid = false;
+      uint32_t regs_be[shadow::dev::kRegShadowDwords] = {};
+      RenderState rs;
+      uint32_t hv_scale = 0;
+      bool hv_writes_depth = false;
+      HostViewport hv;
+    };
+    DrawStateMemo g_state_memo;
 
     // Device bytes 0 .. 10271 (VS / PS float constants at +1920 / +6016, bool + loop constants at +10112..+10271)
     // as they were when the pending BeginVertices returned: D3D emitted the batch's constants in that call's
@@ -1228,6 +1320,9 @@ namespace pdz::native
 
     void NewFrame(uint64_t frame)
     {
+      g_draw_memo = std::clamp(int(REXCVAR_GET(pdz_native_draw_memo)), 0, 2);
+      g_state_memo.rs_valid = false;
+      g_state_memo.hv_valid = false;
       ++g_ei.frames;
       if (g_ei.frames >= 600)
       {
@@ -2630,6 +2725,19 @@ namespace pdz::native
           }
         }
       }
+      // Sun 22 Nov night (audit): a range the guest decommitted since the draw was queued skips this draw instead of
+      // ending the process (the first and last byte read under the texture upload's guard; no system call).
+      if (!GuardedRangeTouch(src, bytes))
+      {
+        static std::atomic<uint32_t> unreadable{0};
+        if (unreadable.fetch_add(1, std::memory_order_relaxed) < 8)
+        {
+          REXLOG_INFO("pdz_native: {} range {:08X} ({} bytes) not readable at the draw: the draw is skipped "
+                      "(pdz_native_texture_guarded_read)",
+                      is_vertex ? "vertex" : "index", guest_address, bytes);
+        }
+        return false;
+      }
       const uint64_t content =
           CountedSampleHash(src, bytes, stamp) ^ (cut ? (uint64_t(reset->index) + 1) * 0x9E3779B97F4A7C15ull : 0ull);
       uint32_t chunk = 0;
@@ -2880,7 +2988,11 @@ namespace pdz::native
         // ReplaceResetIndex16To24).
         const uint32_t ib_base = view::Load32(base, r.index_buffer + shadow::dev::kVbBase) & 0x1FFFFFFEu;
         const uint8_t *src = PhysPtr(ib_base + args.start_index * 2u);
-        if (src && args.index_count <= kMaxDrawVertices * 3)
+        // Sun 22 Nov night (audit): the scan stays inside the 512 MB physical view, as IssueDraw's
+        // kPastPhysicalMemory bound (such a draw is skipped there anyway), and reads only a range still there.
+        if (src && args.index_count <= kMaxDrawVertices * 3 &&
+            uint64_t(ib_base) + (uint64_t(args.start_index) + args.index_count) * 2u <= 0x20000000ull &&
+            GuardedRangeTouch(src, args.index_count * 2u))
         {
           for (uint32_t i = 0; i < args.index_count; ++i)
           {
@@ -3130,8 +3242,42 @@ namespace pdz::native
       Lap(kStageTargets);
 
       // Pipeline.
+      // pdz_native_draw_memo: DecodeRenderState and ComputeHostViewport read nothing of the record but its register
+      // copy (regs_be, through ReadReg), so a draw whose register copy equals the previous draw's byte for byte gets
+      // the same RenderState (and, with the same scale and depth-writing flag, the same HostViewport).
+      const int memo_mode = g_draw_memo;
+      bool regs_hit = false;
       RenderState rs;
-      DecodeRenderState(r, rs);
+      if (memo_mode != 0)
+      {
+        regs_hit = g_state_memo.rs_valid && std::memcmp(g_state_memo.regs_be, r.regs_be, sizeof(r.regs_be)) == 0;
+      }
+      if (regs_hit && memo_mode == 1)
+      {
+        rs = g_state_memo.rs;
+        ++g_draw_memo_stats.state_hits;
+      }
+      else
+      {
+        DecodeRenderState(r, rs);
+        if (regs_hit)
+        {
+          ++g_draw_memo_stats.checked;
+          if (std::memcmp(&rs, &g_state_memo.rs, sizeof(rs)) != 0 && g_draw_memo_stats.differ++ < 8)
+          {
+            REXLOG_WARN("pdz_native: draw memo verify: render state differs ({} draw #{} caller {:08X})",
+                        DrawKindName(r.kind), r.sequence, r.caller);
+          }
+        }
+        else if (memo_mode != 0)
+        {
+          std::memcpy(g_state_memo.regs_be, r.regs_be, sizeof(r.regs_be));
+          g_state_memo.rs = rs;
+          g_state_memo.rs_valid = true;
+          g_state_memo.hv_valid = false;
+          ++g_draw_memo_stats.state_misses;
+        }
+      }
       if (!TopologyFor(args.prim).supported)
       {
         ++g_stats.skipped_pipeline;
@@ -3160,7 +3306,43 @@ namespace pdz::native
       // GetHostViewportInfo / GetScissor maths (native_pipeline.cpp ComputeHostViewport). The vertex shader
       // applies ndc_scale / ndc_offset in pdzHostPosition (fork patch 08).
       HostViewport hv;
-      ComputeHostViewport(r, tf.resolution_scale, ps->writes_depth, hv);
+      // pdz_native_draw_memo: g_state_memo.regs_be equals this draw's register copy here (a hit, or copied above).
+      const bool hv_hit = memo_mode != 0 && regs_hit && g_state_memo.hv_valid &&
+                          g_state_memo.hv_scale == tf.resolution_scale &&
+                          g_state_memo.hv_writes_depth == ps->writes_depth;
+      if (hv_hit && memo_mode == 1)
+      {
+        hv = g_state_memo.hv;
+        ++g_draw_memo_stats.view_hits;
+      }
+      else
+      {
+        ComputeHostViewport(r, tf.resolution_scale, ps->writes_depth, hv);
+        if (hv_hit)
+        {
+          const HostViewport &m = g_state_memo.hv;
+          ++g_draw_memo_stats.checked;
+          const bool same = std::memcmp(&m.viewport, &hv.viewport, sizeof(hv.viewport)) == 0 &&
+                            std::memcmp(&m.scissor, &hv.scissor, sizeof(hv.scissor)) == 0 &&
+                            std::memcmp(m.ndc_scale, hv.ndc_scale, sizeof(hv.ndc_scale)) == 0 &&
+                            std::memcmp(m.ndc_offset, hv.ndc_offset, sizeof(hv.ndc_offset)) == 0 &&
+                            m.vte_flags == hv.vte_flags && m.depth_clip == hv.depth_clip &&
+                            m.empty_viewport == hv.empty_viewport;
+          if (!same && g_draw_memo_stats.differ++ < 8)
+          {
+            REXLOG_WARN("pdz_native: draw memo verify: host viewport differs ({} draw #{} caller {:08X})",
+                        DrawKindName(r.kind), r.sequence, r.caller);
+          }
+        }
+        else if (memo_mode != 0 && g_state_memo.rs_valid)
+        {
+          g_state_memo.hv = hv;
+          g_state_memo.hv_scale = tf.resolution_scale;
+          g_state_memo.hv_writes_depth = ps->writes_depth;
+          g_state_memo.hv_valid = true;
+          ++g_draw_memo_stats.view_misses;
+        }
+      }
       const D3D12_VIEWPORT &vp = hv.viewport;
       D3D12_RECT scissor = hv.scissor;
       if (host_width)
@@ -4009,6 +4191,22 @@ namespace pdz::native
                     rs.depthcontrol, rs.blendcontrol[0], rs.color_mask, vs->hash, ps->hash, vs->textures.size(),
                     ps->textures.size(), static_cast<const void *>(pipe->pso));
       }
+      // The Laboratory's local darkness (pdz_lab_dark_visual, native_labdark.h): Rare's sun / ambient pass was just
+      // drawn into the light buffer; the lamps that are out take the ambient away around them. One compare a draw;
+      // the pass sets its own pipeline, root signature and target (the next draw binds the draw path's again).
+      {
+        // Draws into colour target 0 since it was last another surface (the pass's first-use log: where the ambient
+        // draw stands among the light buffer's draws).
+        static uint32_t s_rt0 = 0, s_rt0_draws = 0;
+        const uint32_t rt0 = (tf.rt_count != 0 && bound.rt[0]) ? bound.rt[0]->guest : 0;
+        s_rt0_draws = rt0 == s_rt0 ? s_rt0_draws + 1 : 1;
+        s_rt0 = rt0;
+        if (ps->hash == labdark::kAmbientPixelShader && rt0 != 0)
+        {
+          labdark::AfterAmbientDraw(dev, r, dev_ptr + shadow::dev::kPsAluConstants, bound.rt[0], vp, scissor,
+                                    s_rt0_draws - 1);
+        }
+      }
       return true;
     }
 
@@ -4356,6 +4554,20 @@ namespace pdz::native
                 g_stats.up_inner_begin, g_stats.topology_differs,
                 REXCVAR_GET(pdz_native_draw_topology) ? "drawn with their own" : "drawn with the PSO's",
                 g_stats.indexed_up_draws, g_stats.indexed_up_off, FloatCbText(), StateFilterText(), SmallCbText());
+    if (REXCVAR_GET(pdz_native_geometry_front) != 0)
+    {
+      REXLOG_INFO("pdz_native: geometry front table (pdz_native_geometry_front {}): verify: {} lookups compared with "
+                  "the map, {} differ",
+                  REXCVAR_GET(pdz_native_geometry_front), g_geometry.front_checked(), g_geometry.front_differ());
+    }
+    if (REXCVAR_GET(pdz_native_draw_memo) != 0)
+    {
+      const DrawMemoStats &m = g_draw_memo_stats;
+      REXLOG_INFO("pdz_native: draw memo (pdz_native_draw_memo {}): render state reused {} decoded {}, viewport reused "
+                  "{} computed {}, pipeline reused {} looked up {}; verify: {} results compared, {} differ",
+                  REXCVAR_GET(pdz_native_draw_memo), m.state_hits, m.state_misses, m.view_hits, m.view_misses,
+                  m.pipe_hits, m.pipe_misses, m.checked, m.differ);
+    }
   }
   namespace guestwatch
   {

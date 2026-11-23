@@ -57,6 +57,22 @@ REXCVAR_DEFINE_INT32(pdz_native_skip_pm4, 0, "Render",
     .range(0, 2)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+// Mon 16 Nov (Outpost / Jungle performance job, step 2c): the same skip as pdz_native_skip_pm4 1, as its own switch
+// with one line per level. Off: nothing below changes (one more cvar load per Swap).
+REXCVAR_DEFINE_BOOL(pdz_native_skip_unused_pm4, true, "Render",
+                    "Native renderer with graphics_backend null: the guest D3D library does not copy the context "
+                    "registers and the shader / fetch constants into the PM4 ring (the packets nothing reads: the "
+                    "native renderer takes them from the D3D device, the null command processor never uses them). "
+                    "The same skip as pdz_native_skip_pm4 1, with the same guards (ignored with the GPU plugin, which "
+                    "renders from those packets: captures against the emulated renderer and the picture gate run "
+                    "with it; ignored while pdz_render_shadow_assert is on), plus one 'pdz_pm4: level' line per "
+                    "level: what was skipped and what is still written per frame. Draw packets, shader loads, "
+                    "fences, waits, callbacks and the Swap are still written. Taken at each guest Swap. Off = "
+                    "pdz_native_skip_pm4 alone decides, as before. History: pdz_native_skip_pm4 1 was scrapped on "
+                    "30 Oct for ~32 ms waits in wait.guest_fence under the old latch pacing; not re-tested on the "
+                    "fixed / paced path until this job.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DECLARE(int32_t, pdz_frame_timing_skip); // frame_timing.cpp: the SUMMARY counts the same Swaps as pdz_timing's
 
 REX_EXTERN(__imp__sub_826F9298); // register run writer (context registers, bool / loop constants)
@@ -217,6 +233,63 @@ namespace pdz::pm4skip
     };
     State g_s;
 
+    // pdz_native_skip_unused_pm4: one line per level. The Swap hook says whether the frame is a level frame
+    // (NoteScene, before pdz::timing::OnSwap takes the scene). A level starts after kLevelGapFrames frames outside one;
+    // its line is written after kLevelLineFrames level frames with the skip in effect.
+    constexpr uint64_t kLevelLineFrames = 600, kLevelGapFrames = 30;
+    struct LevelLine
+    {
+      bool level_frame = false; // this Swap's frame (NoteScene)
+      uint64_t outside = kLevelGapFrames; // frames in a row outside a level
+      uint64_t levels = 0;
+      bool logged = false;
+      Acc acc;
+    };
+    LevelLine g_level; // render thread only
+
+    // d: this frame's counters (mode 1: the runs counted were skipped). Called under the state mutex, once per Swap.
+    void LevelFrame(const Snap &d, bool skipping, uint64_t swap)
+    {
+      LevelLine &l = g_level;
+      if (!l.level_frame)
+      {
+        ++l.outside;
+        return;
+      }
+      if (l.outside >= kLevelGapFrames)
+      {
+        ++l.levels;
+        l.logged = false;
+        l.acc = Acc();
+      }
+      l.outside = 0;
+      if (l.logged || !skipping)
+      {
+        return;
+      }
+      l.acc.Add(d, 1, swap);
+      if (l.acc.frames < kLevelLineFrames)
+      {
+        return;
+      }
+      l.logged = true;
+      const double f = double(l.acc.frames);
+      const uint64_t calls = l.acc.sum.calls[kRuns] + l.acc.sum.calls[kAlu] + l.acc.sum.calls[kFetch];
+      const uint64_t dwords = l.acc.sum.dwords[kRuns] + l.acc.sum.dwords[kAlu] + l.acc.sum.dwords[kFetch];
+      PDZ_LOG_DEFERRED("pdz_pm4: level {} (swaps {}-{}, {} level frames): pdz_native_skip_unused_pm4 skips per frame "
+                       "{:.0f} run-writer calls = {:.0f} ring dwords ({:.0f} KB) never read with the null GPU backend: "
+                       "{} {:.0f} calls / {:.0f} dwords, {} {:.0f} / {:.0f}, {} {:.0f} / {:.0f} (most in one frame {} "
+                       "dwords) | still written and executed: {:.0f} dwords per frame in {:.1f} ring kicks (draw "
+                       "packets, shader loads, fences, waits, callbacks, Swap; most in one frame {}); config runs "
+                       "below 0x2000 written {:.2f} per frame",
+                       l.levels, l.acc.first_swap, l.acc.last_swap, l.acc.frames, double(calls) / f, double(dwords) / f,
+                       double(dwords) * 4.0 / 1024.0 / f, kWriterName[kRuns], double(l.acc.sum.calls[kRuns]) / f,
+                       double(l.acc.sum.dwords[kRuns]) / f, kWriterName[kAlu], double(l.acc.sum.calls[kAlu]) / f,
+                       double(l.acc.sum.dwords[kAlu]) / f, kWriterName[kFetch], double(l.acc.sum.calls[kFetch]) / f,
+                       double(l.acc.sum.dwords[kFetch]) / f, l.acc.max_dwords, double(l.acc.sum.kicked) / f,
+                       double(l.acc.sum.kicks) / f, l.acc.max_kicked, double(l.acc.sum.config_calls) / f);
+    }
+
     int64_t Qpc()
     {
       LARGE_INTEGER v;
@@ -300,12 +373,20 @@ namespace pdz::pm4skip
     }
   } // namespace
 
+  void NoteScene(bool level_frame) { g_level.level_frame = level_frame; }
+
   void OnSwap()
   {
     const uint64_t swap = ++g_swaps;
     const int32_t mode_now = g_mode.load(std::memory_order_relaxed);
     int32_t requested = REXCVAR_GET(pdz_native_skip_pm4);
     requested = requested < 0 ? 0 : (requested > 2 ? 2 : requested);
+    // pdz_native_skip_unused_pm4: asks for the skip (mode 1) unless pdz_native_skip_pm4 itself is set; the level line.
+    const bool unused = REXCVAR_GET(pdz_native_skip_unused_pm4);
+    if (unused && requested == 0)
+    {
+      requested = 1;
+    }
     if (mode_now == 0 && requested == 0)
     {
       return; // off and staying off: nothing counted, nothing to log (one cvar load per Swap)
@@ -327,6 +408,10 @@ namespace pdz::pm4skip
       d.kicks = now.kicks - s.last.kicks;
       d.kicked = now.kicked - s.last.kicked;
       s.window.Add(d, mode_now, swap);
+      if (unused)
+      {
+        LevelFrame(d, mode_now == 1, swap); // one 'pdz_pm4: level' line per level (deferred logger)
+      }
       if (swap > uint64_t(REXCVAR_GET(pdz_frame_timing_skip) > 0 ? REXCVAR_GET(pdz_frame_timing_skip) : 0))
       {
         s.session.Add(d, mode_now, swap); // the SUMMARY: Swaps after pdz_frame_timing_skip, as the pdz_timing SUMMARY

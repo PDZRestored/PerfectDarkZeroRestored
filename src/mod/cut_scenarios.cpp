@@ -58,8 +58,14 @@
 // pdz_scenario_log (off by default): the mode's creation and first tick, flag
 // carriers and drops, each team score the plant check writes, the
 // multiplayer announcer cues, bot goal changes and bot plant attempts.
+#if PDZ_COUNTEROP
+#include "counter_op_pvp.h" // round 4: damage between the two Counter-Op players
+#endif
 #include "cut_scenarios.h"
 #include "cue_fixes.h"
+#include "lab_grate_sound.h"
+#include "bymodel_sounds_Wed18Nov.h"
+#include "lab_stealth.h"
 #include "minigame_log.h"
 #include "mp_announcer.h"
 #include "objective_bots.h"
@@ -93,7 +99,9 @@
 #include <rex/system/kernel_state.h>
 
 #include "../game_cvars.h"
+#include "aim120_Wed18Nov.h"
 #include "hook_profile.h" // pdz_hook_profile (must follow <rex/hook.h>)
+#include "guest_readable_Sat21Nov.h" // Sat 21 Nov: pdz_fix_readable_cache
 
 // Overnight 1108 A1 (sweep 7 Nov, FINDINGS R1-R3): bot reloads.
 REXCVAR_DEFINE_BOOL(pdz_fix_bot_fire_during_reload, true, "Gameplay",
@@ -180,6 +188,11 @@ namespace
   // props, 0x3F800000 / 0x03030000, and crashed on unmapped pages).
   bool Readable(const uint8_t *base, uint32_t address, uint32_t size)
   {
+    // Sat 21 Nov (pdz_fix_readable_cache): the cached check (guest_readable_Sat21Nov.cpp); below = off.
+    if (pdz::guestmem::CacheOn())
+    {
+      return pdz::guestmem::Readable(const_cast<uint8_t *>(base), address, size);
+    }
     if (address < 0x00010000u || address > 0xFFFF0000u - size)
     {
       return false;
@@ -522,6 +535,8 @@ REX_HOOK_RAW(sub_8244ADC0)
 }
 
 // sub_8244AE50 [8243EDB8](mode, flags): its destructor.
+void PdzPlantTheFlagReset(); // below, with the bots
+
 REX_HOOK_RAW(sub_8244AE50)
 {
   if (ctx.r3.u32 == g_mode)
@@ -531,6 +546,7 @@ REX_HOOK_RAW(sub_8244AE50)
       REXLOG_INFO("pdz_scenario: Plant the Flag mode {:08X} destroyed", g_mode);
     }
     g_mode = 0;
+    PdzPlantTheFlagReset(); // Sun 22 Nov night (audit): the match's bot pointers go with it
   }
   __imp__sub_8244AE50(ctx, base);
 }
@@ -622,8 +638,19 @@ uint32_t PdzProtectionCueName(uint8_t *base, uint32_t name);
 // CP3 (log 152): DEMOKIT_DETACH cues seen (a planted charge left the kit).
 int g_demokit_detaches = 0;
 
+namespace unwired_sounds
+{
+  uint32_t CueName(PPCContext &ctx, uint8_t *base, uint32_t name); // unwired_sounds_Tue17Nov.cpp
+}
+namespace pdz::soundmissing
+{
+  // sound_missing_log_Tue17Nov.cpp: the 'pdz_sound: MISSING' line (only called when a lookup found nothing)
+  void OnMiss(PPCContext &ctx, uint8_t *base, uint32_t asked, uint32_t asked_by_game, uint32_t lr);
+}
+
 REX_HOOK_RAW(sub_82202D20)
 {
+  const uint32_t cue_ref = ctx.r3.u32, asked_by_game = ctx.r4.u32, asked_from = uint32_t(ctx.lr);
   minigame_log::OnCue(ctx, base, ctx.r4.u32);
   if (ctx.r4.u32 && std::strstr(reinterpret_cast<const char *>(base + ctx.r4.u32), "DEMOKIT_DETACH"))
   {
@@ -632,6 +659,10 @@ REX_HOOK_RAW(sub_82202D20)
   // Recorded lines under other names (cue_fixes.cpp, game fixes), unused
   // announcer lines (mp_announcer.cpp), Protection's hacker-down line.
   ctx.r4.u64 = cue_fixes::CueName(ctx, base, ctx.r4.u32);
+  ctx.r4.u64 = unwired_sounds::CueName(ctx, base, ctx.r4.u32); // a prop's own recorded sound for a generic one
+  ctx.r4.u64 = lab_stealth::CueName(base, ctx.r4.u32); // Laboratory: the lamp-out comment
+  ctx.r4.u64 = lab_grate_sound::CueName(ctx, base, ctx.r4.u32); // Laboratory: a vent grate's fall sound
+  ctx.r4.u64 = bymodel_sounds::CueName(ctx, base, ctx.r4.u32); // metal doors, swivel chairs (by model)
   ctx.r4.u64 = mp_announcer::CueName(ctx, base, ctx.r4.u32);
   ctx.r4.u64 = PdzProtectionCueName(base, ctx.r4.u32);
   if (Log())
@@ -654,7 +685,14 @@ REX_HOOK_RAW(sub_82202D20)
       REXLOG_INFO("pdz_scenario: announcer cue {}", name);
     }
   }
+  const uint32_t asked = ctx.r4.u32;
   __imp__sub_82202D20(ctx, base);
+  // The reference's cue (+256) is -1 when no loaded bank has the name: one load and one compare when it resolved.
+  if (asked && cue_ref >= 0x10000u && cue_ref < 0xFFFF0000u &&
+      *reinterpret_cast<const uint32_t *>(base + cue_ref + 256) == 0xFFFFFFFFu)
+  {
+    pdz::soundmissing::OnMiss(ctx, base, asked, asked_by_game, asked_from);
+  }
 }
 
 // --- Bots (our addition) ---
@@ -758,8 +796,13 @@ namespace
   {
     // Vtables live in the image: anything else is not an object (a field the
     // other participant kind doesn't have read as one crashed the game).
+    // Sun 22 Nov night (audit): the object and its slot readable, the vtable in the game image.
+    if (!pdz::guestmem::Ok(base, object, 4))
+    {
+      return 0;
+    }
     const uint32_t vtable = Load32(base, object);
-    if (vtable < 0x82000000u || vtable >= 0x84000000u)
+    if (vtable < 0x82000000u || vtable >= 0x83000000u || !pdz::guestmem::Ok(base, vtable + slot, 4))
     {
       return 0;
     }
@@ -772,6 +815,22 @@ namespace
     frame.ctx.r3.u64 = object;
     fn(frame.ctx, base);
     return frame.ctx.r3.u32;
+  }
+
+  // Sun 22 Nov night (audit): an object's vtable slot value, 0 (GuestFunction: nullptr) unless the object is
+  // readable, its vtable lies in the game image and the slot is readable.
+  uint32_t VtableSlot(const uint8_t *base, uint32_t object, uint32_t slot)
+  {
+    if (!pdz::guestmem::Ok(base, object, 4))
+    {
+      return 0;
+    }
+    const uint32_t vtable = Load32(base, object);
+    if (vtable < 0x82000000u || vtable >= 0x83000000u || !pdz::guestmem::Ok(base, vtable + slot, 4))
+    {
+      return 0;
+    }
+    return Load32(base, vtable + slot);
   }
 
   uint32_t TeamBase(const uint8_t *base, int team)
@@ -1096,6 +1155,14 @@ namespace
 void PdzPlantTheFlagBots(PPCContext &ctx, uint8_t *base)
 {
   DriveBotPlants(ctx, base);
+}
+
+// Sun 22 Nov night (audit): the mode is gone (match over): its carriers and planters are forgotten, so the next
+// match never follows these characters (the plant check's lines did).
+void PdzPlantTheFlagReset()
+{
+  g_bot_plants.clear();
+  g_ptf_carriers.clear();
 }
 
 // sub_82146A00 [821438C0]: the bot script for the match (scenario 3 -> CTF's;
@@ -1445,8 +1512,13 @@ namespace
     }
     const uint32_t manager = Load32(base, kPadManager);
     const uint32_t list = IsGuestPointer(manager) ? Load32(base, manager + kPadSpawnList) : 0;
-    const uint32_t count = IsGuestPointer(list) ? Load32(base, list) : 0;
+    uint32_t count = IsGuestPointer(list) ? Load32(base, list) : 0;
     const uint32_t entries = IsGuestPointer(list) ? Load32(base, list + 4) : 0;
+    // Sun 22 Nov night (audit): the table read only when the count is sane and every entry readable.
+    if (count > 4096 || !pdz::guestmem::Ok(base, entries, count * kPadEntrySize))
+    {
+      count = 0;
+    }
     std::vector<uint32_t> clear;
     std::vector<uint32_t> free;
     for (uint32_t i = 0; IsGuestPointer(entries) && i < count; ++i)
@@ -1621,11 +1693,13 @@ namespace
 
 // sub_8244C610 [82440450](memory): the manager's constructor.
 void PdzProtectionCueCheck(PPCContext &ctx, uint8_t *base);
+void PdzProtectionManagerCreated(); // below, with the Protection bots
 
 REX_HOOK_RAW(sub_8244C610)
 {
   __imp__sub_8244C610(ctx, base);
   g_protection = ctx.r3.u32;
+  PdzProtectionManagerCreated(); // Sun 22 Nov night (audit): a new match, even at a pooled address
   if (Log() && Enabled())
   {
     REXLOG_INFO("pdz_scenario: Protection manager created ({:08X})", g_protection);
@@ -2068,7 +2142,7 @@ REX_HOOK_RAW(sub_824251D0)
   if (decided && team_duel && teams.front() >= 0 && teams.front() < 4)
   {
     const uint32_t net = settings + kTeamScores + uint32_t(teams.front()) * 52;
-    if (PPCFunc *get = pdz::GuestFunction(Load32(base, Load32(base, net) + 24)))
+    if (PPCFunc *get = pdz::GuestFunction(VtableSlot(base, net, 24)))
     {
       const int32_t before = Call(ctx, base, get, net);
       Call(ctx, base, __imp__sub_824CD3E8, net, uint32_t(before + 1));
@@ -4384,7 +4458,9 @@ namespace
   {
     const uint32_t handle = Load32(base, manager + kProtHackers + team * 4);
     uint32_t participant = handle == 0xFFFFFFFFu ? 0 : uint32_t(Call(ctx, base, sub_82473E50, handle));
-    if (!IsGuestPointer(participant) && g_pick_manager == manager && IsGuestPointer(g_bot_pick[team]))
+    // Sun 22 Nov night (audit): our bot pick only while he is still a participant.
+    if (!IsGuestPointer(participant) && g_pick_manager == manager && IsGuestPointer(g_bot_pick[team]) &&
+        InParticipantList(base, g_bot_pick[team]))
     {
       participant = g_bot_pick[team];
     }
@@ -4606,7 +4682,10 @@ REX_HOOK_RAW(sub_82539698)
                   GuestCallers(ctx, base, 14));
     }
   }
+  const uint32_t aim_npc = ctx.r3.u32, aim_weapon = ctx.r4.u32, aim_sp = ctx.r1.u32;
+  pdz::aim120::NpcShotBefore(base, aim_npc, aim_weapon); // aim120_Wed18Nov.cpp: pdz_jo_hit_log (log only)
   __imp__sub_82539698(ctx, base);
+  pdz::aim120::NpcShotAfter(base, aim_npc, aim_weapon, aim_sp);
 }
 
 // CP1: bots join Sabotage rounds as Rare assigns them (DarkOps bot script
@@ -4692,6 +4771,16 @@ REX_HOOK_RAW(sub_82428D48)
 bool PdzProtectionBots(const uint8_t *base)
 {
   return BotsEnabled(base);
+}
+
+// Sun 22 Nov night (audit): a Protection manager was just built (a new match). Our per-manager state is keyed by
+// the manager's address, which a pooled manager repeats; forgetting the old manager makes each keeper run its own
+// "new match" reset (the pick, the bot tick, the Data Thief glows) instead of following the last match's pointers.
+void PdzProtectionManagerCreated()
+{
+  g_pick_manager = 0;
+  g_bots_manager = 0;
+  g_glow_manager = 0;
 }
 
 // A hack: every team gets a new hacker (Rare's handler picks them all).
@@ -6015,12 +6104,21 @@ namespace
   // A bot's own name (its object name, "BOT-BERRI" -> "Berri"), for the log.
   std::string BotName(const uint8_t *base, uint32_t bot)
   {
+    // Sun 22 Nov night (audit): the object and the name's bytes readable (a non-bot's +136 can be anything).
+    if (!pdz::guestmem::Ok(base, bot, 140))
+    {
+      return "?";
+    }
     const uint32_t name = IsGuestPointer(bot) ? Load32(base, bot + 136) : 0; // kPropName (below)
     if (!IsGuestPointer(name))
     {
       // Log 313: the human (the player class) has no name there; his hits
       // and fights are named in the lines.
       return IsGuestPointer(bot) && Load32(base, bot) == 0x820C7DE0 ? "the human" : "?";
+    }
+    if (!pdz::guestmem::Ok(base, name, 32))
+    {
+      return "?";
     }
     const char *text = reinterpret_cast<const char *>(base + name);
     std::string n(text, strnlen(text, 32));
@@ -6124,12 +6222,8 @@ namespace
 
   float PropHealth(PPCContext &ctx, uint8_t *base, uint32_t prop)
   {
-    const uint32_t vtable = Load32(base, prop);
-    if (vtable < 0x82000000u || vtable >= 0x84000000u)
-    {
-      return 0.0f;
-    }
-    PPCFunc *fn = pdz::GuestFunction(Load32(base, vtable + 332));
+    // Sun 22 Nov night (audit): object readable, vtable in the game image (VtableSlot); _purecall refused.
+    PPCFunc *fn = pdz::GuestFunction(VtableSlot(base, prop, 332));
     if (!fn)
     {
       return 0.0f;
@@ -9359,7 +9453,7 @@ namespace
   // went straight back (328 times in log 123).
   bool PutBack(PPCContext &ctx, uint8_t *base, uint32_t item)
   {
-    PPCFunc *fn = pdz::GuestFunction(Load32(base, Load32(base, item) + 504));
+    PPCFunc *fn = pdz::GuestFunction(VtableSlot(base, item, 504));
     if (!fn)
     {
       return true;
@@ -9407,7 +9501,7 @@ namespace
     {
       return;
     }
-    PPCFunc *select = pdz::GuestFunction(Load32(base, Load32(base, switcher)));
+    PPCFunc *select = pdz::GuestFunction(VtableSlot(base, switcher, 0));
     if (!select)
     {
       return;
@@ -9490,7 +9584,7 @@ namespace
     {
       return;
     }
-    PPCFunc *select = pdz::GuestFunction(Load32(base, Load32(base, switcher)));
+    PPCFunc *select = pdz::GuestFunction(VtableSlot(base, switcher, 0));
     if (!select)
     {
       return;
@@ -9648,7 +9742,7 @@ namespace
     {
       return;
     }
-    PPCFunc *raise = pdz::GuestFunction(Load32(base, Load32(base, gun) + 492));
+    PPCFunc *raise = pdz::GuestFunction(VtableSlot(base, gun, 492));
     if (!raise)
     {
       return;
@@ -9970,7 +10064,8 @@ namespace
   void ReloadWatchFrame(PPCContext &ctx, uint8_t *base, uint32_t bot)
   {
     const bool guard = ReloadGuardOn(base);
-    if ((!Log() && !guard) || !IsBot(base, bot))
+    // Sun 22 Nov night (audit): bot = a controller - 6284, readable before the vtable test.
+    if ((!Log() && !guard) || !pdz::guestmem::Ok(base, bot, 4) || !IsBot(base, bot))
     {
       return;
     }
@@ -10449,7 +10544,7 @@ namespace
           did = fmt::format("clip refilled Rare's AI way ({} of {}, reserve {} -> {}), ", load, size, reserve, reserve - load);
         }
       }
-      if (PPCFunc *raise = pdz::GuestFunction(Load32(base, Load32(base, gun) + 492)))
+      if (PPCFunc *raise = pdz::GuestFunction(VtableSlot(base, gun, 492)))
       {
         rex::CallFrame frame(ctx);
         frame.ctx.r1.u64 = (ctx.r1.u32 - 0x800) & ~0xFu;
@@ -15062,7 +15157,7 @@ namespace
     }
     // The prop's own transform, for the log only.
     float own[16] = {};
-    if (PPCFunc *get_transform = pdz::GuestFunction(Load32(base, Load32(base, prop) + 16)))
+    if (PPCFunc *get_transform = pdz::GuestFunction(VtableSlot(base, prop, 16)))
     {
       rex::CallFrame frame(ctx);
       frame.ctx.r1.u64 = (ctx.r1.u32 - 0x800) & ~0xFu;
@@ -19959,7 +20054,8 @@ REX_HOOK_RAW(sub_82143D08)
   if (IsGuestPointer(brain))
   {
     const auto object_ok = [&](uint32_t o) {
-      if (!IsGuestPointer(o))
+      // Sun 22 Nov night (audit): readable first (a garbage target such as 01000000 may be unmapped).
+      if (!IsGuestPointer(o) || !pdz::guestmem::Ok(base, o, 4))
       {
         return false;
       }
@@ -21421,7 +21517,9 @@ namespace
           std::vector<std::pair<float, uint32_t>> near;
           for (const auto &[other, oj] : g_sabotage_attackers)
           {
-            if (other != bot && !oj.plant && !oj.gather_for && oj.prop && !objective_bots::CharacterDown(ctx, base, other) &&
+            // Sun 22 Nov night (audit): a key left from an earlier match may be no bot now: checked before the call.
+            if (other != bot && !oj.plant && !oj.gather_for && oj.prop && pdz::guestmem::Ok(base, other, 4) && IsBot(base, other) &&
+                !objective_bots::CharacterDown(ctx, base, other) &&
                 g_bot_team[other] == g_bot_team[bot] && Distance(base, other, bot) < 5000.0f)
             {
               const Squad *mine = PlaySquads() ? SquadOf(bot) : nullptr;
@@ -23293,8 +23391,53 @@ void PdzSabotageMessageDone()
 // the round, the time into it, the local player's team and side, and what
 // asked for it. The announcer speaks to the local player, so "team" is his.
 REX_EXTERN(__imp__sub_822014B8);
+REXCVAR_DEFINE_BOOL(pdz_level_speech_log, false, "Debug",
+                    "Diagnosis (round 8, Jack's lines): log every request to Rare's speech / announcer queue "
+                    "822014B8 (name, caller, speaker, priority, game type, the queue's gate word, the answer), and "
+                    "the 'busy' flags of the Rooftops script's companion (script +0x700)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REX_HOOK_RAW(sub_822014B8)
 {
+  if (REXCVAR_GET(pdz_level_speech_log) && IsGuestPointer(ctx.r3.u32))
+  {
+    const char *text = reinterpret_cast<const char *>(base + ctx.r3.u32);
+    const std::string name(text, strnlen(text, 128));
+    const uint32_t lr = uint32_t(ctx.lr), speaker = ctx.r7.u32, priority = ctx.r6.u32;
+    const uint32_t so = Load32(base, 0x82D6BFD8);
+    const uint32_t type = IsGuestPointer(so) ? Load32(base, so + 40) : 0xFFFFFFFFu;
+    const uint32_t gate_owner = Load32(base, 0x82D6BFD8 + 0x44);
+    const uint32_t gate = IsGuestPointer(gate_owner) ? Load32(base, gate_owner + 0xC) : 0xFFFFFFFFu;
+    // The level script's companion (Rooftops: Jack at script +0x700) and Rare's flags that make a solo script skip
+    // his lines (his vtable +0xE8 = 8252CD98: byte [[guard +0x18D0] +0x3E0] or bit 0 of +0x186C).
+    std::string jack = "none";
+    const uint32_t level = Load32(base, 0x82D6BFD8 + 0x1C);
+    const uint32_t target = IsGuestPointer(level) ? Load32(base, level + 0x2D8) : 0;
+    const uint32_t script = IsGuestPointer(target) ? Load32(base, target + 0x74) : 0;
+    const uint32_t who = IsGuestPointer(script) ? Load32(base, script + 0x700) : 0;
+    if (IsGuestPointer(who) && Load32(base, who) == 0x820C45A0u)
+    {
+      const uint32_t brain = Load32(base, who + 0x18D0);
+      jack = fmt::format("{:08X} busy byte {} flag word {:08X}", who, IsGuestPointer(brain) ? int(base[brain + 0x3E0]) : -1,
+                         Load32(base, who + 0x186C));
+    }
+    if (IsGuestPointer(script) && Load32(base, script) == 0x820A4B08u)
+    {
+      // Rooftops: JACK_11 is asked when one of these three guards' vtable +332 value passes a threshold.
+      for (uint32_t off : {1824u, 1832u, 1840u})
+      {
+        const uint32_t guard = Load32(base, script + off);
+        jack += fmt::format("; [+{}] {:08X}{}", off, guard,
+                            IsGuestPointer(guard) ? (Load32(base, guard + 6272) & 0x10 ? " hidden" : " in the world") : "");
+      }
+    }
+    __imp__sub_822014B8(ctx, base);
+    REXLOG_INFO("pdz_speech: '{}' asked by {:08X}: speaker {:08X}, priority {}, game type {}, queue gate {}, answer "
+                "{:08X}; script {:08X} (vtable {:08X}) companion {}",
+                name, lr, speaker, priority, type, gate, ctx.r3.u32, script,
+                IsGuestPointer(script) ? Load32(base, script) : 0, jack);
+    return;
+  }
   if (REXCVAR_GET(pdz_sabotage_cue_log) && Log() && IsGuestPointer(ctx.r3.u32))
   {
     const char *text = reinterpret_cast<const char *>(base + ctx.r3.u32);
@@ -23542,7 +23685,9 @@ namespace
         any = any || DemoKitOf(base, ch);
       }
       const uint32_t shop = Load32(base, kShopObject);
-      const int32_t money = IsGuestPointer(shop) ? int32_t(Load32(base, shop + (Load32(base, participant + 0x3F0) + 11) * 4)) : 0;
+      const uint32_t shop_index = Load32(base, participant + 0x3F0); // Sun 22 Nov night (audit): bounded, as Duel's credits
+      const int32_t money =
+          IsGuestPointer(shop) && shop_index < 64 ? int32_t(Load32(base, shop + (shop_index + 11) * 4)) : 0;
       const int32_t price = Call(ctx, base, sub_824206A8, kDemoKitType);
       if (!any && IsGuestPointer(shop) && price > 0 && money >= price)
       {
@@ -23900,7 +24045,12 @@ REX_HOOK_RAW(sub_82158590)
                   int32_t(ctx.r5.u32), int32_t(ctx.r6.u32), int32_t(ctx.r10.u32), ctx.f1.f64, ctx.f2.f64);
     }
   }
+  // (stealth round 5, Mon 16 Nov, fix 6: Jo's melee is seen by the stealth layer; both calls return at once for
+  // anyone but player 1 or with the layer off)
+  const uint32_t melee_attacker = ctx.r3.u32;
+  lab_stealth::MeleeBefore(base, melee_attacker);
   __imp__sub_82158590(ctx, base);
+  lab_stealth::MeleeAfter(base, melee_attacker);
 }
 
 // --- Bullet diagnostic (pdz_sabotage_bots + pdz_scenario_log; log 151) ---
@@ -24078,7 +24228,8 @@ bool PlantingKit(PPCContext &ctx, uint8_t *base, uint32_t kit)
   }
   for (const auto &[bot, job] : g_sabotage_attackers)
   {
-    if (job.kit == kit && job.planting && !objective_bots::CharacterDown(ctx, base, bot))
+    if (job.kit == kit && job.planting && pdz::guestmem::Ok(base, bot, 4) && IsBot(base, bot) &&
+        !objective_bots::CharacterDown(ctx, base, bot)) // Sun 22 Nov night (audit): still a bot (stale keys)
     {
       ++g_round_counts.lowers_refused;
       return true;
@@ -24439,7 +24590,11 @@ REX_HOOK_RAW(sub_82546BC8)
   // hit is zeroed in the first 5 s of a window, or halved near death three times, each opening a new 5 s window).
   // The routine skips that block when its stack argument byte (entry r1+0x6F) is set; it is set for this call only and
   // restored. The agent keeps Rare's co-op mercy.
-  const bool no_mercy = PdzCounterOpIsPlayer2(ctx.r3.u32);
+  // Round 4 (item 1): a hit between the agent and player 2 (pdz_counterop_pvp_damage not "off"): no mercy for the
+  // agent either (log 054: hit 17 halved at 20 -> 15, then every hit of the next 5 s zeroed), her health floor lifted
+  // and Rare's low-difficulty boost kept out, for this call only (counter_op_pvp.cpp).
+  const PdzCounterOpPvpScope pvp = PdzCounterOpPvpBegin(base, ctx.r3.u32, ctx.r4.u32); // before the registers change
+  const bool no_mercy = PdzCounterOpIsPlayer2(ctx.r3.u32) || pvp.no_mercy;
   const uint32_t mercy_arg = ctx.r1.u32 + 0x6F;
   const uint8_t mercy_old = no_mercy ? base[mercy_arg] : 0;
   if (no_mercy)
@@ -24451,6 +24606,7 @@ REX_HOOK_RAW(sub_82546BC8)
   {
     base[mercy_arg] = mercy_old;
   }
+  PdzCounterOpPvpEnd(base, pvp);
 #else
   __imp__sub_82546BC8(ctx, base);
 #endif

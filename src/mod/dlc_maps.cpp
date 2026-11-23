@@ -101,6 +101,7 @@
 #include "../game_cvars.h"
 #include "../local_profiles.h"
 #include "mp_music.h"
+#include "guest_readable_Sat21Nov.h" // Sun 22 Nov night (audit): pdz::guestmem::Ok
 
 
 REX_EXTERN(__imp__sub_821EEE60);
@@ -1023,6 +1024,10 @@ REX_HOOK_RAW(sub_82393780)
     return;
   }
   const uint32_t game = LoadBe32(base, kGameState);
+  if (!pdz::guestmem::Ok(base, game, 40)) // Sun 22 Nov night (audit)
+  {
+    return;
+  }
   const uint32_t mode = LoadBe32(base, game + 36);
   if (mode != 2 && mode != 3)
   {

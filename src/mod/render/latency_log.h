@@ -31,4 +31,6 @@ namespace pdz::latency
   void OnNativeSubmit(uint64_t swap);
   // The SUMMARY line (test exit).
   void LogSummary(const char *why);
+  // Sun 22 Nov night (audit): game_pace.cpp, a level starts loading or is left: the cached player is forgotten.
+  void LevelReset();
 } // namespace pdz::latency

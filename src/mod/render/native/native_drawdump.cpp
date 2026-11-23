@@ -33,6 +33,7 @@
 #include <rex/logging.h>
 
 #include "native.h"
+#include "../../guest_readable_Sat21Nov.h" // Sun 22 Nov night (audit): pdz::guestmem::Ok
 #include "native_device.h"
 #include "native_draw.h"
 #include "native_recthread.h"
@@ -1019,7 +1020,10 @@ namespace pdz::native::drawdump
 
     // Vertices of a UP / BeginVertices draw, as uploaded (8in32 swap of the guest dwords).
     std::string vertex_json;
-    if (info.user_data && shadow::IsGuestPointer(info.data) && info.stride >= 4)
+    // Sun 22 Nov night (audit): the vertices read below only while they are there.
+    if (info.user_data && shadow::IsGuestPointer(info.data) && info.stride >= 4 &&
+        pdz::guestmem::Ok(base, info.data,
+                          std::min(info.vertex_count, std::max(kMaxVertexLog, kMaxVertexJson)) * info.stride))
     {
       const uint32_t dwords = info.stride / 4;
       const uint32_t shown = std::min(info.vertex_count, kMaxVertexLog);

@@ -5,6 +5,7 @@
 #include "shadow.h" // pdz_render_shadow_vs_ucode_erase
 #include "frame_timing.h"
 #include "native/native_view.h" // pdz_native_record_thread: the hook's copies of shader object fields
+#include "../guest_readable_Sat21Nov.h" // Sun 22 Nov night (audit): pdz::guestmem::Ok
 
 #include <unordered_map>
 
@@ -19,6 +20,12 @@ REXCVAR_DEFINE_INT32(pdz_native_record_ring, 1024, "Render",
                      "startup")
     .range(0, 4096)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+namespace pdz::native::pipeline_seed
+{
+  // native_pipeline.h (not included here: it pulls in D3D12).
+  void NotePixelShaderCreated(uint64_t hash, const uint8_t *container_be, uint32_t header_bytes, uint32_t ucode_bytes);
+} // namespace pdz::native::pipeline_seed
 
 namespace pdz::shadow
 {
@@ -43,6 +50,12 @@ namespace pdz::shadow
     }
 
     constexpr uint32_t kMaxProbes = 64; // keeps every lookup O(1)
+
+    // Sun 22 Nov night (audit): [a, a + n) readable where GuestPtr reads it (the physical window's 0x1000 offset).
+    inline bool GuestOk(const uint8_t *base, uint32_t a, uint32_t n)
+    {
+      return a < 0xFFFF0000u && pdz::guestmem::Ok(base, a >= 0xE0000000u ? a + 0x1000u : a, n);
+    }
   } // namespace
 
   State &Get() { return g_state; }
@@ -321,12 +334,18 @@ namespace pdz::shadow
     // sub_826E4108) and a pointer to its microcode copy (+12 / +40, the address the state flush IM_LOADs; the
     // shadow assert checks exactly these fields on every shader load).
     const uint32_t header = object + (vertex ? 592u : 52u);
+    // Sun 22 Nov night (audit): the object's fields and its header copy (+52 / +592: magic, header size, microcode
+    // size, program info) only while the object is still there (the record thread reads this after the hook).
+    if (!GuestOk(base, object, vertex ? 616u : 64u))
+    {
+      return nullptr;
+    }
     const uint32_t magic = Load32(base, header);
     const uint32_t header_bytes = Load32(base, header + 4);
     const uint32_t bytes = Load32(base, header + 8);
     const uint32_t ucode = pdz::native::view::Load32(base, object + (vertex ? 40u : 12u));
     if (magic != (vertex ? 0x102A0E01u : 0x102A0E00u) || header_bytes < 24 || header_bytes >= 16384 || bytes == 0 ||
-        bytes > 64 * 1024 || (bytes & 3) || !IsGuestPointer(ucode))
+        bytes > 64 * 1024 || (bytes & 3) || !IsGuestPointer(ucode) || !GuestOk(base, ucode, bytes))
     {
       return nullptr;
     }
@@ -437,13 +456,14 @@ namespace pdz::shadow
     if (slot->magic == 0x102A0E01u && header_bytes >= 24 && header_bytes < 16384)
     {
       const uint32_t program = Load32(base, function + 0x14);
-      if (program >= 24 && program + 12 * 4 <= header_bytes)
+      // Sun 22 Nov night (audit): each word only while it is there (a header copy read from the object).
+      if (program >= 24 && program + 12 * 4 <= header_bytes && GuestOk(base, function + program + 7 * 4, 4))
       {
         const uint32_t count = Load32(base, function + program + 7 * 4);
         for (uint32_t e = 0; e < count && e < 24; ++e)
         {
           const uint32_t at = program + (11 + e) * 4;
-          if (at + 4 > header_bytes)
+          if (at + 4 > header_bytes || !GuestOk(base, function + at, 4))
           {
             break;
           }
@@ -459,6 +479,14 @@ namespace pdz::shadow
     {
       slot->hash = 0;
     }
+    // pdz_native_shader_prepare: a pixel shader made by the hooked Create call, with its container still in the
+    // game's memory: its patch and variants are compiled before its first draw (native_pipeline_seed.cpp).
+    if (!ucode_override && slot->magic == 0x102A0E00u && slot->hash && slot->ucode_bytes <= 64 * 1024 &&
+        header_bytes <= 16384 && IsGuestPointer(function + header_bytes + slot->ucode_bytes - 1))
+    {
+      pdz::native::pipeline_seed::NotePixelShaderCreated(slot->hash, GuestPtr(base, function), header_bytes,
+                                                         slot->ucode_bytes);
+    }
     return slot;
   }
   } // namespace
@@ -466,7 +494,8 @@ namespace pdz::shadow
   void NoteDeclaration(uint8_t *base, uint32_t object, uint32_t elements)
   {
     State &s = g_state;
-    if (!IsGuestPointer(object) || !IsGuestPointer(elements))
+    // Sun 22 Nov night (audit): the object's count fields still there (the binder reads FVF declarations later).
+    if (!IsGuestPointer(object) || !IsGuestPointer(elements) || !GuestOk(base, object, dev::kDeclElements))
     {
       return;
     }
@@ -508,7 +537,11 @@ namespace pdz::shadow
     // The D3D object keeps its own copy: +8 count, +12 max stream, +36 table.
     slot->count = Load32(base, object + dev::kDeclCount);
     slot->max_stream = Load32(base, object + dev::kDeclMaxStream);
-    const uint32_t n = slot->count < 16 ? slot->count : 16;
+    uint32_t n = slot->count < 16 ? slot->count : 16;
+    if (!GuestOk(base, object + dev::kDeclElements, 12 * n))
+    {
+      n = 0; // Sun 22 Nov night (audit): the table is not all there: kept as zeros
+    }
     for (uint32_t e = 0; e < n; ++e)
     {
       const uint32_t at = object + dev::kDeclElements + 12 * e;

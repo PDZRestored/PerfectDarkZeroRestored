@@ -525,6 +525,16 @@ namespace pdz::timing
   void Defer(std::function<void()> fn);
   // A line formatted by the caller (whose counters are not safe to read elsewhere), written on that thread.
   void DeferLine(std::string line);
+
+  // Slow items (pdz_frame_timing_item_ms, Thu 12 Nov hitch hunt): one piece of first-use work on the render thread
+  // (a pixel shader's patch check, a variant build, a pipeline, a texture, a GPU resource) that took at least that
+  // long gets one 'pdz_timing: slow item' line with what it was, its size and type, so the frame of a spike line can
+  // be read item by item. Only while the spike log is on. The detail is built only when the line is written:
+  //   if (pdz::timing::SlowItemWanted(ms)) pdz::timing::SlowItem("7e3 variant", ms, fmt::format(...));
+  bool SlowItemWanted(double ms);
+  void SlowItem(const char *kind, double ms, std::string detail);
+  // A steady clock in ms for the items (QueryPerformanceCounter).
+  double ItemClockMs();
 } // namespace pdz::timing
 
 // A periodic line: formatted here, written on the background log thread (pdz::timing::DeferLine).

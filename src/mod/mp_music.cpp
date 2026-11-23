@@ -75,6 +75,9 @@
 #include "../game_cvars.h"
 #include "cut_scenarios.h"
 #include "mp_music.h"
+#include "bymodel_sounds_Wed18Nov.h"
+#include "guest_readable_Sat21Nov.h" // Sun 22 Nov night (audit)
+#include "restored_voice_Wed18Nov.h"
 #include "mp_music_custom.h"
 #include "hook_profile.h" // pdz_hook_profile (must follow <rex/hook.h>)
 
@@ -254,9 +257,19 @@ namespace
   std::string ReadString(const uint8_t *base, uint32_t address, size_t max = 260)
   {
     std::string text;
-    for (size_t i = 0; address && i < max && base[address + i]; ++i)
+    for (size_t i = 0; address && i < max; ++i)
     {
-      text += char(base[address + i]);
+      // (Sun 22 Nov night (audit): each page of the text tested as mapped before it is read.)
+      const uint32_t a = address + uint32_t(i);
+      if ((i == 0 || (a & 0xFFFu) == 0) && !pdz::guestmem::Ok(base, a, 1))
+      {
+        break;
+      }
+      if (!base[a])
+      {
+        break;
+      }
+      text += char(base[a]);
     }
     return text;
   }
@@ -367,6 +380,10 @@ namespace
     for (uint32_t i = 1; manager && i <= kGameBankSlots; ++i)
     {
       const uint32_t entry = manager + 56 + i * 12;
+      if (!pdz::guestmem::Ok(base, entry, 12)) // (Sun 22 Nov night (audit))
+      {
+        break;
+      }
       if (Lower(ReadString(base, LoadBe32(base, entry))) == name)
       {
         return entry;
@@ -682,6 +699,8 @@ REX_HOOK_RAW(sub_82205BD0)
     g_taken_by = uint32_t(ctx.lr);
     g_taken = true;
   }
+  bymodel_sounds::OnRelease(ctx.r3.u32); // a fuse box hum the game released itself
+  pdz::snd::OnRelease(ctx.r3.u32);       // a kept restored sound the game released itself
   __imp__sub_82205BD0(ctx, base);
 }
 
@@ -736,6 +755,7 @@ REX_HOOK_RAW(sub_821F9098)
 REX_HOOK_RAW(sub_821F9290)
 {
   mp_music::LeaveLevel(ctx, base);
+  pdz::snd::LevelEnd(ctx, base); // every kept restored sound (loops) stops with the level
   __imp__sub_821F9290(ctx, base);
 }
 

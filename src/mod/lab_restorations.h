@@ -27,6 +27,10 @@ namespace lab_restorations
   // pdz_lab_blackout_lines: is this position (cm) inside one of the four
   // light-group boxes the blackout darkens?
   bool InDarkenedBox(const float pos[3]);
+  // Round 3, Sun 15 Nov: which of those four boxes (1 main hall, 2 generator room, 3 cutscene room, 4 security /
+  // lower security / tower), 0 none (the first box in their order for a point in two). The lights-out
+  // conversation's "same room" rule (restorations.cpp, pdz_lab_lights_out_wide).
+  int DarkenedBoxOf(const float pos[3]);
 
   // pdz_lab_blackout_coverage as this run of the Laboratory uses it: the
   // level latched at the blackout, else the cvar (1..3). At 3 every room is

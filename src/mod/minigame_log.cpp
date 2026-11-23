@@ -28,6 +28,7 @@
 #include "minigame_log.h"
 #include "minigame_input.h" // NoteDemoKit: the keyboard fix follows the demo kit's puzzle too
 
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -43,6 +44,7 @@
 #include <rex/logging.h>
 
 #include "../game_cvars.h"
+#include "aim120_Wed18Nov.h"
 #include "hook_profile.h" // pdz_hook_profile (must follow <rex/hook.h>)
 
 REX_EXTERN(__imp__sub_82647A08);
@@ -298,10 +300,44 @@ namespace
   }
 } // namespace
 
+// Counter-Operative (round 6): is a hacking minigame running (Data Thief, demo kit or Locktopus: one of their
+// per-frame updates ran in the last half second)? holder = the character whose minigame it must be (0 = anyone's).
+// Noted at the top of the three update hooks, whatever the log switch says.
+namespace
+{
+  std::atomic<int64_t> g_minigame_ms{0};
+  std::atomic<uint32_t> g_minigame_holder{0};
+  int64_t MinigameNowMs()
+  {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now().time_since_epoch()).count();
+  }
+} // namespace
+void PdzMinigameNote(const uint8_t *base, uint32_t subgame)
+{
+  if (!IsGuestPointer(subgame))
+  {
+    return;
+  }
+  const uint32_t gadget = Load32(base, subgame + kSubgameGadget);
+  g_minigame_holder.store(IsGuestPointer(gadget) ? Load32(base, gadget + kGadgetHolder) : 0, std::memory_order_relaxed);
+  g_minigame_ms.store(MinigameNowMs(), std::memory_order_relaxed);
+}
+bool PdzMinigameRunning(uint32_t holder)
+{
+  const int64_t at = g_minigame_ms.load(std::memory_order_relaxed);
+  if (!at || MinigameNowMs() - at > 500)
+  {
+    return false;
+  }
+  const uint32_t who = g_minigame_holder.load(std::memory_order_relaxed);
+  return !holder || !who || who == holder;
+}
+
 // sub_82647A08 [82637BA0](subgame, f1 dt): the Data Thief minigame update.
 REX_HOOK_RAW(sub_82647A08)
 {
   const uint32_t object = ctx.r3.u32;
+  PdzMinigameNote(base, object);
   if (!Enabled() || !IsGuestPointer(object))
   {
     __imp__sub_82647A08(ctx, base);
@@ -383,6 +419,7 @@ REX_HOOK_RAW(sub_826478E8)
 REX_HOOK_RAW(sub_8264ADE0)
 {
   const uint32_t object = ctx.r3.u32;
+  PdzMinigameNote(base, object);
   pdz::minigame::NoteDemoKit(object); // minigame_input.cpp: the demo kit's tile puzzle reads the left stick too
   if (!Enabled() || !IsGuestPointer(object))
   {
@@ -408,6 +445,7 @@ REX_HOOK_RAW(sub_825AAF50)
   if (ctx.f1.f64 > 0.0)
   {
     PdzCharacterHit(ctx.r3.u32);
+    pdz::aim120::PlayerDamage(base, ctx.r3.u32, ctx.r4.u32, ctx.f1.f64); // aim120_Wed18Nov.cpp: pdz_jo_hit_log
   }
   if (Enabled() && g_active && ctx.r3.u32 == g_session.holder && ctx.f1.f64 > 0.0)
   {

@@ -85,21 +85,51 @@ list(APPEND PERFECTDARKZERORECOMP_SOURCES
     src/mod/fix_log.cpp
     src/mod/mp_music.cpp
     src/mod/mp_music_custom.cpp
+    src/mod/music_cause_log.cpp
     src/mod/cut_scenarios.cpp
     src/mod/bot_turrets.cpp
     src/mod/minigame_log.cpp
     src/mod/objective_bots.cpp
     src/mod/bot_watch.cpp
     src/mod/cue_fixes.cpp
+    src/mod/lab_grate_sound.cpp
     src/mod/audio_presence_log.cpp
     src/mod/restorations.cpp
     src/mod/lab_restorations.cpp
+    src/mod/level_memory.cpp
     src/mod/lab_cut_content.cpp
+    src/mod/lab_stealth.cpp
+    src/mod/cover_log_tu3.cpp
+    src/mod/voice_volume.cpp
+    src/mod/lab_light_shot_log.cpp
+    src/mod/lab_light_level.cpp
+    src/mod/lab_dark_patches.cpp
     src/mod/mp_announcer.cpp
     src/mod/anim_log.cpp
     src/mod/anim_viewer.cpp
     src/mod/ai_behaviour_debug.cpp
     src/mod/physics_step.cpp
+    src/mod/ragdoll_step_fix_Mon16Nov.cpp
+    src/mod/guard_footsteps_Mon16Nov.cpp
+    src/mod/camera_blend_60_Tue17Nov.cpp
+    src/mod/camera_sounds_Tue17Nov.cpp
+    src/mod/restored_sounds_Tue17Nov.cpp
+    src/mod/restored_sounds_r2_Tue17Nov.cpp
+    src/mod/bymodel_sounds_Wed18Nov.cpp
+    src/mod/restored_voice_Wed18Nov.cpp
+    src/mod/contact_log_Wed18Nov.cpp
+    src/mod/restored_sounds_r3_Wed18Nov.cpp
+    src/mod/hums_Fri20Nov.cpp
+    src/mod/sound_heard_Fri20Nov.cpp
+    src/mod/guest_readable_Sat21Nov.cpp
+    src/mod/look_hold_Fri20Nov.cpp
+    src/mod/glass_door_Fri20Nov.cpp
+    src/mod/walls_Fri20Nov.cpp
+    src/mod/datathief_log_Thu19Nov.cpp
+    src/mod/aim120_Wed18Nov.cpp
+    src/mod/sound_missing_log_Tue17Nov.cpp
+    src/mod/sound_census_Tue17Nov.cpp
+    src/mod/unwired_sounds_Tue17Nov.cpp
     src/mod/unarmed_log.cpp
     src/mod/prop_motion_rate.cpp
     src/mod/player_move.cpp
@@ -113,19 +143,24 @@ list(APPEND PERFECTDARKZERORECOMP_SOURCES
     src/mod/crash_dump.cpp
     src/mod/render/shadow_record.cpp
     src/mod/render/shadow_hooks.cpp
+    src/mod/render/sign_lights.cpp
+    src/mod/render/beam_fade_Mon16Nov.cpp
     src/mod/render/shadow_cvars.cpp
     src/mod/render/shadow_dump.cpp
     src/mod/render/native/native_cvars.cpp
     src/mod/render/native/native_device.cpp
     src/mod/render/native/native_passes.cpp
+    src/mod/render/native/native_labdark.cpp
     src/mod/render/native/native_postfx.cpp
     src/mod/render/native/native_textures.cpp
+    src/mod/render/native/native_menu_card.cpp
     src/mod/render/native/native_async_upload.cpp
     src/mod/render/native/native_surfaces.cpp
     src/mod/render/native/native_present.cpp
     src/mod/render/native/native_autodiff.cpp
     src/mod/render/native/native_passdump.cpp
     src/mod/render/test_harness.cpp
+    src/mod/render/test_pad_driver.cpp
     src/mod/render/native/native_shaders.cpp
     src/mod/render/native/native_binder.cpp
     src/mod/render/native/native_pipeline.cpp
@@ -182,6 +217,20 @@ endif()
 set_target_properties(perfectdarkzerorecomp PROPERTIES OUTPUT_NAME PDZRestored)
 
 rexglue_setup_target(perfectdarkzerorecomp GPU_PLUGINS xenos)
+# codegen_options.toml "iso_volatile = true" (docs/CPU_STUDY_2.md): the generated code, and only it, is built with
+# standard volatile semantics. The flag is only ever added here, from the same line of the same file that makes the
+# code generator emit every guest access as a volatile one, so the two cannot disagree. The title's own sources
+# (hooks, the lifted music functions) keep clang's default.
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/codegen_options.toml")
+file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/codegen_options.toml" _pdz_iso_volatile REGEX "^iso_volatile[ \t]*=[ \t]*true")
+if(_pdz_iso_volatile AND TARGET perfectdarkzerorecomp_recomp)
+    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        message(FATAL_ERROR "codegen_options.toml: iso_volatile is written for clang (-fno-ms-volatile)")
+    endif()
+    target_compile_options(perfectdarkzerorecomp_recomp PRIVATE -fno-ms-volatile)
+    target_compile_definitions(perfectdarkzerorecomp_recomp PRIVATE REX_ISO_VOLATILE_FLAG=1)
+    message(STATUS "codegen_options.toml: iso_volatile -> -fno-ms-volatile on the generated code")
+endif()
 # Startup log line (src/build_info.cpp): the build time and the source commit, written at every build by
 # cmake/pdz_build_info.cmake into the build folder (rewritten only when the commit changes).
 add_custom_target(pdz_build_info
@@ -200,13 +249,40 @@ endif()
 if(PDZ_NO_MODS)
     target_compile_definitions(perfectdarkzerorecomp PRIVATE PDZ_NO_MODS=1)
 endif()
+# Profiling builds only (docs/CPU_STUDY_2.md): a PDB with the generated code's line tables, so a profiler sample's
+# address maps to its line in generated/default/*.cpp and from there to the PowerPC instruction it came from
+# (tools/perf/ip_ppc_lines.py). /OPT:REF and /OPT:ICF are named because /DEBUG would otherwise turn them off: the
+# code is the same as without the option.
+option(PDZ_STUDY_PDB "Link PDZRestored.pdb (line tables of the generated code) for profiling" OFF)
+if(PDZ_STUDY_PDB AND WIN32)
+    target_link_options(perfectdarkzerorecomp PRIVATE "LINKER:/DEBUG" "LINKER:/OPT:REF" "LINKER:/OPT:ICF")
+endif()
+# The same for the title's own sources (the renderer's record thread: tools/perf/ip_host_lines.py). Line tables
+# only: no change to the code the compiler emits.
+option(PDZ_STUDY_PDB_MOD "PDZ_STUDY_PDB: line tables for the title's own sources too" OFF)
+if(PDZ_STUDY_PDB AND PDZ_STUDY_PDB_MOD AND WIN32 AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    target_compile_options(perfectdarkzerorecomp PRIVATE -gline-tables-only -gcodeview)
+endif()
 # Counter-Operative (docs/COUNTEROP_STUDY.md), parked 2026-10-30: out of the build unless asked for. ON compiles
 # src/mod/counter_op.cpp (its hooks and pdz_counterop* cvars) and the one call site in cut_scenarios.cpp.
 # Branch d15-counterop (8 Nov 2026): ON here so the prototype builds and can be tested; the runtime switch
 # pdz_counterop stays off by default and every hook passes straight through while it is off. tu3-base keeps OFF.
 option(PDZ_COUNTEROP "Build the parked Counter-Operative mod (src/mod/counter_op.cpp)" ON)
 if(PDZ_COUNTEROP)
-    target_sources(perfectdarkzerorecomp PRIVATE src/mod/counter_op.cpp src/mod/counter_op_menu.cpp)
+    target_sources(perfectdarkzerorecomp PRIVATE src/mod/counter_op.cpp src/mod/counter_op_menu.cpp
+        src/mod/counter_op_view.cpp src/mod/counter_op_triggers.cpp src/mod/counter_op_greet.cpp
+        src/mod/counter_op_guards.cpp src/mod/counter_op_jetpack.cpp src/mod/counter_op_hands.cpp
+        src/mod/counter_op_pads.cpp src/mod/counter_op_hud.cpp src/mod/counter_op_voice.cpp src/mod/counter_op_wake.cpp src/mod/counter_op_dress.cpp src/mod/counter_op_pvp.cpp
+        src/mod/counter_op_anim.cpp src/mod/counter_op_objectives.cpp src/mod/counter_op_spider.cpp
+        src/mod/counter_op_unheard.cpp src/mod/counter_op_only_jo.cpp
+        src/mod/counter_op_allies.cpp src/mod/counter_op_vehicles.cpp src/mod/counter_op_twins.cpp
+        src/mod/counter_op_rooftops.cpp src/mod/counter_op_outpost.cpp src/mod/counter_op_mansion.cpp
+        src/mod/counter_op_river.cpp src/mod/counter_op_levels13.cpp
+        src/mod/counter_op_turrets.cpp
+        src/mod/counter_op_regen_Fri20Nov.cpp
+        src/mod/counter_op_reticle_Fri20Nov.cpp
+        src/mod/counter_op_quick_Sat21Nov.cpp
+        src/mod/counter_op_spectate_Sat21Nov.cpp)
     target_compile_definitions(perfectdarkzerorecomp PRIVATE PDZ_COUNTEROP=1)
 endif()
 

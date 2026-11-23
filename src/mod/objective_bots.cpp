@@ -10,6 +10,7 @@
 
 #include <rex/hook.h>
 #include "guest_function.h" // our indirect calls: nullptr for no function (log 101)
+#include "guest_readable_Sat21Nov.h" // Sun 22 Nov night (audit): pdz::guestmem::Ok
 #include <rex/ppc/func.h>
 #include "hook_profile.h" // pdz_hook_profile (must follow <rex/hook.h>)
 
@@ -35,6 +36,7 @@ namespace
   }
 
   std::unordered_map<uint32_t, uint32_t> g_brains; // character -> brain (from its update)
+  uint64_t g_brains_level = ~0ull;                 // Sun 22 Nov night (audit): the session / level g_brains belongs to
   bool g_setting_goal = false;                     // SetGoal is in Rare's setter
 } // namespace
 
@@ -164,7 +166,9 @@ namespace objective_bots
   uint32_t BrainOf(const uint8_t *base, uint32_t character)
   {
     const auto it = g_brains.find(character);
-    if (it == g_brains.end() || Load32(base, it->second + kBrainCharacter) != character)
+    // Sun 22 Nov night (audit): a cached brain may be gone: read it only while it is mapped.
+    if (it == g_brains.end() || !pdz::guestmem::Ok(base, it->second + kBrainCharacter, 4) ||
+        Load32(base, it->second + kBrainCharacter) != character)
     {
       return 0;
     }
@@ -173,16 +177,24 @@ namespace objective_bots
 
   bool CharacterDown(PPCContext &ctx, uint8_t *base, uint32_t character)
   {
-    if (!IsGuestPointer(character))
+    // Sun 22 Nov night (audit): callers pass cached characters that may be stale or freed. Unreadable, a vtable
+    // outside the game image, or a slot that is not image code / is the runtime's _purecall (a destroyed object):
+    // down, without calling anything.
+    if (!IsGuestPointer(character) || !pdz::guestmem::Ok(base, character, 4))
     {
       return true;
     }
     const uint32_t vtable = Load32(base, character);
-    if (vtable < 0x82000000u || vtable >= 0x84000000u)
+    if (vtable < 0x82000000u || vtable >= 0x83000000u || !pdz::guestmem::Ok(base, vtable + 232, 4))
     {
       return true;
     }
-    PPCFunc *fn = pdz::GuestFunction(Load32(base, vtable + 232));
+    const uint32_t slot = Load32(base, vtable + 232);
+    if (slot < 0x82000000u || slot >= 0x833E0000u || slot == 0x82AA2BC8u)
+    {
+      return true;
+    }
+    PPCFunc *fn = pdz::GuestFunction(slot);
     if (!fn)
     {
       return false;
@@ -210,6 +222,14 @@ REX_HOOK_RAW(sub_821C2158)
   const uint32_t character = Load32(base, brain + kBrainCharacter);
   if (IsGuestPointer(character))
   {
+    // Sun 22 Nov night (audit): a new session or level: the brains of the one before are forgotten.
+    const uint32_t session = Load32(base, 0x82D6BFD8);
+    const uint64_t level = (uint64_t(session) << 8) | (pdz::guestmem::Ok(base, session, 28) ? base[session + 25] : 0xFFu);
+    if (level != g_brains_level)
+    {
+      g_brains_level = level;
+      g_brains.clear();
+    }
     if (g_brains.size() > 256)
     {
       g_brains.clear();

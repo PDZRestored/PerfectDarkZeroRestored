@@ -215,6 +215,7 @@ registers = ["r31", "r10", "r11", "r28"]
 [[midasm_hook]]
 address = 0x8260C8F4
 name = "PdzShadowPassBegin"
+registers = ["r20", "r24"]
 
 [[midasm_hook]]
 address = 0x8260CF5C
@@ -224,3 +225,11 @@ name = "PdzShadowPassEnd"
 address = 0x82411BEC
 name = "PdzShadowCasterCount"
 registers = ["r15", "r16", "r20"]
+
+# Restored sounds round 2 (Tue 17 Nov night, src/mod/restored_sounds_r2_Tue17Nov.cpp, pdz_snd_contact_*): in Rare's
+# physics-contact sound routine sub_82511A90, right after the object's template record is fetched (its vfunc +72,
+# r3): the contact flag +81 of a few templates whose own bounce sound their data had switched off.
+[[midasm_hook]]
+address = 0x82511D94
+name = "PdzPropContactRecord"
+registers = ["r3"]

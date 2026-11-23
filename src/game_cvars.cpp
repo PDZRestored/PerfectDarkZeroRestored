@@ -562,22 +562,26 @@ REXCVAR_DEFINE_BOOL(pdz_restore_mansion_door_greeting, false, "Gameplay",
                     "Jo through. Off by default")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
-REXCVAR_DEFINE_BOOL(pdz_restore_light_speech, false, "Gameplay",
-                    "Restoration: the Laboratory staff's cut lights-out lines. When the generator "
-                    "blackout starts, the nearest scientist (or two, as question and answer) says his "
-                    "\"lights out again\" line and the other staff nearby say their \"lights shot out\" "
-                    "line. Speech only: the darkness itself is unchanged. Off by default")
+REXCVAR_DEFINE_BOOL(pdz_restore_light_speech, true, "Gameplay",
+                    "Restoration: the Laboratory staff's recorded, never-played lights-out lines. When the "
+                    "generator blackout starts, the other staff near the player say their \"lights shot out\" "
+                    "line; the scientists' \"lights out again\" conversation (one asks, another answers; a "
+                    "scientist on his own has a solo line) waits until the player comes near a scientist "
+                    "standing in the dark, enters his darkened room, or sees him with no wall between "
+                    "(pdz_lab_lights_out_*). Its take is the sound bank's own random pick. Speech only: the "
+                    "darkness itself is unchanged. Laboratory only. On by default (Rare's recorded lines)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 // Laboratory | Rescue restorations (src/mod/lab_restorations.cpp; research in
 // the Laboratory research notes). Rare's lines and Rare's logic where
-// they exist; each off by default.
-REXCVAR_DEFINE_BOOL(pdz_lab_blackout_lines, false, "Gameplay",
-                    "Restoration: the Laboratory staff's cut lights-out lines on the generator blackout "
-                    "(pdz_restore_light_speech's lines), spoken only by staff standing inside one of Rare's "
-                    "four darkened light-group boxes (main hall, generator room, cutscene room, security / "
-                    "tower), so nobody in the still-lit Lab One / Lab Two says \"lights out again\". Speech "
-                    "only. Off by default")
+// they exist; each off by default except pdz_lab_blackout_lines (round 3,
+// Sun 15 Nov: Rare's recorded lines, on with pdz_restore_light_speech).
+REXCVAR_DEFINE_BOOL(pdz_lab_blackout_lines, true, "Gameplay",
+                    "Restoration: the Laboratory staff's recorded lights-out lines on the generator blackout "
+                    "(pdz_restore_light_speech's lines; either switch turns them on), spoken only by staff "
+                    "standing inside one of Rare's four darkened light-group boxes (main hall, generator room, "
+                    "cutscene room, security / tower), so nobody in the still-lit Lab One / Lab Two says "
+                    "\"lights out again\". Speech only. Laboratory only. On by default (Rare's recorded lines)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(pdz_lab_power_return, false, "Gameplay",
@@ -821,6 +825,33 @@ REXCVAR_DEFINE_BOOL(pdz_cover_log, false, "Debug",
                     "cover behaviour is unchanged")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+// The player's cover fixes (src/mod/cover_log_tu3.cpp), single player only, each on by default. Their actions are
+// logged as pdz_cover: C1 / C2 / C3 / C5 lines whatever pdz_cover_log says.
+REXCVAR_DEFINE_BOOL(pdz_cover_fix_faced, true, "Gameplay",
+                    "Player cover: of the three places the cover scan tries (ahead and two diagonals), take the "
+                    "wall that faces where you look, not Rare's best-ranked one (a wall about 90 degrees off is "
+                    "never taken when one you face is there). Off = Rare's choice. Single player only")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(pdz_cover_fix_fan, true, "Gameplay",
+                    "Player cover: the cover scan tries all three places in one frame instead of one step a frame "
+                    "(up to 15 steps), so the prompt follows where you stand and look at once. Off = Rare's one "
+                    "step a frame. Single player only")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(pdz_cover_fix_stale, true, "Gameplay",
+                    "Player cover: never use an old cover find. The prompt goes and the press does nothing when "
+                    "the newest scan from where you stand found no cover, or the find was made more than 40 cm "
+                    "from you or more than 20 frames ago (Rare kept re-checking the old place instead). Off = "
+                    "Rare's rule. Single player only")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(pdz_cover_fix_fresh_push, true, "Gameplay",
+                    "Player cover: the jump to the other end of the cover needs a fresh sideways push: the stick "
+                    "must have come back near the centre (under half way) after you took cover or after the last "
+                    "jump. A push still held from before is ignored. Off = Rare's rule. Single player only")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(pdz_combat_log, false, "Debug",
                     "Combat aiming measurement (player only): while a target is selected or an "
                     "enemy targeting you is within 40 m and in view, 20 Hz samples of distance, "
@@ -854,9 +885,10 @@ REXCVAR_DEFINE_BOOL(pdz_shot_log, false, "Debug",
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(pdz_music_log, false, "Debug",
-                    "Log music changes: music type (Interactive, Tune1-4, Death), interactive music "
-                    "level (Silence / Stealth / Speedup), music cue starts (and failures), pause / "
-                    "resume / stop. Diagnostic only")
+                    "Log one line whenever Rare's level music changes (pdz_music: ...): the previous and new "
+                    "interactive level (Silence / Stealth / Speedup) or music type (Interactive, Tune1-4, Death) "
+                    "and what caused it: the guards engaged, the alarm, an alarm runner, the level script moment. "
+                    "Diagnostic only")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(pdz_look_log, false, "Debug",

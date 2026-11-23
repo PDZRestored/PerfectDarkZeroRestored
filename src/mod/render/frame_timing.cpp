@@ -45,6 +45,7 @@
 #include <thread>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <initializer_list>
 #include <limits>
@@ -98,6 +99,22 @@ REXCVAR_DEFINE_INT32(pdz_frame_timing_spike_ms, 0, "Render",
                      "present, guest vblanks), with a cause tag (the largest component). At most 600 lines per run; a "
                      "'pdz_timing: spikes SUMMARY' line at test exit (spikes by scene, cause histogram). 0 = off.")
     .range(0, 100000);
+REXCVAR_DEFINE_STRING(pdz_frame_timing_spike_file, "", "Render",
+                      "Frame timing spike log (pdz_frame_timing_spike_ms): a file that gets one short line per spike "
+                      "(swap, scene, frame ms), whatever the log level, for runs at --log_level=critical that write no "
+                      "log lines. Empty = none.");
+REXCVAR_DEFINE_INT32(pdz_frame_timing_item_ms, 3, "Render",
+                     "Frame timing spike log (pdz_frame_timing_spike_ms): one 'pdz_timing: slow item' line for every "
+                     "piece of first-use work on the render thread that took at least this many ms: a pixel shader's "
+                     "first use (file load, patch check, compiles), a depth20e4 / 7e3 blend variant, a pipeline, a "
+                     "texture created at the draw, a GPU resource, each with its size and type and the Swap it fell "
+                     "in. At most 800 lines per run. 0 = off.")
+    .range(0, 100000);
+REXCVAR_DEFINE_STRING(pdz_frame_timing_dump_file, "", "Render",
+                      "Frame timing (needs pdz_frame_timing; measurement aid, Mon 16 Nov): at test exit every kept "
+                      "Swap interval is written to this file, one line each: wall clock seconds (Unix time), frame ms, "
+                      "scene (0 other, 1 front end, 2 level), the Swap thread's CPU ms and the native draw calls (both "
+                      "need pdz_frame_timing_phases), native gpu ms. Empty = none.");
 REXCVAR_DEFINE_BOOL(pdz_frame_timing_spike_level_only, false, "Render",
                     "Frame timing spike log (pdz_frame_timing_spike_ms): only frames of the level scene (state 21) "
                     "count and get lines; the front end's paced 60 fps frames are not spikes at 120 Hz.");
@@ -226,6 +243,8 @@ namespace pdz::timing
       bool level_seen = false; // the first level frame was logged (load time, compiler experiments)
       std::vector<Sample> samples;
       std::vector<PhaseSample> phases; // same index as samples
+      std::vector<double> wall_s;      // pdz_frame_timing_dump_file: Unix time at each kept Swap (same index)
+      int dump = -1;                   // pdz_frame_timing_dump_file set? (-1: not read yet)
       std::vector<float> scratch;
       // Phases: the cumulative cycle counters at the previous Swap, and the TSC calibration against QPC.
       uint64_t phase_prev[kPhases] = {};
@@ -1438,6 +1457,21 @@ namespace pdz::timing
         s.spike_max_ms = x.frame_ms;
         s.spike_max_swap = swap;
       }
+      // pdz_frame_timing_spike_file: the spike as one short line in a file of its own, whatever the log level (a run at
+      // --log_level=critical writes no log lines). Appended on the background log thread.
+      if (const std::string file = REXCVAR_GET(pdz_frame_timing_spike_file); !file.empty())
+      {
+        const float frame_ms = x.frame_ms;
+        const char *scene = SceneName(x.scene);
+        Defer([file, swap, frame_ms, scene]() {
+          if (FILE *fp = std::fopen(file.c_str(), "ab"))
+          {
+            std::fprintf(fp, "swap %llu scene %s frame %.2f ms\n", static_cast<unsigned long long>(swap), scene,
+                         double(frame_ms));
+            std::fclose(fp);
+          }
+        });
+      }
       const bool off_thread = g_native_off_thread.load(std::memory_order_relaxed);
       std::string detail;
       const Cause cause = SpikeCause(x, ph, f, off_thread, detail);
@@ -1757,6 +1791,18 @@ namespace pdz::timing
                          presents ? float(double(present_delay_us) / 1000.0 / double(presents)) : kNone,
                          presents && present_gap_us ? float(double(present_gap_us) / 1000.0) : kNone});
     s.samples.back().scene = scene;
+    if (s.dump < 0)
+    {
+      s.dump = REXCVAR_GET(pdz_frame_timing_dump_file).empty() ? 0 : 1;
+    }
+    if (s.dump == 1)
+    {
+      FILETIME ft;
+      GetSystemTimePreciseAsFileTime(&ft);
+      const uint64_t t100 = (uint64_t(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
+      s.wall_s.resize(s.samples.size() - 1, 0.0);
+      s.wall_s.push_back(double(t100) / 1e7 - 11644473600.0);
+    }
     if (spike_valid)
     {
       ++s.spike_frames;
@@ -1800,6 +1846,22 @@ namespace pdz::timing
       return;
     }
     LogRange(s, 0, s.samples.size(), "SUMMARY", why);
+    if (const std::string file = REXCVAR_GET(pdz_frame_timing_dump_file); !file.empty())
+    {
+      if (FILE *fp = std::fopen(file.c_str(), "wb"))
+      {
+        for (size_t i = 0; i < s.samples.size(); ++i)
+        {
+          const bool ph = i < s.phases.size() && s.phases[i].level != 0;
+          std::fprintf(fp, "%.4f %.3f %d %.3f %.0f %.3f\n", i < s.wall_s.size() ? s.wall_s[i] : 0.0,
+                       double(s.samples[i].frame_ms), int(s.samples[i].scene),
+                       ph ? double(s.phases[i].thread_cpu_ms) : -1.0, ph ? double(s.phases[i].draws) : -1.0,
+                       std::isnan(s.samples[i].native_gpu_ms) ? -1.0 : double(s.samples[i].native_gpu_ms));
+        }
+        std::fclose(fp);
+        REXLOG_INFO("pdz_timing: {} frames written to {}", s.samples.size(), file);
+      }
+    }
     LogSpikeSummary(s, why); // pdz_frame_timing_spike_ms
   }
 } // namespace pdz::timing
@@ -1871,5 +1933,48 @@ namespace pdz::timing
   void DeferLine(std::string line)
   {
     Defer([line = std::move(line)]() { REXLOG_INFO("{}", line); });
+  }
+
+  // pdz_frame_timing_item_ms (Thu 12 Nov hitch hunt).
+  namespace
+  {
+    constexpr uint32_t kSlowItemLines = 800;
+    std::atomic<uint32_t> g_slow_items{0};
+  } // namespace
+
+  double ItemClockMs()
+  {
+    static const double ms_per_tick = [] {
+      LARGE_INTEGER f;
+      QueryPerformanceFrequency(&f);
+      return 1000.0 / double(f.QuadPart);
+    }();
+    LARGE_INTEGER c;
+    QueryPerformanceCounter(&c);
+    return double(c.QuadPart) * ms_per_tick;
+  }
+
+  bool SlowItemWanted(double ms)
+  {
+    if (!SpikeOn())
+    {
+      return false;
+    }
+    const int32_t at = REXCVAR_GET(pdz_frame_timing_item_ms);
+    return at > 0 && ms >= double(at) && g_slow_items.load(std::memory_order_relaxed) < kSlowItemLines;
+  }
+
+  void SlowItem(const char *kind, double ms, std::string detail)
+  {
+    const uint32_t n = g_slow_items.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n > kSlowItemLines)
+    {
+      return;
+    }
+    // The Swap counter is the one of the frame being recorded by the game thread: with the record thread the item
+    // belongs to that frame or the one before.
+    DeferLine(fmt::format("pdz_timing: slow item {} at swap ~{}: {} {:.2f} ms: {}{}", n,
+                          sampler::g_swaps.load(std::memory_order_relaxed), kind, ms, detail,
+                          n == kSlowItemLines ? "; no further slow item lines in this run" : ""));
   }
 } // namespace pdz::timing

@@ -48,6 +48,7 @@
 // Trinity Escape's INS_SQUAD_JONATHAN_JO_BLOW_DOOR, CRATE_WOOD_PUSH, the lab
 // door sounds, <voice>_FRIEND_DIES_MALE (event 109 passes the killer's sex,
 // so the target take isn't confirmed; plan item G6).
+#include "lab_stealth.h"
 #include "cue_fixes.h"
 
 #include <cstring>
@@ -270,6 +271,12 @@ namespace cue_fixes
 // session: pdz_sound: <BANK>_<CUE>, from the XACT name.
 REX_EXTERN(__imp__sub_82205C68);
 
+namespace sound_census // sound_census_Tue17Nov.cpp (pdz_sound_census)
+{
+  uint32_t PrimeBegin(const uint8_t *base, uint32_t sound);
+  void PrimeEnd(const uint8_t *base, uint32_t sound, uint32_t started, uint32_t stack, uint32_t token);
+}
+
 REX_HOOK_RAW(sub_82205C68)
 {
   if (REXCVAR_GET(pdz_sound_log) && ctx.r3.u32)
@@ -293,6 +300,11 @@ REX_HOOK_RAW(sub_82205C68)
     }
   }
   const uint32_t sound = ctx.r3.u32;
+  const uint32_t census_stack = ctx.r1.u32;
+  const uint32_t census = sound_census::PrimeBegin(base, sound); // pdz_sound_census (0 = off)
+  lab_stealth::PrimeBegin(base, sound); // Laboratory guard stealth: the guard line's take
   __imp__sub_82205C68(ctx, base);
+  sound_census::PrimeEnd(base, sound, ctx.r3.u32, census_stack, census);
+  lab_stealth::PrimeEnd(base, sound);
   audio_presence_log::OnPrime(base, sound, ctx.r3.u32); // pdz_audio_presence_log
 }

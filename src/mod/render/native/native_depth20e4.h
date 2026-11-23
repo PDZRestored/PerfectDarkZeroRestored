@@ -58,7 +58,10 @@ namespace pdz::native::depth20e4
   // Compiles a pixel shader source with the variants' compiler and arguments (the fork's dxcompiler.dll / dxil.dll,
   // `-T ps_6_0 -E main -HV 2021 -all-resources-bound ...` as XenosRecomp/dxc_compiler.cpp): signed DXIL in `dxil`.
   // Shared with native_coissue.cpp (render thread). False with `errors` when there is no compiler or it fails.
-  bool CompilePixelShader(const std::string &source, std::vector<uint8_t> &dxil, std::string &errors);
+  // `cache_path`: the file the caller will save the DXIL to; while ahead::Collecting() the compile is handed to the
+  // prepare workers with it (they write that file).
+  bool CompilePixelShader(const std::string &source, std::vector<uint8_t> &dxil, std::string &errors,
+                          const std::string *cache_path = nullptr);
   // A DXBC container whose hash is set (signed by dxil.dll; CreateGraphicsPipelineState rejects unsigned DXIL).
   bool IsSignedDxil(const std::vector<uint8_t> &dxil);
   // Compiles run so far by CompilePixelShader and the variants (the first-use log tells a compile from a disk read).
@@ -85,6 +88,29 @@ namespace pdz::native::depth20e4
     Result CompileCollected(uint32_t threads);
     void Clear();
   } // namespace batch
+
+  // Compiles ahead of the draw (pdz_native_shader_prepare, Thu 12 Nov hitch hunt; native_pipeline_seed.cpp). Render
+  // thread. Between Begin and End every compile of CompilePixelShader (given its cache path) and Variant() of both
+  // kinds is handed to a few low-priority worker threads and returns a placeholder (batch::Collecting() is true: the
+  // callers log nothing and keep it off disk); Variant() then keeps nothing and returns nullptr. A worker compiles the
+  // source with its own compiler and writes the cache file, so the draw's first use reads it from the disk cache. A
+  // draw that needs a source still being compiled waits for that compile; one not started yet is compiled by the
+  // draw as before. `low_priority`: behind everything queued without it. Begin is false without a compiler, or
+  // during the pipeline list's pass.
+  namespace ahead
+  {
+    struct Counters
+    {
+      uint32_t threads = 0, queued = 0, compiled = 0, failed = 0, written = 0;
+      uint32_t taken_done = 0, taken_waited = 0, taken_inline = 0; // by a draw: finished / waited for / compiled itself
+      double compile_ms = 0.0, waited_ms = 0.0, waited_max_ms = 0.0;
+    };
+    bool Begin(bool low_priority = false);
+    void End();
+    bool Collecting();
+    uint32_t Pending(); // queued or compiling now
+    Counters GetCounters();
+  } // namespace ahead
 
   // pdz_native_dxc_preload (default on): loads the compiler on a detached worker thread now (PipelineCache::Init), so
   // the first compile of a session (a pixel shader not in the disk caches) does not also pay the DLL load. Once.

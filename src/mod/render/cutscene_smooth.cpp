@@ -106,6 +106,7 @@
 
 #include "cutscene_dump.h"
 #include "game_pace.h" // LastCutsceneStep (the per-frame dump)
+#include "../guest_readable_Sat21Nov.h" // Sun 22 Nov night (audit): pdz::guestmem::Ok
 
 REXCVAR_DEFINE_BOOL(pdz_cutscene_smooth, false, "Render",
                     "In-engine cutscenes at the frame rate: Rare samples cutscene animation without interpolation "
@@ -3171,7 +3172,8 @@ REX_HOOK_RAW(sub_82220AC8)
     if (g_ring_n && g_f.cam0_ctrl)
     {
       RingEntry &e = g_ring[(g_ring_n - 1) % kRing];
-      if (!e.view)
+      // Sun 22 Nov night (audit): the control only while it is there.
+      if (!e.view && pdz::guestmem::Ok(base, g_f.cam0_ctrl + kCtrlEye, kCtrlTarget + 12 - kCtrlEye))
       {
         LV(base, g_f.cam0_ctrl + kCtrlEye, e.view_eye);
         LV(base, g_f.cam0_ctrl + kCtrlTarget, e.view_target);
@@ -3198,6 +3200,11 @@ REX_HOOK_RAW(sub_8220F478)
   {
     g_after = 0;
     return;
+  }
+  // Sun 22 Nov night (audit): the cached control only while it is there (the cutscene may have ended the level).
+  if (g_after && !pdz::guestmem::Ok(base, g_after_ctrl + kCtrlEye, kCtrlTarget + 12 - kCtrlEye))
+  {
+    g_after = 0;
   }
   if (g_after)
   {

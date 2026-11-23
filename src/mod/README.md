@@ -296,6 +296,18 @@ reads: cover behaviour is the original game's.
 | `pdz_cover_log` | `false` | `pdz_cover:` log lines: cover found/lost, enter requested (with Cover Mode and A state), snapped in, lean out/back, exit, time in each step |
 |  |  | `pdz_cover_ai:` lines for enemies: cover task created / in cover / peek position / look-out / snap-back / cover tests failed / ended, and totals once a minute |
 
+The Title Update 3 build's `cover_log_tu3.cpp` also holds four player cover
+fixes, single player only, each on by default (`false` = the original). Each
+logs what it does as `pdz_cover: C1` / `C2` / `C3` / `C5` lines, whatever
+`pdz_cover_log` says.
+
+| Setting | Default | What it does |
+|---|---|---|
+| `pdz_cover_fix_faced` | `true` | C1: of the scan's three probes, the wall facing the view is taken (Rare's rank only decides between walls within 20 degrees of the best-faced one) |
+| `pdz_cover_fix_fan` | `true` | C2: the out-of-cover scan completes all three probes in one frame (at most 15 scanner steps) instead of one step a frame |
+| `pdz_cover_fix_stale` | `true` | C3: an empty scan drops the candidate at once (Rare forgave one and re-checked from the old place, which kept a stale candidate alive); a candidate found over 40 cm away is re-scanned in the frame; the press is refused for a candidate over 40 cm away, over 20 frames old or after an empty scan |
+| `pdz_cover_fix_fresh_push` | `true` | C5: the in-cover jump to the other end needs the sideways input back inside +-0.5 after taking cover or after the last jump |
+
 ## How the game's cover works
 
 - **Player only.** The module (`sub_824EFCF8`..`sub_824F7F40`, player fields

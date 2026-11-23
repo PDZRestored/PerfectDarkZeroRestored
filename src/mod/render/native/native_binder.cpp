@@ -1,6 +1,7 @@
 // Native renderer (stage 1): the vertex-declaration binder (native_binder.h). A port of
 // PDZRenderResearch\native\tools\binder\binder.py, which reproduces all 534 .xsh bound variants.
 #include "native_binder.h"
+#include "../../guest_readable_Sat21Nov.h" // Sun 22 Nov night (audit): pdz::guestmem::Ok
 
 #include <algorithm>
 #include <cstring>
@@ -9,6 +10,11 @@ namespace pdz::native::binder
 {
   namespace
   {
+    // Sun 22 Nov night (audit): [a, a + n) readable where shadow::GuestPtr reads it (the physical window's offset).
+    inline bool GuestOk(const uint8_t *base, uint32_t a, uint32_t n)
+    {
+      return a < 0xFFFF0000u && pdz::guestmem::Ok(base, a >= 0xE0000000u ? a + 0x1000u : a, n);
+    }
     inline uint32_t Bits(uint32_t v, uint32_t lo, uint32_t n) { return (v >> lo) & ((1u << n) - 1u); }
     inline uint32_t Be32(const uint8_t *p) { return (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) | (uint32_t(p[2]) << 8) | p[3]; }
     inline void PutBe32(uint8_t *p, uint32_t v)
@@ -227,7 +233,7 @@ namespace pdz::native::binder
     for (uint32_t back = 24; back <= 16384; back += 4)
     {
       const uint32_t p = entry.ucode_src - back;
-      if (!shadow::IsGuestPointer(p))
+      if (!shadow::IsGuestPointer(p) || !GuestOk(base, p, 12)) // Sun 22 Nov night (audit): the container may be freed
       {
         break;
       }
@@ -243,13 +249,13 @@ namespace pdz::native::binder
 
   uint32_t ReadTable(const uint8_t *base, uint32_t container, TableEntry *out, uint32_t max_out)
   {
-    if (!shadow::IsGuestPointer(container))
+    if (!shadow::IsGuestPointer(container) || !GuestOk(base, container, 0x18)) // Sun 22 Nov night (audit)
     {
       return 0;
     }
     const uint32_t header_size = shadow::Load32(base, container + 4);
     const uint32_t program = shadow::Load32(base, container + 0x14);
-    if (program == 0 || program + 12 * 4 > header_size)
+    if (program == 0 || program + 12 * 4 > header_size || !GuestOk(base, container + program + 7 * 4, 4))
     {
       return 0;
     }
@@ -258,7 +264,7 @@ namespace pdz::native::binder
     for (uint32_t i = 0; i < count && n < max_out; ++i)
     {
       const uint32_t at = container + program + (11 + i) * 4;
-      if (at + 4 > container + header_size)
+      if (at + 4 > container + header_size || !GuestOk(base, at, 4))
       {
         break;
       }

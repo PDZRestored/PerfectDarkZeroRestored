@@ -21,7 +21,9 @@
 #include <rex/cvar.h>
 #include <rex/hook.h>
 #include <rex/logging.h>
+#include <rex/system/kernel_state.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -42,6 +44,7 @@ REX_EXTERN(__imp__sub_82710CC0);
 REX_EXTERN(__imp__sub_826216D0);
 REX_EXTERN(__imp__sub_82603AC0);
 REX_EXTERN(__imp__sub_82622510);
+REX_EXTERN(__imp__sub_82628888); // the per-view object visibility pass (skyline objects, below)
 
 namespace
 {
@@ -166,8 +169,276 @@ namespace
   }
 } // namespace
 
+// Water reflection visibility (Mon 16 Nov; pdz_fix_reflection_visibility, on by default). Rare's reflection pass
+// sub_82621BE8 draws the scene again with a mirrored camera, but runs no visibility query of its own: the mesh drawer
+// below skips every world part whose bit is clear in the MAIN camera's per-frame bit array (pointer at 82E22568, set
+// by sub_82714FF8). A tall building that has left the screen therefore vanishes from the water's reflection. While
+// the pass's "in reflection" byte (82E3C69F) is set, the drawer reads a private all-ones array instead: every world
+// part counts as visible in the reflection. Only the pointer is swapped (and put back); Rare's array is not written.
+REXCVAR_DEFINE_BOOL(pdz_fix_reflection_visibility, true, "Render",
+                    "Water reflections: the reflection pass draws every world part, not only the parts the main "
+                    "camera sees, so tall buildings stay in the reflection when they leave the screen. Off: as on "
+                    "the Xbox 360")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+// Skyline visibility (Mon 16 Nov, release candidate; pdz_fix_skyline_visibility, OFF by default since the hand test of
+// that evening: with it active the Nightclub skyline was still flat head-on, and the effect was then found to be the
+// level's fog, which is never changed. The code stays for a later look; nothing here runs while the switch is off). On the Nightclub
+// harbour a block of far buildings across the water shows only as the flat grey backdrop from some spots and as the
+// detailed lit towers from others. Read in the code: the world is split into rooms; the mesh drawer below skips every
+// room whose bit is clear in the frame's bit array (the same array the reflection fix above replaces), and the object
+// pass sub_82628888 hides the objects of every room whose bit is clear in the view's visible-room bitfield. Nothing
+// else was found that swaps far geometry (no distance or angle test in these paths). INFERRED, not seen in a run: the
+// towers' room is missing from the visible set at those spots.
+// The fix, on the levels of pdz_fix_skyline_levels only ("nightclub"): in the main scene passes (renderer modes 0, 1,
+// 7 and 8 at 82E22554; not the shadow passes) the drawer reads the all-ones array, so every room's static geometry is
+// submitted, and the per-room screen rectangles are not applied for that call (82E2254C = 0: a room that Rare did not
+// mark visible has no rectangle of its own and would be cut by the last one set). Hidden rooms end up behind the
+// walls in the depth buffer. Cost: all of the level's static geometry is submitted in each main pass, every frame,
+// instead of the visible rooms only. Rare's arrays are not written; the pointer and the flag are put back.
+// pdz_fix_skyline_objects (off; to try by hand if the towers turn out to be objects): the object pass runs with every
+// room marked visible (the view's bitfield is filled for the call and restored), so each object is only tested
+// against the view frustum.
+REXCVAR_DEFINE_BOOL(pdz_fix_skyline_visibility, false, "Render",
+                    "Far skyline: on the levels of pdz_fix_skyline_levels the main picture draws every part of the "
+                    "level, not only the rooms the game marks visible, so far buildings no longer drop out and leave "
+                    "the flat backdrop. Costs draw time on those levels. Off by default (hand test, Mon 16 Nov: it did not "
+                    "change the Nightclub skyline, which is a fog effect and is left as the game draws it). Off: as on "
+                    "the Xbox 360")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_STRING(pdz_fix_skyline_levels, "nightclub", "Render",
+                      "The single player levels pdz_fix_skyline_visibility acts on (names as pdz_sp_60_levels takes "
+                      "them, separated by commas). Empty: none")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(pdz_fix_skyline_objects, false, "Render",
+                    "With pdz_fix_skyline_visibility, on the same levels: objects in rooms the game marks hidden are "
+                    "drawn too when they are inside the view (props and other objects, not only the level's own "
+                    "geometry). Costs more. Off by default: untested")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+namespace pdz::pace
+{
+  std::string SpLevelName(const uint8_t *base, std::string *raw); // render/game_pace.cpp
+}
+
+namespace
+{
+  constexpr uint32_t kInReflection = 0x82E3C69F;  // byte, raised by sub_82621BE8 around its scene draw
+  constexpr uint32_t kVisibleBits = 0x82E22568;   // pointer to the frame's world-part visibility bits
+  constexpr uint32_t kUseRects = 0x82E2254C;      // word: the drawer applies the per-room screen rectangles
+  constexpr uint32_t kRenderMode = 0x82E22554;    // word: the scene pass's mode (2 shadow casters, 3 reflection)
+  constexpr uint32_t kAllVisibleSize = 0x10000;   // 64 KB of ones: part ids up to 524287
+  uint32_t g_all_visible = 0;
+
+  std::atomic<bool> g_skyline_level{false};
+  std::atomic<uint32_t> g_skyline_checked{~0u}; // the game frame of the last level check
+  std::atomic<bool> g_skyline_logged{false};
+
+  // Is the level being played on pdz_fix_skyline_levels? Asked again every 64 game frames (both threads call this).
+  bool SkylineLevel(const uint8_t *base)
+  {
+    const uint32_t frame = Frame(base);
+    const uint32_t last = g_skyline_checked.load(std::memory_order_relaxed);
+    if (last == ~0u || frame - last >= 64u)
+    {
+      g_skyline_checked.store(frame, std::memory_order_relaxed);
+      bool on = false;
+      const std::string list = REXCVAR_GET(pdz_fix_skyline_levels);
+      const std::string level = list.empty() ? std::string() : pdz::pace::SpLevelName(base, nullptr);
+      for (size_t at = 0; !level.empty() && at <= list.size();)
+      {
+        size_t end = list.find_first_of(", ;", at);
+        if (end == std::string::npos)
+        {
+          end = list.size();
+        }
+        if (end > at && list.compare(at, end - at, level) == 0)
+        {
+          on = true;
+          break;
+        }
+        at = end + 1;
+      }
+      if (g_skyline_level.exchange(on, std::memory_order_relaxed) != on)
+      {
+        REXLOG_INFO("pdz_fix_skyline_visibility: this level is {} pdz_fix_skyline_levels ('{}')", on ? "on" : "not on",
+                    level);
+      }
+    }
+    return g_skyline_level.load(std::memory_order_relaxed);
+  }
+
+  // What a call of the mesh drawer has to put back: the bits pointer (0: nothing swapped) and the rectangle flag.
+  struct PartsSwap
+  {
+    uint32_t bits = 0;
+    bool rects = false;
+    uint32_t rects_value = 0; // as stored (guest byte order)
+  };
+
+  // All world parts visible for this call of the drawer? The reflection pass (pdz_fix_reflection_visibility) and, on
+  // the skyline levels, the main scene passes (pdz_fix_skyline_visibility).
+  PartsSwap SeeAllParts(uint8_t *base)
+  {
+    PartsSwap swap;
+    if (!REXCVAR_GET(pdz_game_fixes))
+    {
+      return swap;
+    }
+    const bool reflection = base[kInReflection] != 0;
+    bool main_pass = false;
+    if (reflection)
+    {
+      if (!REXCVAR_GET(pdz_fix_reflection_visibility))
+      {
+        return swap;
+      }
+    }
+    else
+    {
+      if (!REXCVAR_GET(pdz_fix_skyline_visibility))
+      {
+        return swap;
+      }
+      const uint32_t mode = Load32(base, kRenderMode);
+      if ((mode != 0 && mode != 1 && mode != 7 && mode != 8) || !SkylineLevel(base))
+      {
+        return swap;
+      }
+      main_pass = true;
+    }
+    if (!g_all_visible)
+    {
+      g_all_visible = REX_KERNEL_MEMORY()->SystemHeapAlloc(kAllVisibleSize);
+      if (!g_all_visible)
+      {
+        return swap;
+      }
+      std::memset(base + g_all_visible, 0xFF, kAllVisibleSize);
+      REXLOG_INFO("pdz_fix_reflection_visibility: {} now draws every world part (all-visible bits at {:08X})",
+                  reflection ? "the water reflection pass" : "a main scene pass (pdz_fix_skyline_visibility)",
+                  g_all_visible);
+    }
+    const uint32_t old = Load32(base, kVisibleBits);
+    if (old == g_all_visible || !IsGuestPointer(old))
+    {
+      return swap;
+    }
+    *reinterpret_cast<uint32_t *>(base + kVisibleBits) = _byteswap_ulong(g_all_visible);
+    swap.bits = old;
+    if (main_pass)
+    {
+      uint32_t *rects = reinterpret_cast<uint32_t *>(base + kUseRects);
+      if (*rects != 0)
+      {
+        swap.rects = true;
+        swap.rects_value = *rects;
+        *rects = 0;
+      }
+      if (!g_skyline_logged.exchange(true, std::memory_order_relaxed))
+      {
+        REXLOG_INFO("pdz_fix_skyline_visibility: the main scene passes on this level now draw every world part "
+                    "(renderer mode {}, the per-room rectangles {})",
+                    Load32(base, kRenderMode), swap.rects ? "held off for these calls" : "were not in use");
+      }
+    }
+    return swap;
+  }
+} // namespace
+
+// The per-view object visibility pass (game thread; r3 = the view). pdz_fix_skyline_objects only: the view's
+// visible-room bitfield is filled with ones for the call and restored after it, so the pass takes every room as
+// visible and tests each object against the view frustum alone (its own loop, sub_82627DE8). The addresses are the
+// pass's own: level rooms = [[[82D6BFD8 + 12] + 16] + 4] (count at + 68, the room pointers at [+ 64], a room's bit
+// number at room + 76); the view's record = [[82D6BFD8 + 12] + 4 (buffer + 7)] + [rooms + 32] + view x [rooms + 36];
+// the bitfield = [[rooms + 104] + record + 44].
+REX_HOOK_RAW(sub_82628888)
+{
+  constexpr uint32_t kGame = 0x82D6BFD8, kBuffer = 0x82FBE3C0;
+  constexpr uint32_t kMaxBytes = 4096;
+  uint8_t saved[kMaxBytes];
+  uint32_t bits = 0, bytes = 0;
+  if (REXCVAR_GET(pdz_fix_skyline_objects) && REXCVAR_GET(pdz_fix_skyline_visibility) && REXCVAR_GET(pdz_game_fixes) &&
+      SkylineLevel(base))
+  {
+    const uint32_t tables = Load32(base, kGame + 12);
+    const uint32_t level = IsGuestPointer(tables) ? Load32(base, tables + 16) : 0;
+    const uint32_t rooms = IsGuestPointer(level) ? Load32(base, level + 4) : 0;
+    const uint32_t view_object = IsGuestPointer(ctx.r3.u32) ? Load32(base, ctx.r3.u32 + 20) : 0;
+    const uint32_t buffer = Load32(base, kBuffer);
+    if (IsGuestPointer(rooms) && IsGuestPointer(view_object) && buffer <= 1)
+    {
+      const uint32_t count = (uint32_t(base[rooms + 68]) << 8) | base[rooms + 69];
+      const uint32_t list = Load32(base, rooms + 64);
+      const uint32_t frame_record = Load32(base, tables + 4 * (buffer + 7));
+      const uint32_t view = Load32(base, view_object + 64);
+      if (count && count <= 8192 && IsGuestPointer(list) && IsGuestPointer(frame_record) && view <= 3)
+      {
+        const uint32_t record = frame_record + Load32(base, rooms + 32) + view * Load32(base, rooms + 36);
+        const uint32_t holder = Load32(base, rooms + 104) + record;
+        const uint32_t field = IsGuestPointer(holder) ? Load32(base, holder + 44) : 0;
+        uint32_t highest = 0;
+        bool sane = IsGuestPointer(field);
+        for (uint32_t i = 0; sane && i < count; ++i)
+        {
+          const uint32_t room = Load32(base, list + 4 * i);
+          if (!IsGuestPointer(room))
+          {
+            sane = false;
+            break;
+          }
+          const uint32_t n = Load32(base, room + 76);
+          if (n >= kMaxBytes * 8)
+          {
+            sane = false;
+            break;
+          }
+          highest = n > highest ? n : highest;
+        }
+        if (sane)
+        {
+          bits = field;
+          bytes = (highest >> 3) + 1;
+          std::memcpy(saved, base + bits, bytes);
+          std::memset(base + bits, 0xFF, bytes);
+          static bool logged = false;
+          if (!logged)
+          {
+            logged = true;
+            REXLOG_INFO("pdz_fix_skyline_objects: the object pass takes all {} rooms of this level as visible "
+                        "({} bytes of the view's room bits at {:08X} filled for the call)",
+                        count, bytes, bits);
+          }
+        }
+      }
+    }
+  }
+  __imp__sub_82628888(ctx, base);
+  if (bits)
+  {
+    std::memcpy(base + bits, saved, bytes);
+  }
+}
+
 REX_HOOK_RAW(sub_82710CC0)
 {
+  const PartsSwap parts_swap = SeeAllParts(base);
+  struct RestoreParts
+  {
+    uint8_t *base;
+    PartsSwap swap;
+    ~RestoreParts()
+    {
+      if (swap.bits)
+      {
+        *reinterpret_cast<uint32_t *>(base + kVisibleBits) = _byteswap_ulong(swap.bits);
+      }
+      if (swap.rects)
+      {
+        *reinterpret_cast<uint32_t *>(base + kUseRects) = swap.rects_value;
+      }
+    }
+  } restore_parts{base, parts_swap};
   static bool first = true;
   if (first && REXCVAR_GET(pdz_transparency_trace_frame) > 0)
   {

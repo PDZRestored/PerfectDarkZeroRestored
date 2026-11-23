@@ -25,10 +25,12 @@
 // src/mod/render/sun_shadows.cpp (polish 6b): the far-cascade PCF radius; above 0 at the mask shader's first use, it is
 // patched (native_hlslfix.h PatchShadowFarPcf).
 REXCVAR_DECLARE(double, pdz_shadow_far_pcf);
+REXCVAR_DECLARE(bool, pdz_long_shadows);
 // Polish 6c: the near / far split blend band; above 0 with pdz_shadow_distance_scale above 1 at the mask shader's first
 // use, it is patched (PatchShadowSplitBlend).
 REXCVAR_DECLARE(double, pdz_shadow_split_blend);
 REXCVAR_DECLARE(double, pdz_shadow_distance_scale);
+REXCVAR_DECLARE(bool, pdz_game_fixes); // src/game_cvars.cpp: the master switch of the game fixes
 
 REXCVAR_DEFINE_BOOL(pdz_native_coissue_fix, true, "Render",
                     "Native renderer: co-issued Xenos ALU operations read their sources before either writes (the "
@@ -90,9 +92,28 @@ REXCVAR_DEFINE_BOOL(pdz_native_live_literals, true, "Render",
                     "first-use patches; cached in <shader dir>\\coissue). Read at a shader's first use. Off: the "
                     "fork's baked values (native_hlslfix.h, stage1/subagents/temple2.md).");
 
+REXCVAR_DEFINE_BOOL(pdz_fix_fog_true_distance, true, "Render",
+                    "Native renderer, game fix: the fog is measured by the true distance to the camera. The game "
+                    "measures it along the view axis (the pixel's view-space depth), so the same far building is "
+                    "fogged out straight ahead and shows at the edge of the view (Nightclub's harbour skyline), and "
+                    "the fog on a thing changes as the camera turns. On: every fogged material pixel shader (668 in "
+                    "the cache) is recompiled at its first use with the same fog function fed the distance (together "
+                    "with the other first-use patches; cached in <shader dir>\\coissue): the fog's colour, start, end "
+                    "and curve are the game's, and the picture is identical on the view axis; towards the edges the "
+                    "fog is what the same point gets straight ahead (slightly more than before). Read at a shader's "
+                    "first use: a change needs a restart. Needs pdz_game_fixes. Off: the game's own depth fog. The "
+                    "emulated GPU path has no shader patch layer and keeps the depth fog (native_hlslfix.h "
+                    "PatchFogTrueDistance)");
+
 // The pipeline list's collect pass (depth20e4::batch) runs Apply on copies of the shaders: nothing of it is logged.
 #define COISSUE_LOG_INFO(...)                                                                                            do                                                                                                                     {                                                                                                                        if (!::pdz::native::depth20e4::batch::Collecting())                                                                    {                                                                                                                        REXLOG_INFO(__VA_ARGS__);                                                                                            }                                                                                                                    } while (0)
 #define COISSUE_LOG_WARN(...)                                                                                            do                                                                                                                     {                                                                                                                        if (!::pdz::native::depth20e4::batch::Collecting())                                                                    {                                                                                                                        REXLOG_WARN(__VA_ARGS__);                                                                                            }                                                                                                                    } while (0)
+
+namespace pdz::sunshadow
+{
+  void ApplyPreset(bool game_thread); // sun_shadows.cpp
+  void NoteMaskShader(bool long_patches);
+}
 
 namespace pdz::native::coissue
 {
@@ -148,8 +169,11 @@ namespace pdz::native::coissue
     HlslFixStats g_rcpf;  // pdz_native_rcpf_zero (sites = rcpf / rsqf instructions)
     HlslFixStats g_array; // pdz_native_stacked_array (sites = tfetch3D slots rewritten)
     HlslFixStats g_live;  // pdz_native_live_literals (sites = literal registers read from c[])
+    HlslFixStats g_fog;   // pdz_fix_fog_true_distance (with_sites = shaders with the fog line, sites = patched)
+    uint32_t g_fog_family[3] = {}; // patched shaders by shape: A, B1, B2 (native_hlslfix.h)
     bool g_pcf_logged = false;   // pdz_shadow_far_pcf: the one shader's outcome is logged once
     bool g_blend_logged = false; // pdz_shadow_split_blend: likewise
+    bool g_fade_logged = false;  // pdz_shadow_far_object_fade_fix: likewise
 
     void CountFixFailure(HlslFixStats &st, const char *name, uint64_t hash, const std::string &what)
     {
@@ -227,19 +251,30 @@ namespace pdz::native::coissue
       return;
     }
     s.coissue_checked = true;
+    pdz::sunshadow::ApplyPreset(false); // pdz_long_shadows sets the shadow cvars read below (sun_shadows.cpp)
     const bool coissue_on = REXCVAR_GET(pdz_native_coissue_fix);
     const bool param_gen_on = REXCVAR_GET(pdz_native_param_gen);
     const bool cube_on = REXCVAR_GET(pdz_native_cube_fix);
     const bool rcpf_on = REXCVAR_GET(pdz_native_rcpf_zero);
     const bool array_on = REXCVAR_GET(pdz_native_stacked_array);
     const bool live_on = REXCVAR_GET(pdz_native_live_literals);
+    const bool fog_on = REXCVAR_GET(pdz_fix_fog_true_distance) && REXCVAR_GET(pdz_game_fixes);
     // pdz_shadow_far_pcf (an enhancement, off by default): only the sun shadow mask shader, only when on at its first use.
-    const bool pcf_wanted = REXCVAR_GET(pdz_shadow_far_pcf) > 0.0 && s.hash == hlslfix::kShadowMaskShader;
+    const bool preset_wanted = REXCVAR_GET(pdz_long_shadows); // on, but perhaps not applied on this level (skip list)
+    const bool pcf_wanted = (REXCVAR_GET(pdz_shadow_far_pcf) > 0.0 || preset_wanted) && s.hash == hlslfix::kShadowMaskShader;
     // pdz_shadow_split_blend (part of the longer shadows): the same shader, only with the band above 0 and
     // pdz_shadow_distance_scale above 1 at its first use (so the stock settings never patch it).
     const bool blend_wanted = REXCVAR_GET(pdz_shadow_split_blend) > 0.0 && REXCVAR_GET(pdz_shadow_distance_scale) > 1.0 &&
                               s.hash == hlslfix::kShadowMaskShader;
-    if ((!coissue_on && !param_gen_on && !cube_on && !rcpf_on && !array_on && !live_on && !pcf_wanted && !blend_wanted) ||
+    // pdz_shadow_far_object_fade_fix (Mon 16 Nov): the same shader, whenever the longer shadows are on at its first use
+    // (the far cascade's depth range is only stretched then); the switch itself is read every frame (c17.z).
+    const bool fade_wanted = (REXCVAR_GET(pdz_shadow_distance_scale) > 1.0 || preset_wanted) && s.hash == hlslfix::kShadowMaskShader;
+    if (s.hash == hlslfix::kShadowMaskShader && !s.is_vertex)
+    {
+      pdz::sunshadow::NoteMaskShader(pcf_wanted && fade_wanted); // the preset can only be switched on later if so
+    }
+    if ((!coissue_on && !param_gen_on && !cube_on && !rcpf_on && !array_on && !live_on && !fog_on && !pcf_wanted &&
+         !blend_wanted && !fade_wanted) ||
         s.is_vertex || s.dxil.empty() || !s.usable)
     {
       return;
@@ -332,11 +367,11 @@ namespace pdz::native::coissue
         ++g_param_gen.enabled;
       }
     }
-    // The cube fix and the live literals cannot tell from the microcode scan whether they apply: with either on, every
-    // pixel shader's .hlsl is read once (only those whose main() uses the cube instruction or a cube fetch, resp. that
-    // declare literal registers, are recompiled).
+    // The cube fix, the live literals and the true-distance fog cannot tell from the microcode scan whether they apply:
+    // with one of them on, every pixel shader's .hlsl is read once (only those whose main() uses the cube instruction
+    // or a cube fetch, resp. that declare literal registers, resp. that have the fog line, are recompiled).
     if (!coissue_wanted && param_gen == paramgen::kNone && !cube_on && !rcpf_wanted && !array_wanted && !live_on &&
-        !pcf_wanted && !blend_wanted)
+        !fog_on && !pcf_wanted && !blend_wanted && !fade_wanted)
     {
       return;
     }
@@ -384,6 +419,11 @@ namespace pdz::native::coissue
         COISSUE_LOG_WARN("pdz_native: shadow split blend: ps {:016x}: no .hlsl next to the shader, drawn without the blend",
                     s.hash);
       }
+      if (fade_wanted)
+      {
+        COISSUE_LOG_WARN("pdz_native: far object shadow fade: ps {:016x}: no .hlsl next to the shader, drawn without the fix",
+                    s.hash);
+      }
       return;
     }
     const bool cube_wanted = cube_on && cubefix::Uses(hlsl);
@@ -404,8 +444,17 @@ namespace pdz::native::coissue
         ++g_live.with_sites;
       }
     }
+    const bool fog_wanted = fog_on && hlsl.find(hlslfix::kFogFactorTail) != std::string::npos;
+    if (fog_on)
+    {
+      ++g_fog.checked;
+      if (fog_wanted)
+      {
+        ++g_fog.with_sites;
+      }
+    }
     if (!coissue_wanted && param_gen == paramgen::kNone && !cube_wanted && !rcpf_wanted && !array_wanted && !live_wanted &&
-        !pcf_wanted && !blend_wanted)
+        !fog_wanted && !pcf_wanted && !blend_wanted && !fade_wanted)
     {
       return;
     }
@@ -414,7 +463,8 @@ namespace pdz::native::coissue
     // sites), and last the tfetch3D calls of main() with their prelude before the entry point.
     std::string source = hlsl, why;
     bool coissue_done = false, param_gen_done = false, cube_done = false, rcpf_done = false, array_done = false;
-    bool live_done = false, pcf_done = false, blend_done = false;
+    bool live_done = false, pcf_done = false, blend_done = false, fade_done = false, fog_done = false;
+    char fog_family = 0;
     uint32_t rcpf_lines = 0, array_slots = 0, live_registers = 0;
     if (rcpf_wanted)
     {
@@ -543,8 +593,43 @@ namespace pdz::native::coissue
                     path, why);
       }
     }
+    // The far object shadow fade (pdz_shadow_far_object_fade_fix): insert-only too, after the other two.
+    if (fade_wanted)
+    {
+      std::string patched;
+      if (hlslfix::PatchShadowFarObjectFade(source, patched, why))
+      {
+        source = std::move(patched);
+        fade_done = true;
+      }
+      else if (!why.empty())
+      {
+        COISSUE_LOG_WARN("pdz_native: far object shadow fade: ps {:016x}: {} not patched ({}), drawn without the fix", s.hash,
+                    path, why);
+      }
+    }
+    // The true-distance fog (pdz_fix_fog_true_distance) last: insert-only, after the co-issue moves (it accepts the
+    // z copy on either side of the position's normalise), and none of its lines is a "ps = " line.
+    if (fog_wanted)
+    {
+      std::string patched;
+      if (hlslfix::PatchFogTrueDistance(source, patched, why, &fog_family))
+      {
+        source = std::move(patched);
+        fog_done = true;
+      }
+      else if (why.empty())
+      {
+        ++g_fog.already; // c30 is not the fog in this shader, or patched already
+      }
+      else
+      {
+        CountFixFailure(g_fog, "true-distance fog", s.hash,
+                        fmt::format("{} not patched ({}), drawn with the game's depth fog", path, why));
+      }
+    }
     if (!coissue_done && !param_gen_done && !cube_done && !rcpf_done && !array_done && !live_done && !pcf_done &&
-        !blend_done)
+        !blend_done && !fade_done && !fog_done)
     {
       return;
     }
@@ -560,7 +645,7 @@ namespace pdz::native::coissue
     {
       std::string errors;
       const auto t0 = std::chrono::steady_clock::now();
-      const bool ok = depth20e4::CompilePixelShader(source, dxil, errors);
+      const bool ok = depth20e4::CompilePixelShader(source, dxil, errors, &cache_path);
       ms = uint32_t(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count());
       g_stats.compile_ms += ms;
       if (!ok)
@@ -592,6 +677,10 @@ namespace pdz::native::coissue
         {
           CountFixFailure(g_live, "live literals", s.hash, what);
         }
+        if (fog_done)
+        {
+          CountFixFailure(g_fog, "true-distance fog", s.hash, what);
+        }
         if (pcf_done)
         {
           COISSUE_LOG_WARN("pdz_native: far shadow PCF: ps {:016x}: {}", s.hash, what);
@@ -599,6 +688,10 @@ namespace pdz::native::coissue
         if (blend_done)
         {
           COISSUE_LOG_WARN("pdz_native: shadow split blend: ps {:016x}: {}", s.hash, what);
+        }
+        if (fade_done)
+        {
+          COISSUE_LOG_WARN("pdz_native: far object shadow fade: ps {:016x}: {}", s.hash, what);
         }
         return;
       }
@@ -617,6 +710,11 @@ namespace pdz::native::coissue
     if (live_done)
     {
       g_live.sites += live_registers;
+    }
+    if (fog_done)
+    {
+      ++g_fog.sites;
+      ++g_fog_family[fog_family == 'A' ? 0 : fog_family == '1' ? 1 : 2];
     }
     if (coissue_done)
     {
@@ -676,7 +774,16 @@ namespace pdz::native::coissue
                   s.hash, REXCVAR_GET(pdz_shadow_split_blend), pcf_done ? " with the PCF taps" : "", s.dxil.size(),
                   from_disk ? std::string("from the disk cache") : fmt::format("compiled in {} ms", ms));
     }
-    for (HlslFixStats *st : {rcpf_done ? &g_rcpf : nullptr, array_done ? &g_array : nullptr, live_done ? &g_live : nullptr})
+    if (fade_done && !g_fade_logged)
+    {
+      g_fade_logged = true;
+      COISSUE_LOG_INFO("pdz_native: far object shadow fade: ps {:016x} (the sun shadow mask): the far cascade's object "
+                  "shadow fade is scaled by c17.z (pdz_shadow_far_object_fade_fix, read every frame): patched ({} bytes "
+                  "DXIL, {})",
+                  s.hash, s.dxil.size(), from_disk ? std::string("from the disk cache") : fmt::format("compiled in {} ms", ms));
+    }
+    for (HlslFixStats *st : {rcpf_done ? &g_rcpf : nullptr, array_done ? &g_array : nullptr, live_done ? &g_live : nullptr,
+                             fog_done ? &g_fog : nullptr})
     {
       if (!st)
       {
@@ -697,9 +804,13 @@ namespace pdz::native::coissue
                 ? fmt::format("stacked array: ps {:016x}: tfetch3D of slot mask {:08X} reads a Texture2DArray when a 2D "
                               "/ stacked texture is bound",
                               s.hash, array_slots)
-                : fmt::format("live literals: ps {:016x}: {} literal register(s) read from the uploaded constants (the "
+            : st == &g_live
+                ? fmt::format("live literals: ps {:016x}: {} literal register(s) read from the uploaded constants (the "
                               "bound object's, D3D's SetPixelShader copy)",
-                              s.hash, live_registers);
+                              s.hash, live_registers)
+                : fmt::format("true-distance fog: ps {:016x}: the fog factor from the view position's length instead of "
+                              "its depth (shape {})",
+                              s.hash, fog_family == 'A' ? "A" : fog_family == '1' ? "B1" : "B2");
         COISSUE_LOG_INFO("pdz_native: {}: patched ({} bytes DXIL, {}){}", what, s.dxil.size(),
                     from_disk ? std::string("from the disk cache") : fmt::format("compiled in {} ms", ms),
                     st->patched == kLogShaders ? "; further shaders only in the counters" : "");
@@ -717,14 +828,47 @@ namespace pdz::native::coissue
     g_rcpf = HlslFixStats();
     g_array = HlslFixStats();
     g_live = HlslFixStats();
+    g_fog = HlslFixStats();
+    g_fog_family[0] = g_fog_family[1] = g_fog_family[2] = 0;
     g_pcf_logged = false;
     g_blend_logged = false;
+    g_fade_logged = false;
   }
+
+  CountersHold::CountersHold()
+      : stats_(g_stats), param_gen_(g_param_gen), cube_(g_cube), rcpf_(g_rcpf), array_(g_array), live_(g_live),
+        fog_(g_fog), pcf_logged_(g_pcf_logged), blend_logged_(g_blend_logged), fade_logged_(g_fade_logged)
+  {
+    for (int i = 0; i < 3; ++i)
+    {
+      fog_family_[i] = g_fog_family[i];
+    }
+  }
+
+  CountersHold::~CountersHold()
+  {
+    g_stats = stats_;
+    g_param_gen = param_gen_;
+    g_cube = cube_;
+    g_rcpf = rcpf_;
+    g_array = array_;
+    g_live = live_;
+    g_fog = fog_;
+    for (int i = 0; i < 3; ++i)
+    {
+      g_fog_family[i] = fog_family_[i];
+    }
+    g_pcf_logged = pcf_logged_;
+    g_blend_logged = blend_logged_;
+    g_fade_logged = fade_logged_;
+  }
+
   const ParamGenStats &GetParamGenStats() { return g_param_gen; }
   const CubeFixStats &GetCubeFixStats() { return g_cube; }
   const HlslFixStats &GetRcpfStats() { return g_rcpf; }
   const HlslFixStats &GetArrayStats() { return g_array; }
   const HlslFixStats &GetLiveLiteralStats() { return g_live; }
+  const HlslFixStats &GetFogStats() { return g_fog; }
 
   std::string StatsText()
   {
@@ -734,7 +878,8 @@ namespace pdz::native::coissue
                        "{}: checked {}, with rcpf / rsqf {} ({} instructions), patched {} ({} from disk), already {}, "
                        "failed {} | stacked array {}: checked {}, with tfetch3D {}, patched {} ({} slots, {} from "
                        "disk), already {}, failed {} | live literals {}: checked {}, with literals {}, patched {} ({} "
-                       "registers, {} from disk), already {}, failed {}",
+                       "registers, {} from disk), already {}, failed {} | true-distance fog {}: checked {}, fogged {}, "
+                       "patched {} (A {}, B1 {}, B2 {}; {} from disk), failed {}",
                        REXCVAR_GET(pdz_native_coissue_fix) ? "on" : "off", g_stats.checked, g_stats.hazardous,
                        g_stats.hazards, g_stats.patched, g_stats.from_disk, g_stats.compile_ms, g_stats.failed,
                        REXCVAR_GET(pdz_native_param_gen) ? "on" : "off", g_param_gen.checked, g_param_gen.from_file,
@@ -745,6 +890,8 @@ namespace pdz::native::coissue
                        REXCVAR_GET(pdz_native_stacked_array) ? "on" : "off", g_array.checked, g_array.with_sites,
                        g_array.patched, g_array.sites, g_array.from_disk, g_array.already, g_array.failed,
                        REXCVAR_GET(pdz_native_live_literals) ? "on" : "off", g_live.checked, g_live.with_sites,
-                       g_live.patched, g_live.sites, g_live.from_disk, g_live.already, g_live.failed);
+                       g_live.patched, g_live.sites, g_live.from_disk, g_live.already, g_live.failed,
+                       REXCVAR_GET(pdz_fix_fog_true_distance) ? "on" : "off", g_fog.checked, g_fog.with_sites,
+                       g_fog.patched, g_fog_family[0], g_fog_family[1], g_fog_family[2], g_fog.from_disk, g_fog.failed);
   }
 } // namespace pdz::native::coissue

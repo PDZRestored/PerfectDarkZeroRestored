@@ -57,6 +57,12 @@ REXCVAR_DEFINE_INT32(pdz_guest_ip_profile_spike_ms, 0, "Debug",
                      "functions), so the profile shows what ran in the hitches only (docs/MANSION_HITCH.md). 0 = every "
                      "frame")
     .range(0, 100000);
+REXCVAR_DEFINE_BOOL(pdz_guest_ip_profile_rips, false, "Debug",
+                    "pdz_guest_ip_profile: also count the exact top-frame address of every sample that is in the exe "
+                    "(recompiled guest code included), per thread, inside the time window ('srip' lines for the Swap "
+                    "thread, 'trip' for the others). tools/perf/ip_classify.py disassembles the exe at those addresses "
+                    "and says what kind of instruction the time went on (byte swaps, address translation, register "
+                    "context traffic, vector maths, calls)");
 REXCVAR_DEFINE_INT32(pdz_guest_ip_profile_to_s, 0, "Debug",
                      "pdz_guest_ip_profile: count frames up to this many seconds after the process started (0 = to the "
                      "end)")
@@ -427,6 +433,8 @@ namespace pdz::ipprof
       std::unordered_map<std::string, uint64_t> stacks;
       std::unordered_map<uint64_t, uint64_t> rip; // the exact top-frame address (exe rva) when it is our own code
     };
+    bool g_rips_all = false;                              // pdz_guest_ip_profile_rips (read once, at the start)
+    std::unordered_map<uint64_t, uint64_t> g_swap_rip;    // the Swap thread's exact top-frame exe rva (sampler thread)
     size_t g_focus = SIZE_MAX; // the busiest other thread (mode 2), sampled every tick
     size_t g_record_thread = SIZE_MAX; // "PDZ native record thread" (modes 1-2: sampled every tick too)
     std::vector<OtherThread> g_others;
@@ -524,7 +532,8 @@ namespace pdz::ipprof
         }
       }
       ++o.self[ids[0]];
-      if (KindOf(ids[0]) == kExe)
+      if (KindOf(ids[0]) == kExe ||
+          (g_rips_all && (KindOf(ids[0]) == kGuest || KindOf(ids[0]) == kHook) && rips[0] >= g_exe_base))
       {
         ++o.rip[rips[0] - g_exe_base];
       }
@@ -782,6 +791,17 @@ namespace pdz::ipprof
         {
           ids[i] = Classify(rips[i]);
         }
+        if (g_rips_all && n)
+        {
+          const uint64_t k0 = KindOf(ids[0]);
+          const double s = QpcUs(g_process_start_qpc, QpcNow()) / 1e6;
+          const int32_t f0 = REXCVAR_GET(pdz_guest_ip_profile_from_s), t0 = REXCVAR_GET(pdz_guest_ip_profile_to_s);
+          if ((k0 == kExe || k0 == kGuest || k0 == kHook) && rips[0] >= g_exe_base && (f0 <= 0 || s >= f0) &&
+              (t0 <= 0 || s <= t0))
+          {
+            ++g_swap_rip[rips[0] - g_exe_base];
+          }
+        }
         {
           std::lock_guard<std::mutex> lock(g_mutex);
           if (g_stream.size() < (64u << 20) / 8)
@@ -935,6 +955,7 @@ namespace pdz::ipprof
       g_stack_lo = lo;
       g_stack_hi = hi;
       BuildTables();
+      g_rips_all = REXCVAR_GET(pdz_guest_ip_profile_rips);
       g_stream.reserve(1u << 20);
       g_period_us.store(uint32_t(std::clamp(period, 100, 100000)), std::memory_order_relaxed);
       HANDLE t = g_thread ? CreateThread(nullptr, 256 * 1024, Main, nullptr, 0, nullptr) : nullptr;
@@ -1048,6 +1069,10 @@ namespace pdz::ipprof
       }
     };
     print_stacks("swap", t.stacks);
+    for (const auto &kv : g_swap_rip)
+    {
+      fmt::print(f, "srip {:X} {}\n", kv.first, kv.second);
+    }
     for (const std::string &line : t.spike_frames)
     {
       fmt::print(f, "{}\n", line);

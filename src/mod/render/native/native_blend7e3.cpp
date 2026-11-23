@@ -21,6 +21,7 @@
 #include "native_depth20e4.h" // CompilePixelShader / IsSignedDxil: the fork's dxcompiler, the variants' arguments
 #include "native_device.h"
 #include "native_shaders.h"
+#include "../frame_timing.h" // pdz_frame_timing_item_ms: the slow item lines
 
 REXCVAR_DEFINE_INT32(pdz_native_7e3_blend, 1, "Render",
                      "Native renderer: blending into a 7e3 (k_2_10_10_10_FLOAT) render target like the SDK's ROV path "
@@ -227,12 +228,46 @@ namespace pdz::native::blend7e3
     {
       return nullptr;
     }
+    if (depth20e4::ahead::Collecting())
+    {
+      // pdz_native_shader_prepare: only the source goes to the workers (unless the cache file is there already);
+      // nothing is kept or counted here, the draw's own call builds the variant from the cache file.
+      std::string why, source;
+      if (!ps->coissue_hlsl.empty())
+      {
+        source = BuildVariantSource(ps->coissue_hlsl, mode, why);
+      }
+      else
+      {
+        const std::string path = FindHlsl(ps);
+        std::string hlsl;
+        if (!path.empty() && ReadText(path, hlsl))
+        {
+          source = BuildVariantSource(hlsl, mode, why);
+        }
+      }
+      if (!source.empty())
+      {
+        const std::string cache_path =
+            fmt::format("{}\\blend7e3\\{:016x}_{}_{:016x}.dxil", ShaderCache::Get().directory(), ps->hash, mode,
+                        XXH3_64bits(source.data(), source.size()));
+        if (!FileExists(cache_path))
+        {
+          std::vector<uint8_t> placeholder;
+          std::string errors;
+          depth20e4::CompilePixelShader(source, placeholder, errors, &cache_path);
+        }
+      }
+      return nullptr;
+    }
     const uint64_t key = Key(ps, mode);
     auto it = g_variants.find(key);
     if (it != g_variants.end())
     {
       return it->second.failed ? nullptr : &it->second.dxil;
     }
+    const double item_t0 = pdz::timing::SpikeOn() ? pdz::timing::ItemClockMs() : 0.0;
+    const uint32_t item_compiles = depth20e4::CompileCount();
     Entry &e = g_variants[key];
     e.failed = true;
     std::string why, source;
@@ -316,6 +351,21 @@ namespace pdz::native::blend7e3
                   g_stats.built, ps->hash, e.dxil.size(), from_disk ? "read from the disk cache" : "compiled", ms,
                   g_stats.built == kLogBuilds ? "; further builds only in the periodic counters" : "");
     }
+    if (item_t0 != 0.0 && !depth20e4::batch::Collecting())
+    {
+      // pdz_frame_timing_item_ms: the whole first use (source, cache read or compile).
+      const double item_ms = pdz::timing::ItemClockMs() - item_t0;
+      if (pdz::timing::SlowItemWanted(item_ms))
+      {
+        pdz::timing::SlowItem("7e3 blend variant", item_ms,
+                              fmt::format("ps {:016x} mode {}: {} ({} bytes of source, {} bytes DXIL)", ps->hash, mode,
+                                          from_disk ? "read from the disk cache"
+                                                    : (depth20e4::CompileCount() != item_compiles
+                                                           ? "COMPILED on the render thread (not in the disk cache)"
+                                                           : "taken from the prepare workers"),
+                                          source.size(), e.dxil.size()));
+      }
+    }
     return &e.dxil;
   }
 
@@ -372,6 +422,11 @@ namespace pdz::native::blend7e3
   }
 
   void CountVariantFallback() { ++g_stats.fallback_variant; }
+  uint64_t FallbackTotal()
+  {
+    return g_stats.fallback_depth + g_stats.fallback_stencil + g_stats.fallback_mrt + g_stats.fallback_surface +
+           g_stats.fallback_device + g_stats.fallback_variant;
+  }
 
   void ResetForSeed()
   {

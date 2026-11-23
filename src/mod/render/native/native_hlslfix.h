@@ -616,7 +616,9 @@ namespace pdz::native::hlslfix
         ai + "\t\tfloat3 pdzLp = float3(dot(r1.xyzw, c[4].xyzw), dot(r1.xyzw, c[5].xyzw), dot(r1.xyzw, c[6].xyzw));",
         ai + "\t\tfloat2 pdzLuv = pdzLp.xy * cl14.xy + cl14.xx;",
         ai + "\t\tfloat pdzA = pdzLp.z - g_Texture2D[4].SampleLevel(g_Samplers[2], pdzLuv, 0.0).x;",
-        ai + "\t\tpdzA = saturate(c[18].x * (pdzA >= 0.0 ? pdzA : cl15.x));",
+        // c[17].z: the far cascade's depth-range factor while pdz_shadow_far_object_fade_fix is on (else the literal's
+        // 0, so a factor of 1): see PatchShadowFarObjectFade.
+        ai + "\t\tpdzA = saturate(c[18].x * (pdzA >= 0.0 ? pdzA * max(c[17].z, 1.0) : cl15.x));",
         ai + "\t\tpdzA = r0.x * pdzA + -r0.x + cl15.x;",
         ai + "\t\tfloat pdzZ = pdzLp.z + r2.w;",
         ai + "\t\tfloat pdzDb = pdzZ - g_Texture2D[2].SampleLevel(g_Samplers[3], pdzLuv, 0.0).x;",
@@ -664,6 +666,345 @@ namespace pdz::native::hlslfix
     l.lines.insert(l.lines.begin() + std::ptrdiff_t(apply), block.begin(), block.end());
     l.lines.insert(l.lines.begin() + std::ptrdiff_t(fetch + 1), fi + "pdzNear = true; " + kShadowBlendMarker);
     l.lines.insert(l.lines.begin() + std::ptrdiff_t(decl + 1), indent(decl) + "bool pdzNear = false; " + kShadowBlendMarker);
+    out = detail::Join(l);
+    return true;
+  }
+
+  constexpr const char *kShadowObjectFadeMarker = "// native_hlslfix.h: far object shadow fade";
+
+  // Far-cascade object shadow fade (pdz_shadow_far_object_fade_fix, Mon 16 Nov). Each cascade has two maps: map B
+  // (t2 far / t1 near: compared with the bias) and map A (t4 far / t6 near: no bias). Map A's term darkens a surface
+  // behind a caster and fades out with the light-space depth behind it: r0.w = z - mapA, then
+  // saturate(c[18].x * r0.w). The far-cascade bias (sun_shadows.cpp, PdzShadowFarDepthRange) divides the far cascade's
+  // light depth by t, so there the same c[18].x made that fade t times longer: a caster's shadow carried on far behind
+  // it, next to its biased map B shadow (MP Desert: palm shadows through walls, and doubled). This multiplies the far
+  // cascade's depth difference by c[17].z (the literal's unused z, where sun_shadows.cpp writes t while the fix is on;
+  // 0 = the literal = a factor of 1), which gives Rare's fade length back. The near cascade is never touched.
+  // Insert-only, as the two patches above; any order. False with `why` set: not shaped like the fork's 34d98195; `why`
+  // empty: patched already.
+  inline bool PatchShadowFarObjectFade(const std::string &hlsl, std::string &out, std::string &why)
+  {
+    using namespace coissue::scan_detail;
+    why.clear();
+    if (hlsl.find(kShadowObjectFadeMarker) != std::string::npos)
+    {
+      return false;
+    }
+    detail::Lines l = detail::Split(hlsl);
+    const size_t start = detail::EntryLine(l);
+    if (start == l.lines.size())
+    {
+      why = "no [shader(...)] entry point";
+      return false;
+    }
+    const auto find_one = [&](const std::string &text, size_t &at) {
+      size_t n = 0;
+      for (size_t i = start; i < l.lines.size(); ++i)
+      {
+        if (Trim(l.lines[i]) == text)
+        {
+          at = i;
+          ++n;
+        }
+      }
+      if (n != 1)
+      {
+        why = "'" + text + "' found " + std::to_string(n) + " times";
+        return false;
+      }
+      return true;
+    };
+    size_t decl = 0, fetch = 0, diff = 0, unused = 0;
+    if (!find_one("CubeMapData cubeMapData = (CubeMapData)0;", decl) ||
+        !find_one("r3.w = tfetch2D(g_Texture2D[2], g_Samplers[3], r2.xy, float2(0, 0)).x;", fetch) ||
+        !find_one("r2.w = tfetch2D(g_Texture2D[4], g_Samplers[2], r2.xy, float2(0, 0)).x;", unused) ||
+        !find_one("r0.w = -r2.w + r2.z;", diff) || !find_one("r0.w = select(r0.w >= 0.0, r0.w, cl15.x);", unused) ||
+        !find_one("ps = saturate(c[18].x * r0.w);", unused) || !(decl < fetch && fetch < diff))
+    {
+      if (why.empty())
+      {
+        why = "anchors out of order";
+      }
+      return false;
+    }
+    const auto indent = [&](size_t i) {
+      const std::string &line = l.lines[i];
+      return line.substr(0, line.find_first_not_of(" \t"));
+    };
+    // Bottom up, so the earlier indices stay valid.
+    l.lines.insert(l.lines.begin() + std::ptrdiff_t(diff + 1),
+                   indent(diff) + "r0.w = r0.w * pdzFarT; " + kShadowObjectFadeMarker);
+    l.lines.insert(l.lines.begin() + std::ptrdiff_t(fetch + 1),
+                   indent(fetch) + "pdzFarT = max(c[17].z, 1.0); " + kShadowObjectFadeMarker);
+    l.lines.insert(l.lines.begin() + std::ptrdiff_t(decl + 1),
+                   indent(decl) + "float pdzFarT = 1.0; " + kShadowObjectFadeMarker +
+                       " (pdz_shadow_far_object_fade_fix): c[17].z = the far cascade's depth-range factor");
+    out = detail::Join(l);
+    return true;
+  }
+
+  constexpr const char *kFogDistanceMarker = "// native_hlslfix.h: true-distance fog";
+  // The text every fogged material shader ends its fog factor with (after the register and its component).
+  constexpr const char *kFogFactorTail = " * c[30].x + c[30].y);";
+
+  // True-distance fog (pdz_fix_fog_true_distance, Tue 17 Nov). The game's fog is per pixel in the forward material
+  // shaders (668 of the 2,229 cached ones): PS c30 = {1 / (start - end), start / (start - end), the height band's
+  // pair} (sub_8220E740 -> sub_82620828), c31 = the colour, and
+  //   rA.x = saturate(rS.z * c[30].x + c[30].y);     fog amount = (depth - start) / (end - start)
+  // where rS.z is the pixel's VIEW-SPACE Z (negative ahead of the camera), i.e. its depth along the view axis, not its
+  // distance: a far building straight ahead (z = distance) is fogged out while the same building at the edge of the
+  // view (z = distance x cos of the angle off the axis) gets less fog and shows. The shaders do hold the whole view
+  // position, in one of three shapes:
+  //   A  (329) rS.xyz = rS.xyz * -rS.www;  the eye vector un-normalised again right before the fog line, which reads
+  //            rS.z: the position is rS.xyz at the fog line;
+  //   B1 (145) rV.xyz = rV.xyz * -rL.www; ps = max(rV.z, rV.z); rS.w = ps;  one instruction that normalises the
+  //            position and copies its z for the fog (the hardware reads the old z: native_coissue.h): the position is
+  //            rV.xyz before that instruction;
+  //   B2 (194) ps = max(rV.z, rV.z); rS.w = ps;  a plain copy of the position's z, after "r?.w = dot(rV.xyz, rV.xyz)"
+  //            with no write of rV.xyz between: the position is rV.xyz at the copy.
+  // The patch feeds the same function with minus the position's length (the same sign convention), so start, end,
+  // colour and curve are the game's and the result is identical on the view axis; off the axis the fog is what the
+  // same point would get straight ahead. In B the depth is read where the position is (as the hardware reads it), so
+  // the result does not depend on the co-issue patch having moved the copy. Guards: only where the depth is negative
+  // (ahead of the camera), and never more than 3 x the depth (71 degrees off the axis: past any view the game draws), so a shader that only
+  // looks like these shapes cannot go far wrong. Insert-only: the original line stays and the next line recomputes
+  // the factor. False with `why` empty: no fog line, or patched already; false with `why`: not one of the three shapes.
+  // `family` (optional): 'A', '1' or '2'.
+  inline bool PatchFogTrueDistance(const std::string &hlsl, std::string &out, std::string &why, char *family = nullptr)
+  {
+    using namespace coissue::scan_detail;
+    why.clear();
+    if (hlsl.find(kFogFactorTail) == std::string::npos || hlsl.find(kFogDistanceMarker) != std::string::npos)
+    {
+      return false;
+    }
+    detail::Lines l = detail::Split(hlsl);
+    const size_t start = detail::EntryLine(l);
+    if (start == l.lines.size())
+    {
+      why = "no [shader(...)] entry point";
+      return false;
+    }
+    // "r<n>" at `pos` of `s` (one or two digits): the register's text, `pos` moved past it.
+    const auto reg_at = [](const std::string &s, size_t &pos, std::string &reg) {
+      size_t i = pos;
+      if (i >= s.size() || s[i] != 'r')
+      {
+        return false;
+      }
+      ++i;
+      const size_t digits = i;
+      while (i < s.size() && std::isdigit(static_cast<unsigned char>(s[i])) && i - digits < 2)
+      {
+        ++i;
+      }
+      if (i == digits)
+      {
+        return false;
+      }
+      reg = s.substr(pos, i - pos);
+      pos = i;
+      return true;
+    };
+    const auto indent = [&](size_t i) {
+      const std::string &line = l.lines[i];
+      return line.substr(0, line.find_first_not_of(" \t"));
+    };
+    // Does the line write register `reg` with a mask holding x, y or z?
+    const auto writes_xyz = [&](size_t i, const std::string &reg) {
+      const std::string t = Trim(l.lines[i]);
+      if (!StartsWith(t, reg + "."))
+      {
+        return false;
+      }
+      const size_t eq = t.find(" = ");
+      if (eq == std::string::npos || eq <= reg.size() + 1 || eq - reg.size() - 1 > 4)
+      {
+        return false;
+      }
+      const std::string mask = t.substr(reg.size() + 1, eq - reg.size() - 1);
+      return mask.find_first_not_of("xyzw") == std::string::npos && mask.find_first_of("xyz") != std::string::npos;
+    };
+    // The fog line: "rA.c = saturate(rS.k * c[30].x + c[30].y);", exactly once.
+    size_t fog = l.lines.size(), fog_lines = 0;
+    std::string dest, dest_comp, src, src_comp;
+    for (size_t i = start; i < l.lines.size(); ++i)
+    {
+      const std::string t = Trim(l.lines[i]);
+      const size_t tail = t.find(kFogFactorTail);
+      if (tail == std::string::npos || tail + std::string(kFogFactorTail).size() != t.size())
+      {
+        continue;
+      }
+      size_t pos = 0;
+      std::string a, s;
+      if (!reg_at(t, pos, a) || pos + 2 > t.size() || t[pos] != '.' || std::string("xyzw").find(t[pos + 1]) == std::string::npos)
+      {
+        continue;
+      }
+      const char ac = t[pos + 1];
+      pos += 2;
+      const std::string mid = " = saturate(";
+      if (t.compare(pos, mid.size(), mid) != 0)
+      {
+        continue;
+      }
+      pos += mid.size();
+      if (!reg_at(t, pos, s) || pos + 2 != tail || t[pos] != '.' || (t[pos + 1] != 'z' && t[pos + 1] != 'w'))
+      {
+        continue;
+      }
+      ++fog_lines;
+      fog = i;
+      dest = a;
+      dest_comp = std::string(1, ac);
+      src = s;
+      src_comp = std::string(1, t[pos + 1]);
+    }
+    if (fog_lines == 0)
+    {
+      return false; // c30 is something else in this shader
+    }
+    if (fog_lines != 1)
+    {
+      why = std::to_string(fog_lines) + " fog lines";
+      return false;
+    }
+    const std::string marker = std::string(" ") + kFogDistanceMarker;
+    if (src_comp == "z")
+    {
+      // A: the last write of the fog register's x / y / z is the position restore.
+      size_t last = l.lines.size();
+      for (size_t i = fog; i-- > start + 1;)
+      {
+        if (writes_xyz(i, src))
+        {
+          last = i;
+          break;
+        }
+      }
+      if (last == l.lines.size() || Trim(l.lines[last]) != src + ".xyz = " + src + ".xyz * -" + src + ".www;")
+      {
+        why = "the fog register's last write is not the position restore";
+        return false;
+      }
+      l.lines.insert(l.lines.begin() + std::ptrdiff_t(fog + 1),
+                     indent(fog) + dest + "." + dest_comp + " = saturate((" + src + ".z < 0.0 ? -min(length(" + src +
+                         ".xyz), " + src + ".z * -3.0) : " + src + ".z)" + kFogFactorTail + marker);
+      if (family)
+      {
+        *family = 'A';
+      }
+      out = detail::Join(l);
+      return true;
+    }
+    // B: the fog register's w is a copy of a position's z.
+    size_t copy = l.lines.size();
+    for (size_t i = fog; i-- > start + 1;)
+    {
+      if (Trim(l.lines[i]) == src + ".w = ps;")
+      {
+        copy = i;
+        break;
+      }
+    }
+    if (copy == l.lines.size())
+    {
+      why = "no '" + src + ".w = ps;' before the fog line";
+      return false;
+    }
+    size_t zline = l.lines.size();
+    std::string position;
+    for (size_t i = copy; i-- > start + 1 && copy - i <= 2;)
+    {
+      const std::string t = Trim(l.lines[i]);
+      const std::string head = "ps = max(";
+      size_t pos = head.size();
+      std::string v;
+      if (StartsWith(t, head) && reg_at(t, pos, v) && t.substr(pos) == ".z, " + v + ".z);")
+      {
+        zline = i;
+        position = v;
+        break;
+      }
+    }
+    if (zline == l.lines.size())
+    {
+      why = "the fog register is not a copy of a z";
+      return false;
+    }
+    // B1: the position's normalise next to the copy (before it as the fork emits it, after it once the co-issue patch
+    // moved the scalar line up).
+    size_t first = zline;
+    char fam = '2';
+    for (const size_t i : {zline - 1, zline + 1})
+    {
+      if (i <= start || i >= copy)
+      {
+        continue;
+      }
+      const std::string t = Trim(l.lines[i]);
+      const std::string head = position + ".xyz = " + position + ".xyz * -";
+      size_t pos = head.size();
+      std::string len;
+      if (StartsWith(t, head) && reg_at(t, pos, len) && t.substr(pos) == ".www;")
+      {
+        fam = '1';
+        first = i < zline ? i : zline;
+      }
+    }
+    if (fam == '2')
+    {
+      // B2: the position's squared length is taken before the copy, and its x / y / z are not written in between.
+      bool have = false;
+      for (size_t i = zline; i-- > start + 1;)
+      {
+        const std::string t = Trim(l.lines[i]);
+        size_t pos = 0;
+        std::string any;
+        if (reg_at(t, pos, any) && t.substr(pos) == ".w = dot(" + position + ".xyz, " + position + ".xyz);")
+        {
+          have = true;
+          break;
+        }
+        if (writes_xyz(i, position))
+        {
+          break;
+        }
+      }
+      if (!have)
+      {
+        why = "neither a normalise next to the z copy nor a length of the position before it";
+        return false;
+      }
+    }
+    size_t decl = l.lines.size();
+    for (size_t i = start; i < fog; ++i)
+    {
+      if (Trim(l.lines[i]) == "CubeMapData cubeMapData = (CubeMapData)0;")
+      {
+        decl = i;
+        break;
+      }
+    }
+    if (decl == l.lines.size() || decl >= first)
+    {
+      why = "no declaration anchor";
+      return false;
+    }
+    // Bottom up, so the earlier indices stay valid.
+    l.lines.insert(l.lines.begin() + std::ptrdiff_t(fog + 1),
+                   indent(fog) + "if (pdzFogDist >= 0.0 && pdzFogZ < 0.0) " + dest + "." + dest_comp +
+                       " = saturate(-min(pdzFogDist, pdzFogZ * -3.0)" + kFogFactorTail + marker);
+    l.lines.insert(l.lines.begin() + std::ptrdiff_t(first),
+                   indent(first) + "pdzFogDist = length(" + position + ".xyz); pdzFogZ = " + position + ".z;" + marker);
+    l.lines.insert(l.lines.begin() + std::ptrdiff_t(decl + 1),
+                   indent(decl) + "float pdzFogDist = -1.0, pdzFogZ = 0.0;" + marker +
+                       " (pdz_fix_fog_true_distance): the view position's length and its z");
+    if (family)
+    {
+      *family = fam;
+    }
     out = detail::Join(l);
     return true;
   }

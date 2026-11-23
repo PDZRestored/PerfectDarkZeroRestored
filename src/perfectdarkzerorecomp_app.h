@@ -38,6 +38,7 @@
 #include "mod/restorations.h"
 #include "mod/mouse_look.h" // pdz_mouse_look
 #include "mod/mnk_layout.h" // pdz_mnk_follow_layout
+namespace sound_census { void Shutdown(); } // mod/sound_census_Tue17Nov.cpp (pdz_sound_census: the last write)
 #include "setup/settings_window.h" // the settings launch window
 #endif
 #include "utils.h"
@@ -62,7 +63,25 @@ namespace pdz::transwater
 {
   void Init(rex::ui::ImGuiDrawer *drawer); // mod/transparency_water.cpp: F1 and its label
 }
+namespace pdz::light_reach
+{
+  void Init(rex::ui::Window *window); // mod/distant_lights.cpp: F6 cycles pdz_light_draw_distance
+}
+namespace pdz::sunshadow
+{
+  void Init(rex::ui::Window *window); // mod/render/sun_shadows.cpp: F7 switches pdz_long_shadows
+}
+#ifdef PDZ_COUNTEROP
+namespace pdz::counterop_view
+{
+  void Init(rex::ui::ImGuiDrawer *drawer); // mod/counter_op_view.cpp: player 2's dark half while he waits for a guard
+}
+#endif
 
+namespace pdz::crash
+{
+  void InstallRecentLinesSink(); // mod/crash_dump.cpp (Sun 22 Nov): the last Counter-Op / jetpack lines for a stop
+}
 #ifdef PDZ_PGO_GEN
 namespace pdz::pgo
 {
@@ -74,6 +93,12 @@ REXCVAR_DECLARE(bool, pdz_safe_mode);        // native_generate.cpp
 REXCVAR_DEFINE_STRING(pdz_test_dump_image, "", "Testing",
                       "TESTING TOOL: write the loaded (title-update-patched) executable image to this file once the XEX is loaded, then exit (comparing disc pressings).");
 REXCVAR_DECLARE(bool, pdz_setup_quiet);      // setup/first_run.cpp
+REXCVAR_DECLARE(bool, pdz_test_pad_driver);  // render/test_pad_driver.cpp
+REXCVAR_DECLARE(std::string, pdz_input_script); // render/test_harness.cpp
+namespace pdz::test::pad_driver
+{
+  std::unique_ptr<rex::system::IInputSystem> CreateInputSystem(bool tool_mode);
+}
 REXCVAR_DECLARE(bool, pdz_native_renderer);  // native_cvars.cpp
 
 class PerfectdarkzerorecompApp : public rex::ReXApp
@@ -98,6 +123,13 @@ public:
   void OnPreSetup(rex::RuntimeConfig &config) override
   {
     pdz::native::EnableGpuValidationEarly(); // pdz_debug_gpu_validation (off): before the D3D12 device exists
+    // Testing (pdz_test_pad_driver, off): an input script's pads become SDK input devices (users 0 and 1), the layer
+    // real controllers enter at (src/mod/render/test_pad_driver.cpp).
+    if (REXCVAR_GET(pdz_test_pad_driver) && !REXCVAR_GET(pdz_input_script).empty())
+    {
+      config.input_factory = [](bool tool_mode) -> std::unique_ptr<rex::system::IInputSystem>
+      { return pdz::test::pad_driver::CreateInputSystem(tool_mode); };
+    }
     // Release blocker (Steam Deck test, 30 Oct): a settings file without a gpu_plugin line started with no GPU plugin
     // and the null backend: a black screen. The native renderer needs the xenos plugin (its null backend services the
     // ring), so an empty setting means xenos; an explicit gpu_plugin still wins.
@@ -204,6 +236,9 @@ public:
     restorations::RegisterBinds(); // testing tool: pdz_test_lab_blackout_key
     pdz::transwater::Init(drawer); // F1: pdz_fix_transparency_water on / off, and its label
 #endif
+#ifdef PDZ_COUNTEROP
+    pdz::counterop_view::Init(drawer); // Counter-Operative: player 2's dark half while he waits for a guard
+#endif
     // Mouse aim straight into the view angles, menu mode for mnk (src/mod/mouse_look.h).
     pdz::mouse::MouseLook::Get().Attach(window(), drawer);
     // The keyboard's stick keys follow the in-game controller layout (src/mod/mnk_layout.h).
@@ -214,11 +249,19 @@ public:
     {
       window()->SetTitle(std::string("PDZRestored ") + PDZ_RESTORED_VERSION);
     }
+    pdz::light_reach::Init(window()); // F6: the light draw distance steps (title, label, log)
+    pdz::sunshadow::Init(window());   // F7: the long shadows preset on / off
   }
 
   void OnPostSetup() override
   {
     utils::LoadSettingsFiles();
+    if (test_log_level_raised_)
+    {
+      // The reload above hands the settings file's log_level to the SDK's change callback again.
+      rex::SetAllLevels(spdlog::level::info);
+      REXLOG_INFO("pdz_build: test build: log level info kept after the settings reload");
+    }
 
 #ifdef REXGLUE_ENABLE_PERF_COUNTERS
     // SDK exposes the perf_log_csv cvar but never wires it up; do it here so
@@ -239,6 +282,7 @@ public:
   {
     pdz::gpusync::OnAppShutdown(); // pdz_native_record_thread: drain and stop the worker
 #ifndef PDZ_NO_MODS
+    sound_census::Shutdown();
     local_profiles::Shutdown();
 #endif
 #ifdef REXGLUE_ENABLE_PERF_COUNTERS
@@ -254,6 +298,9 @@ public:
   {
     pdz::gtsample::LogGuestProfileTotal("window closing");
     pdz::ipprof::WriteAtExit("window closing"); // pdz_guest_ip_profile
+#ifndef PDZ_NO_MODS
+    sound_census::Shutdown(); // pdz_sound_census: the file as the window closes
+#endif
 #ifdef PDZ_PGO_GEN
     pdz::pgo::WriteProfiles();
 #endif
@@ -384,6 +431,18 @@ public:
     {
       config.flush_interval = std::chrono::seconds(1);
     }
+#ifdef PDZ_COUNTEROP
+    // Hand-test builds (round 3, item 0): a hand test's log came out empty, because the settings file's
+    // log_level = "critical" writes nothing at all (not even at a clean exit), and the launcher passed no
+    // --log_level. A test build always logs at info or finer unless the command line asks otherwise; the file is
+    // flushed every second (above) and on warnings, so a crash or a forced exit keeps everything up to the last second.
+    if (rex::cvar::GetFlagSource("log_level") != rex::cvar::Source::kCommandLine &&
+        config.default_level > spdlog::level::info)
+    {
+      config.default_level = spdlog::level::info;
+      test_log_level_raised_ = true;
+    }
+#endif
     // The release name (2026-11-03): logs\PDZRestored_NNN.log, numbered on from the highest PDZRestored_NNN or
     // perfectdarkzerorecomp_NNN log there (the SDK counts its own app name only, so it would start again at 001).
     // --log_file still wins (applied after this). With a log-folder budget set, the oldest runs under both names are
@@ -465,6 +524,7 @@ public:
   // settings file it read.
   void OnPostInitLogging() override
   {
+    pdz::crash::InstallRecentLinesSink();
     const std::filesystem::path settings = utils::SettingsDir() / "hardware.toml";
     REXLOG_INFO("pdz_build: PDZ Restored {}, built {} from commit {}; settings file {} ({})", PDZ_RESTORED_VERSION,
                 PdzBuildTime(), PdzBuildCommit(), settings.string(),
@@ -472,6 +532,12 @@ public:
     for (const std::string &line : settings_files_)
     {
       REXLOG_INFO("{}", line);
+    }
+    if (test_log_level_raised_)
+    {
+      REXLOG_INFO("pdz_build: test build: the settings file's log_level is above info, so the log would be empty; "
+                  "logging at info instead (--log_level=<level> on the command line still wins). Flushed every second "
+                  "and on warnings.");
     }
     pdz::first_run::LogSummary();
     pdz::settings_ui::LogSummary();
@@ -497,6 +563,7 @@ public:
       std::exit(2);
     }
   }
+  bool test_log_level_raised_ = false; // OnConfigureLogging (test builds): log_level raised to info
   std::filesystem::path update_root_; // the title update's data folder (OnConfigurePaths), checked at startup
   std::filesystem::path game_root_, user_root_; // game data / user data roots (the shader generator's inputs)
   std::vector<std::string> settings_files_; // EnsureSettingsFiles' lines, logged in OnPostInitLogging

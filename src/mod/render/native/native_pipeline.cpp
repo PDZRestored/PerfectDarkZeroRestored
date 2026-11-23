@@ -2295,6 +2295,24 @@ void main(point V input[1], inout TriangleStream<V> stream)
     bool point_gs_failed_logged = false;
     bool point_pso_failed_logged = false;
     bool clip_gs_failed = false; // a PSO with the user-clip-plane GS failed: planes ignored from then on (logged)
+    // pdz_native_draw_memo: the last lookup that found its pipeline in the map. `generation` counts every change of
+    // the map or of what a key is built from (a new entry, an eviction, a failed variant): a remembered lookup is
+    // only reused in the frame and the generation it was made in.
+    uint64_t generation = 0;
+    struct Memo
+    {
+      bool valid = false;
+      uint64_t frame = 0, generation = 0;
+      const NativeShader *vs = nullptr, *ps = nullptr;
+      uint64_t vs_hash = 0, ps_hash = 0, layout_hash = 0;
+      uint32_t ps_color_outputs = 0;
+      bool ps_no_dxil = false, ps_usable = false, ps_writes_depth = false;
+      uint32_t prim = 0;
+      D3D12_INDEX_BUFFER_STRIP_CUT_VALUE strip_cut = D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED;
+      RenderState rs;
+      TargetFormats tf;
+      const Pipeline *result = nullptr;
+    } memo;
     bool clip_gs_logged = false;
     // pdz_native_pso_cache / pdz_native_pso_warmup (nullptr = off) and the identity of the root signature (XXH3 of its
     // serialized form, part of PsoDescIdentity).
@@ -2556,11 +2574,25 @@ void main(point V input[1], inout TriangleStream<V> stream)
         }
         pdz::timing::CountEvent(pdz::timing::Event::kPsoCreate); // pdz_frame_timing_spike_ms
         bool from_library = false;
+        const double item_t0 = pdz::timing::SpikeOn() ? pdz::timing::ItemClockMs() : 0.0;
         hr = store->Create(d, identity, false, &out.pso, &from_library);
         if (SUCCEEDED(hr))
         {
           origin = from_library ? PsoOrigin::kLibrary : PsoOrigin::kCompiled;
           store->Record(key, in, identity, frame);
+        }
+        // pdz_frame_timing_item_ms: a pipeline made at the draw.
+        if (const double item_ms = item_t0 != 0.0 ? pdz::timing::ItemClockMs() - item_t0 : 0.0;
+            pdz::timing::SlowItemWanted(item_ms))
+        {
+          pdz::timing::SlowItem("pipeline", item_ms,
+                                fmt::format("vs {:016x} ps {:016x} {}: {} (VS {} bytes, PS {} bytes, variant {} bytes "
+                                            "DXIL, {} targets)",
+                                            key.vs_hash, key.ps_hash,
+                                            key.depth_variant ? "depth20e4 variant"
+                                                              : (key.blend7e3_variant ? "7e3 blend variant" : "plain"),
+                                            from_library ? "loaded from the pipeline library" : "compiled by the driver",
+                                            in.vs_size, in.ps_size, in.variant_size, key.rt_count));
         }
       }
       else
@@ -2851,6 +2883,7 @@ void main(point V input[1], inout TriangleStream<V> stream)
       }
       dev->ReleaseLater(it->second.pso); // a frame in flight may still hold it (none can: 1800 frames idle)
       impl_->pipelines.erase(it);
+      ++impl_->generation; // pdz_native_draw_memo
       ++pso_evicted_;
       newest_released = last_used;
     }
@@ -2887,9 +2920,80 @@ void main(point V input[1], inout TriangleStream<V> stream)
     return true;
   }
 
+  // pdz_native_draw_memo: the pipeline of the previous lookup when every input of the lookup is the same (the two
+  // shaders and the fields of them the key is built from, the primitive type, the strip cut, the decoded render
+  // state, the target formats), in the same frame, with no change of the pipeline map since. Only a lookup that
+  // found its pipeline in the map and counted nothing is remembered, so a reused one skips no side effect but the
+  // entry's frame stamp, which already holds this frame.
   const Pipeline *PipelineCache::Lookup(const NativeShader *vs, const NativeShader *ps, uint32_t prim,
                                         const RenderState &rs, const TargetFormats &tf,
                                         D3D12_INDEX_BUFFER_STRIP_CUT_VALUE strip_cut)
+  {
+    const int mode = g_draw_memo;
+    if (mode == 0 || !ready_ || !vs || !ps)
+    {
+      return LookupFull(vs, ps, prim, rs, tf, strip_cut);
+    }
+    Impl::Memo &m = impl_->memo;
+    const bool hit = m.valid && m.frame == frame_ && m.generation == impl_->generation && m.vs == vs && m.ps == ps &&
+                     m.prim == prim && m.strip_cut == strip_cut && m.vs_hash == vs->hash && m.ps_hash == ps->hash &&
+                     m.layout_hash == vs->input_layout_hash && m.ps_color_outputs == ps->color_outputs &&
+                     m.ps_no_dxil == ps->dxil.empty() && m.ps_usable == ps->usable &&
+                     m.ps_writes_depth == ps->writes_depth && std::memcmp(&m.rs, &rs, sizeof(rs)) == 0 &&
+                     m.tf.rt_count == tf.rt_count && std::memcmp(m.tf.rt, tf.rt, sizeof(tf.rt)) == 0 &&
+                     m.tf.ds == tf.ds && m.tf.depth_float24 == tf.depth_float24 &&
+                     m.tf.resolution_scale == tf.resolution_scale && m.tf.rt0_7e3 == tf.rt0_7e3 &&
+                     m.tf.rt0_uav == tf.rt0_uav;
+    if (hit && mode == 1)
+    {
+      ++g_draw_memo_stats.pipe_hits;
+      return m.result;
+    }
+    const uint64_t generation_before = impl_->generation;
+    const uint64_t fallbacks_before = blend7e3::FallbackTotal();
+    const Pipeline *p = LookupFull(vs, ps, prim, rs, tf, strip_cut);
+    if (hit)
+    {
+      ++g_draw_memo_stats.checked;
+      if (p != m.result)
+      {
+        if (g_draw_memo_stats.differ++ < 8)
+        {
+          REXLOG_WARN("pdz_native: draw memo verify: pipeline differs (vs {:016X} ps {:016X} prim {})", vs->hash,
+                      ps->hash, prim);
+        }
+      }
+    }
+    else
+    {
+      ++g_draw_memo_stats.pipe_misses;
+    }
+    m.valid = p != nullptr && impl_->generation == generation_before && blend7e3::FallbackTotal() == fallbacks_before;
+    if (m.valid)
+    {
+      m.frame = frame_;
+      m.generation = impl_->generation;
+      m.vs = vs;
+      m.ps = ps;
+      m.vs_hash = vs->hash;
+      m.ps_hash = ps->hash;
+      m.layout_hash = vs->input_layout_hash;
+      m.ps_color_outputs = ps->color_outputs;
+      m.ps_no_dxil = ps->dxil.empty();
+      m.ps_usable = ps->usable;
+      m.ps_writes_depth = ps->writes_depth;
+      m.prim = prim;
+      m.strip_cut = strip_cut;
+      m.rs = rs;
+      m.tf = tf;
+      m.result = p;
+    }
+    return p;
+  }
+
+  const Pipeline *PipelineCache::LookupFull(const NativeShader *vs, const NativeShader *ps, uint32_t prim,
+                                            const RenderState &rs, const TargetFormats &tf,
+                                            D3D12_INDEX_BUFFER_STRIP_CUT_VALUE strip_cut)
   {
     if (!ready_ || !vs || !ps)
     {
@@ -3017,6 +3121,7 @@ void main(point V input[1], inout TriangleStream<V> stream)
       it->second.last_used_frame = frame_; // pdz_native_pso_cap LRU
       return it->second.pso ? &it->second : nullptr;
     }
+    ++impl_->generation; // pdz_native_draw_memo: the map changes (and, below, what a failed variant's key becomes)
     Pipeline &p = impl_->pipelines[h];
     p.topology = topo;
     p.last_used_frame = frame_;

@@ -26,8 +26,7 @@
 // pdz_door_30hz (default off): PDZ Reinstated's door method (their game_patches.cpp, MIT licence): the door's update runs at most every 1/30 s with the accumulated dt, so each frame's delta is
 // large enough for Rare's test. Kept as an alternative for A/B; with pdz_fix_prop_root_motion on it isn't needed.
 //
-// pdz_fix_lab_keycard (default OFF since 0.9.3.1: unproven; the 8 Nov hand test still found the card on the floor
-// beside a broken monitor): Laboratory's desk keycard (on the table, sometimes on the floor or missing at high
+// pdz_fix_lab_keycard (default on since 0.9.4, with the desk group below): Laboratory's desk keycard (on the table, sometimes on the floor or missing at high
 // frame rates) gets a fixed pickup body instead of a moving one, so it stays where Rare placed it. Ported from PDZ
 // Reinstated's physics_timing.cpp (pdz_lab_key_stability, MIT licence): hook sub_825E0EF0 (the placed prop's body
 // setup, r4 = prop, r5 = descriptor, +32 = motion type), only for model aid_darkcharacter_props_niknak_keycard at
@@ -37,6 +36,22 @@
 // computer_monitor (-3368.90, 787.50, 2229.43), the computer_keyboard (-3389.65, 799.38, 2180.94) (motion 1, dynamic)
 // and the furniture_chair_swivel (-3392.36, 700.00, 2130.99) (motion 6, keyframed): Rare's sit-down snap of the
 // scientist s4l3 at the level start flung the monitor and knocked the chair over at high frame rates.
+//
+// pdz_fix_lab_grates (default on): the Laboratory's three vent grates (model aid_darkcharacter_props_structure_vent_large
+// at (3705.50, -169.50, 4011.79), (4220.25, -169.54, 3769.50) and (6331.70, 270.20, -1749.50)) are dynamic bodies
+// (motion 1) with health 1 that sit in their wall openings. Measured (12 Nov 2026, nobody near, the first 50 to
+// 80 s of the level): paced at 120 fps a grate left its opening by itself in three of five starts (the one into
+// Lab Two thrown out 18 s into the level and found 14 m away, or dropped out after 30 s; a generator one pushed
+// 72 cm after 12 s); at 30 fps one grate was pushed 6 cm and turned 48 degrees in one of three starts; at 60 none
+// moved in four starts. What pushes them was not traced. The same switch method as the desk: the body is made fixed (motion 7) at Rare's
+// authored spot, mission 5, single player, by model and position. A fixed grate still breaks: a punch or a bullet
+// destroys the prop (health 1) and throws its loose pieces exactly as before (the damage does not go through the
+// body's motion).
+//
+// pdz_lab_grate_log (default off, diagnostics): the grates' motion type when the body is made, position and rotation
+// (the Havok motion's quaternion) every frame for 10 s, then whenever one moves and all every 10 s, every hit through
+// Rare's damage entry (sub_82521818: collision damage; punches and bullets do not use it), and player 1's position
+// and look twice a second.
 //
 // pdz_door_log (default off, diagnostics): a line per door per frame while a door is opening or closing, plus every
 // state change: state, dt, the frame's root-motion rotation (degrees), whether Rare's test dropped it and whether the
@@ -60,7 +75,15 @@
 #include <rex/ppc/func.h>
 #include "hook_profile.h" // pdz_hook_profile (must follow <rex/hook.h>)
 
+#include "lab_grate_sound.h"  // the grates' fall sound
+#include "bymodel_sounds_Wed18Nov.h" // the fuse box hum
+#include "restored_voice_Wed18Nov.h"
+namespace pdz::r2 { void ScopeTick(PPCContext &ctx, uint8_t *base); } // restored_sounds_r2_Tue17Nov.cpp
+namespace pdz::r3 { void Tick(PPCContext &ctx, uint8_t *base); }      // restored_sounds_r3_Wed18Nov.cpp
+namespace pdz::hums { void Tick(PPCContext &ctx, uint8_t *base); }    // hums_Fri20Nov.cpp
+namespace pdz::walls { void Tick(PPCContext &ctx, uint8_t *base); }   // walls_Fri20Nov.cpp
 #include "render/game_pace.h" // EffectiveHz
+#include "guest_readable_Sat21Nov.h" // Sat 21 Nov: pdz_fix_readable_cache
 
 REXCVAR_DEFINE_BOOL(pdz_fix_prop_root_motion, true, "Gameplay",
                     "Doors and other animated props keep their animation's movement above 60 fps (Rare drops any "
@@ -77,6 +100,13 @@ REXCVAR_DEFINE_BOOL(pdz_fix_lab_keycard, true, "Gameplay",
                     "the scientist sits down (even at 30 fps on the console the card goes missing). The desk, its "
                     "monitor, keyboard and chair get fixed bodies too, so his sit-down can't throw them. On by default")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(pdz_fix_lab_grates, true, "Gameplay",
+                    "Laboratory: the three vent grates stay in their openings until they are punched or shot off. At "
+                    "high frame rates a grate could be thrown out of its wall by the physics on its own (the one "
+                    "into Lab Two about 18 seconds into the level, with nobody near). Each gets a fixed body at "
+                    "Rare's authored spot, as the keycard desk does; a punch or a shot still knocks it off. On by "
+                    "default")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(pdz_door_log, false, "Diagnostics",
                     "Log doors per frame while they move (state, dt, the frame's turn, dropped / applied, total turn)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -84,6 +114,12 @@ REXCVAR_DEFINE_BOOL(pdz_door_log, false, "Diagnostics",
 REXCVAR_DEFINE_BOOL(pdz_lab_prop_log, false, "Diagnostics",
                     "Laboratory: log the props within 4 m of the desk keycard (position, its first 16 words, motion type) "
                     "every frame for 10 s after the level starts; then whenever one moves, and all every 10 s")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(pdz_lab_grate_log, false, "Diagnostics",
+                    "Laboratory: log the vent grates (model structure_vent_large and its loose pieces): motion type "
+                    "when the body is made, position and rotation every frame for 10 s after the level starts, then "
+                    "whenever one moves and all every 10 s, and every hit Rare's damage entry gives one")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(pdz_fix_keyframe_jump, false, "Gameplay",
@@ -103,6 +139,7 @@ REX_EXTERN(__imp__sub_825E0EF0); // placed prop body setup (r4 = prop, r5 = desc
 REX_EXTERN(__imp__sub_824E8BC8);
 REX_EXTERN(__imp__sub_824E7A08); // Havok hard keyframe (r3 = &target position, r4 = &target rotation, r6 = body, f1 = 1/dt) // the physics manager's update (f1 = frame dt): steps Havok once a frame
 REX_EXTERN(sub_82562E98);          // DoorProp Open(r3 = door, r4 = side)
+REX_EXTERN(__imp__sub_82521818);   // prop hit / damage entry (r3 = prop, r4, r5 = attacker, r6 = damage record, +32 amount)
 
 namespace
 {
@@ -124,6 +161,11 @@ namespace
   }
   bool Readable(uint8_t *base, uint32_t address, uint32_t size)
   {
+    // Sat 21 Nov (pdz_fix_readable_cache): the cached check (guest_readable_Sat21Nov.cpp); below = off.
+    if (pdz::guestmem::CacheOn())
+    {
+      return pdz::guestmem::Readable(const_cast<uint8_t *>(base), address, size);
+    }
     if (address < 0x10000u || uint64_t(address) + size > 0xFFFF0000ull)
     {
       return false;
@@ -379,10 +421,11 @@ namespace
   struct LabProp
   {
     uint32_t prop = 0, setup = 0, motion = 0;
+    uint32_t havok = 0; // the body's Havok motion (position +96, rotation columns +48 / +64 / +80), 1 = not found
     std::string name;
     float last[3] = {};
   };
-  std::array<LabProp, 16> g_lab{};
+  std::array<LabProp, 48> g_lab{};
   uint32_t g_lab_n = 0, g_lab_state = 0;
   double g_lab_time = -1.0, g_lab_next = 0.0;
 
@@ -414,7 +457,8 @@ namespace
 
   void LabRegister(uint8_t *base, uint32_t prop, uint32_t descriptor)
   {
-    if (!REXCVAR_GET(pdz_lab_prop_log) || !Readable(base, prop, 128))
+    const bool want_card = REXCVAR_GET(pdz_lab_prop_log), want_grate = REXCVAR_GET(pdz_lab_grate_log);
+    if ((!want_card && !want_grate) || !Readable(base, prop, 128))
     {
       return;
     }
@@ -427,7 +471,8 @@ namespace
     const float x = LoadF(base, setup + 4), y = LoadF(base, setup + 8), z = LoadF(base, setup + 12);
     const float d = std::sqrt((x - kCardAt[0]) * (x - kCardAt[0]) + (y - kCardAt[1]) * (y - kCardAt[1]) +
                               (z - kCardAt[2]) * (z - kCardAt[2]));
-    if (!(d <= 400.0f))
+    const bool grate = want_grate && SetupName(base, setup).find("structure_vent_large") != std::string::npos;
+    if (!(want_card && d <= 400.0f) && !grate)
     {
       return;
     }
@@ -527,9 +572,16 @@ REX_HOOK_RAW(sub_824E7A08)
 // The physics manager's update: after Havok's step, log the registered props.
 REX_HOOK_RAW(sub_824E8BC8)
 {
+  lab_grate_sound::Tick(ctx, base); // pdz_restore_grate_sound
+  pdz::snd::Tick(ctx, base);        // the restored sounds' kept sounds and the voices log line
+  pdz::r2::ScopeTick(ctx, base);    // the audioscope's zoom sound stops when the scope is put down
+  pdz::r3::Tick(ctx, base);         // the fluorescent buzz, the torch, the F12 pointer
+  pdz::hums::Tick(ctx, base);       // Fri 20 Nov: hums by model and the scenery strip lights
+  pdz::walls::Tick(ctx, base);      // Fri 20 Nov: walls make sounds quieter (pdz_snd_wall_cut)
+  bymodel_sounds::Tick(ctx, base);  // pdz_snd_fusebox_hum
   const double dt = ctx.f1.f64;
   __imp__sub_824E8BC8(ctx, base);
-  if (!g_lab_n || !REXCVAR_GET(pdz_lab_prop_log))
+  if (!g_lab_n || !(REXCVAR_GET(pdz_lab_prop_log) || REXCVAR_GET(pdz_lab_grate_log)))
   {
     return;
   }
@@ -561,17 +613,72 @@ REX_HOOK_RAW(sub_824E8BC8)
                            : 0.0f;
     if (g_lab_time <= 10.0 || heartbeat || v > 5.0f)
     {
-      REXLOG_INFO("pdz_lab_prop: t {:.4f} dt {:.4f} {} '{}' pos ({:.2f}, {:.2f}, {:.2f}) speed {:.1f} cm/s | +0.. {}",
-                  g_lab_time, dt, i, l.name, p[0], p[1], p[2], v, Words(base, l.prop, 12));
+      // The rotation: the Havok motion of the prop's body, looked for once among the prop's own pointers.
+      if (!l.havok && REXCVAR_GET(pdz_lab_grate_log))
+      {
+        l.havok = 1;
+        for (uint32_t at = 96; at < 0x400 && l.havok == 1 && Readable(base, l.prop + at, 4); at += 4)
+        {
+          const uint32_t body = Load32(base, l.prop + at);
+          const uint32_t m = Readable(base, body, 84) ? Load32(base, body + 80) : 0;
+          if (Readable(base, m, 112) && std::fabs(LoadF(base, m + 96) * 100.0f - p[0]) < 1.0f &&
+              std::fabs(LoadF(base, m + 100) * 100.0f - p[1]) < 1.0f &&
+              std::fabs(LoadF(base, m + 104) * 100.0f - p[2]) < 1.0f)
+          {
+            l.havok = m;
+            REXLOG_INFO("pdz_lab_prop: {} '{}' body {:08X} (prop +{}), motion {:08X}", i, l.name, body, at, m);
+          }
+        }
+      }
+      const std::string rot = l.havok > 1 && Readable(base, l.havok, 112) ? " | rot " + Words(base, l.havok + 48, 12) : "";
+      REXLOG_INFO("pdz_lab_prop: t {:.4f} dt {:.4f} {} '{}' pos ({:.2f}, {:.2f}, {:.2f}) speed {:.1f} cm/s | +0.. {}{}",
+                  g_lab_time, dt, i, l.name, p[0], p[1], p[2], v, Words(base, l.prop, 12), rot);
     }
     std::memcpy(l.last, p, sizeof(p));
   }
+  // The grate log: player 1's position and look twice a second (where a punch or a shot came from).
+  static double jo_next = 0.0;
+  if (REXCVAR_GET(pdz_lab_grate_log) && (g_lab_time >= jo_next || g_lab_time < jo_next - 1.0))
+  {
+    jo_next = g_lab_time + 0.5;
+    const uint32_t jo = Load32(base, 0x82E3C3E4);
+    if (Readable(base, jo, 0x1678))
+    {
+      REXLOG_INFO("pdz_lab_prop: t {:.4f} player at ({:.1f}, {:.1f}, {:.1f}) yaw {:.1f} pitch {:.1f}", g_lab_time,
+                  LoadF(base, jo + 48), LoadF(base, jo + 52), LoadF(base, jo + 56), LoadF(base, jo + 0x1670),
+                  LoadF(base, jo + 0x1674));
+    }
+  }
+}
+
+// pdz_lab_grate_log: every hit Rare's damage entry gives a logged prop.
+REX_HOOK_RAW(sub_82521818)
+{
+  if (g_lab_n && REXCVAR_GET(pdz_lab_grate_log))
+  {
+    const uint32_t prop = ctx.r3.u32, record = ctx.r6.u32;
+    for (uint32_t i = 0; i < g_lab_n; ++i)
+    {
+      if (g_lab[i].prop == prop)
+      {
+        REXLOG_INFO("pdz_lab_prop: t {:.4f} HIT {} '{}' at ({:.2f}, {:.2f}, {:.2f}): amount {:.2f}, r4 {:08X}, attacker "
+                    "{:08X}, caller {:08X}",
+                    g_lab_time, i, g_lab[i].name, LoadF(base, prop + 48), LoadF(base, prop + 52), LoadF(base, prop + 56),
+                    Readable(base, record, 36) ? LoadF(base, record + 32) : -1.0f, ctx.r4.u32, ctx.r5.u32,
+                    uint32_t(ctx.lr));
+        break;
+      }
+    }
+  }
+  __imp__sub_82521818(ctx, base);
 }
 
 REX_HOOK_RAW(sub_825E0EF0)
 {
   const uint32_t descriptor = ctx.r5.u32;
   const uint32_t prop = ctx.r4.u32;
+  lab_grate_sound::OnPropBody(base, prop); // pdz_restore_grate_sound
+  bymodel_sounds::OnPropBody(base, prop);  // pdz_snd_fusebox_hum
   LabRegister(base, prop, descriptor);
   bool key = false;
   if (REXCVAR_GET(pdz_fix_lab_keycard) && Readable(base, descriptor, 36) && Load32(base, descriptor + 32) == 1 &&
@@ -639,6 +746,44 @@ REX_HOOK_RAW(sub_825E0EF0)
         }
         break;
       }
+    }
+  }
+  // The vent grates (pdz_fix_lab_grates): the same method, for the three grates at their authored spots.
+  bool grate = false;
+  if (!key && !desk_part && REXCVAR_GET(pdz_fix_lab_grates) && Readable(base, descriptor, 36) &&
+      Readable(base, prop, 96) && Load32(base, prop + 12) == 8 && Load32(base, descriptor + 32) == 1)
+  {
+    const uint32_t session = Load32(base, kGame);
+    const uint32_t setup = Load32(base, prop + 84);
+    if (Readable(base, session, 44) && Readable(base, setup, 144) && base[session + 25] == 5 &&
+        Load32(base, session + 40) == 0)
+    {
+      static constexpr char kModel[] = "aid_darkcharacter_props_structure_vent_large";
+      static constexpr float kAt[3][3] = {
+          {3705.50f, -169.50f, 4011.79f}, {4220.25f, -169.54f, 3769.50f}, {6331.70f, 270.20f, -1749.50f}};
+      const uint32_t name = Load32(base, setup + 140);
+      if (Readable(base, name, sizeof(kModel)) && std::memcmp(base + name, kModel, sizeof(kModel)) == 0)
+      {
+        for (const auto &at : kAt)
+        {
+          bool here = true;
+          for (int i = 0; i < 3; ++i)
+          {
+            const float v = LoadF(base, setup + 4 + 4 * i);
+            here = here && std::isfinite(v) && std::fabs(v - at[i]) <= 0.05f;
+          }
+          grate = grate || here;
+        }
+      }
+    }
+    if (grate)
+    {
+      Store32(base, descriptor + 32, 7); // fixed body for this call (Havok motion 7)
+      __imp__sub_825E0EF0(ctx, base);
+      Store32(base, descriptor + 32, 1);
+      REXLOG_INFO("pdz_fix_lab_grates: Laboratory vent grate at ({:.1f}, {:.1f}, {:.1f}): fixed body (motion 1 -> 7)",
+                  LoadF(base, setup + 4), LoadF(base, setup + 8), LoadF(base, setup + 12));
+      return;
     }
   }
   if (desk_part)

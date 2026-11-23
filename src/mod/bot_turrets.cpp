@@ -28,6 +28,7 @@
 
 #include <rex/hook.h>
 #include "guest_function.h" // our indirect calls: nullptr for no function (log 101)
+#include "guest_readable_Sat21Nov.h" // Sun 22 Nov night (audit): pdz::guestmem::Ok
 #include <rex/ppc/func.h>
 #include <rex/logging.h>
 
@@ -105,7 +106,17 @@ namespace
 
   Result CallVirtual(PPCContext &ctx, uint8_t *base, uint32_t object, uint32_t slot)
   {
-    PPCFunc *fn = pdz::GuestFunction(Load32(base, Load32(base, object) + slot));
+    // Sun 22 Nov night (audit): the object mapped, its vtable in the game image (GuestFunction refuses _purecall).
+    if (!pdz::guestmem::Ok(base, object, 4))
+    {
+      return {};
+    }
+    const uint32_t vtable = Load32(base, object);
+    if (vtable < 0x82000000u || vtable >= 0x83000000u || !pdz::guestmem::Ok(base, vtable + slot, 4))
+    {
+      return {};
+    }
+    PPCFunc *fn = pdz::GuestFunction(Load32(base, vtable + slot));
     if (!fn)
     {
       return {};
@@ -126,17 +137,18 @@ namespace
 
   bool IsBot(const uint8_t *base, uint32_t character)
   {
-    return IsGuestPointer(character) && Load32(base, character) == kBotVtable;
+    return IsGuestPointer(character) && pdz::guestmem::Ok(base, character, 4) && Load32(base, character) == kBotVtable;
   }
 
   // Turrets a bot is firing: turret -> the bot.
   std::unordered_map<uint32_t, uint32_t> g_firing;
+  uint64_t g_firing_level = ~0ull; // Sun 22 Nov night (audit): the session / level g_firing belongs to
 
   // The gun's fire object, or 0.
   uint32_t FireObject(const uint8_t *base, uint32_t turret)
   {
     const uint32_t gun = Load32(base, turret + kTurretGun);
-    return IsGuestPointer(gun) ? Load32(base, gun + kGunFire) : 0;
+    return IsGuestPointer(gun) && pdz::guestmem::Ok(base, gun + kGunFire, 4) ? Load32(base, gun + kGunFire) : 0; // (Sun 22 Nov night, audit)
   }
 
   void StopFiring(PPCContext &ctx, uint8_t *base, uint32_t turret)
@@ -158,6 +170,16 @@ REX_HOOK_RAW(sub_8258CEA0)
   if (!REXCVAR_GET(pdz_bot_turrets) || !IsGuestPointer(turret))
   {
     return;
+  }
+  {
+    // Sun 22 Nov night (audit): a new session or level: the turrets of the one before are forgotten.
+    const uint32_t session = Load32(base, 0x82D6BFD8);
+    const uint64_t level = (uint64_t(session) << 8) | (pdz::guestmem::Ok(base, session, 28) ? base[session + 25] : 0xFFu);
+    if (level != g_firing_level)
+    {
+      g_firing_level = level;
+      g_firing.clear();
+    }
   }
   const uint32_t gunner = Load32(base, turret + kTurretGunner);
   const uint32_t state = Load32(base, turret + kTurretState);
@@ -184,8 +206,10 @@ REX_HOOK_RAW(sub_8258CEA0)
   }
 
   const uint32_t gun = Load32(base, turret + kTurretGun);
-  const uint32_t params = IsGuestPointer(gun) ? Load32(base, gun + kGunParams) : 0;
-  const int32_t type = IsGuestPointer(params) ? int32_t(Load32(base, params + kGunType)) : -1;
+  const uint32_t params = IsGuestPointer(gun) && pdz::guestmem::Ok(base, gun + kGunParams, 4) ? Load32(base, gun + kGunParams) : 0;
+  const int32_t type = IsGuestPointer(params) && pdz::guestmem::Ok(base, params + kGunType, 4) // (Sun 22 Nov night, audit)
+                           ? int32_t(Load32(base, params + kGunType))
+                           : -1;
   const float trigger = state == kOperating ? float(CallVirtual(ctx, base, gunner, kCharacterTrigger).f1) : 0.0f;
   const bool pressed = trigger > kTriggerPressed || base[turret + kTurretFireRequest];
 

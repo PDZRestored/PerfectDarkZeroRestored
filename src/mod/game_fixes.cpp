@@ -67,6 +67,7 @@
 
 #include "../game_cvars.h"
 #include "fix_log.h"
+#include "guest_readable_Sat21Nov.h" // Sun 22 Nov night (audit): pdz::guestmem::Ok
 #include "hook_profile.h" // pdz_hook_profile (must follow <rex/hook.h>)
 
 namespace look_tuning
@@ -152,6 +153,10 @@ namespace
     {
       return false;
     }
+    if (!pdz::guestmem::Ok(base, object, 4)) // (Sun 22 Nov night, audit: a shot can outlive its owner)
+    {
+      return false;
+    }
     const uint32_t vtbl = LoadBe32(base, object);
     return vtbl >= 0x82000000u && vtbl < 0x833E0000u && LoadBe32(base, vtbl + 748) == 0x825AAEF0;
   }
@@ -207,7 +212,12 @@ namespace
       rex::graphics::resolve_readback::Remove(registered);
       // Clear the last snapshot read back, so with the fix off the CPU sees
       // what it sees without it (black), not the previous victim.
-      std::memset(base + registered_address, 0, kSnapshotBytes);
+      // Sun 22 Nov night (audit): only while the texture is still there (it moved: its old memory may be another's
+      // now, or released).
+      if (address == registered_address && pdz::guestmem::Ok(base, registered_address, kSnapshotBytes))
+      {
+        std::memset(base + registered_address, 0, kSnapshotBytes);
+      }
       registered = 0;
       registered_address = 0;
     }

@@ -80,6 +80,8 @@ namespace pdz::native::blend7e3
   void CountDraw(uint32_t mode);
   // Mode 2 was wanted but its variant could not be built: mode 1 used instead (pipeline).
   void CountVariantFallback();
+  // The sum of the fallback counters (pdz_native_draw_memo: a pipeline lookup that counted one is not remembered).
+  uint64_t FallbackTotal();
   // After the pipeline list's collect pass (depth20e4::batch): forgets the variants it built and its counters.
   void ResetForSeed();
   // "7e3 blend mode M:variants B (C from disk, failed F, T ms) draws alpha-clamp A rov R, rov fallbacks: ..." for the

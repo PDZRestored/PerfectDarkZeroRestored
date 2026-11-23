@@ -68,6 +68,10 @@ namespace pdz::native::recthread
   void Drain(const char *why);
 } // namespace pdz::native::recthread
 
+#ifdef PDZ_COUNTEROP
+void PdzCounterOpHudLevelEnd(); // counter_op_hud.cpp: the level's ring / radar / prompt counts (a test that ends in a level)
+#endif
+
 namespace pdz::test
 {
   // Printed whether or not the native renderer is on (LogTestSummary has no early return); timing line, then the
@@ -84,5 +88,8 @@ namespace pdz::test
     pdz::census::LogSummary(why);
     pdz::test::LogMpSnapshotSummary(why);
     pdz::latency::LogSummary(why);
+#ifdef PDZ_COUNTEROP
+    PdzCounterOpHudLevelEnd();
+#endif
   }
 } // namespace pdz::test

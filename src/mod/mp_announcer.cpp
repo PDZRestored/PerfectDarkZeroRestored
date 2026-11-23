@@ -37,6 +37,7 @@
 
 #include <rex/hook.h>
 #include "guest_function.h" // our indirect calls: nullptr for no function (log 101)
+#include "guest_readable_Sat21Nov.h" // Sun 22 Nov night (audit): pdz::guestmem::Ok
 #include <rex/logging.h>
 #include <rex/ppc/func.h>
 #include <rex/system/kernel_state.h>
@@ -105,12 +106,12 @@ namespace
   // the image.
   uint32_t CallVirtual(PPCContext &ctx, uint8_t *base, uint32_t object, uint32_t slot)
   {
-    if (!IsGuestPointer(object))
+    if (!IsGuestPointer(object) || !pdz::guestmem::Ok(base, object, 4)) // (Sun 22 Nov night, audit)
     {
       return 0;
     }
     const uint32_t vtable = Load32(base, object);
-    if (vtable < 0x82000000u || vtable >= 0x84000000u)
+    if (vtable < 0x82000000u || vtable >= 0x83000000u || !pdz::guestmem::Ok(base, vtable + slot, 4))
     {
       return 0;
     }
@@ -145,13 +146,13 @@ namespace
 
   int Team(PPCContext &ctx, uint8_t *base, uint32_t p)
   {
-    const uint32_t info = Load32(base, p + 80);
+    const uint32_t info = pdz::guestmem::Ok(base, p + 80, 4) ? Load32(base, p + 80) : 0; // (Sun 22 Nov night, audit)
     return IsGuestPointer(info) ? int(int8_t(CallVirtual(ctx, base, info + 120, 24))) : -1;
   }
 
   int Kills(PPCContext &ctx, uint8_t *base, uint32_t p)
   {
-    const uint32_t info = Load32(base, p + 80);
+    const uint32_t info = pdz::guestmem::Ok(base, p + 80, 4) ? Load32(base, p + 80) : 0; // (Sun 22 Nov night, audit)
     return IsGuestPointer(info) ? int32_t(CallVirtual(ctx, base, info + 1084, 24)) : 0;
   }
 
@@ -159,7 +160,8 @@ namespace
   {
     std::vector<uint32_t> out;
     uint32_t p = Load32(base, kParticipantList);
-    for (int guard = 0; IsGuestPointer(p) && guard < 64; ++guard, p = Load32(base, p + 4))
+    for (int guard = 0; IsGuestPointer(p) && pdz::guestmem::Ok(base, p, 948) && guard < 64; // (Sun 22 Nov night, audit)
+         ++guard, p = Load32(base, p + 4))
     {
       const uint32_t kind = Kind(base, p);
       if (kind == 2 || kind == 3)
@@ -176,7 +178,7 @@ namespace
     for (uint32_t p : Participants(base))
     {
       const uint32_t info = Load32(base, p + 12);
-      if (Kind(base, p) == 2 && IsGuestPointer(info) && base[info + 12])
+      if (Kind(base, p) == 2 && IsGuestPointer(info) && pdz::guestmem::Ok(base, info, 13) && base[info + 12])
       {
         return p;
       }
@@ -269,9 +271,10 @@ namespace
 
   const char *SabotageLine(const uint8_t *base, uint32_t prop)
   {
-    const uint32_t holder = IsGuestPointer(prop) ? Load32(base, prop + 100) : 0;
-    const uint32_t record = IsGuestPointer(holder) ? Load32(base, holder + 4) : 0;
-    if (!IsGuestPointer(record))
+    // Sun 22 Nov night (audit): each pointer only while mapped.
+    const uint32_t holder = pdz::guestmem::Ok(base, prop, 104) ? Load32(base, prop + 100) : 0;
+    const uint32_t record = pdz::guestmem::Ok(base, holder, 8) ? Load32(base, holder + 4) : 0;
+    if (!IsGuestPointer(record) || !pdz::guestmem::Ok(base, record, 406))
     {
       return nullptr;
     }

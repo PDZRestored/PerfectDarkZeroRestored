@@ -31,6 +31,7 @@
 #include <windows.h>
 #include <intrin.h>
 #include <chrono>
+#pragma comment(lib, "Synchronization.lib") // WaitOnAddress / WakeByAddressSingle (pdz_native_record_spin_lock)
 
 #include <fmt/format.h>
 #include <rex/cvar.h>
@@ -77,6 +78,45 @@ REXCVAR_DEFINE_BOOL(pdz_native_record_thread_verify, false, "Render",
                     "pdz_native_record_thread diagnostic: at every draw, compare the worker's float constant mirror "
                     "(built from the dirty groups) with the guest device's 8 KB and count the 64-byte groups that "
                     "differ (constants the game changed without their dirty bit). Costs an 8 KB compare per draw.");
+REXCVAR_DEFINE_BOOL(pdz_native_record_spin_lock, false, "Render",
+                    "pdz_native_record_thread (13 Nov, docs/CPU_STUDY_2.md, Part D): the producer lock every hooked "
+                    "D3D call takes (10,000 times a frame at Outpost) is an inline exclusive lock: one compare-and-"
+                    "swap to take it, one exchange to release it, a short spin and then a sleep on the lock word "
+                    "when another thread holds it (it is held while the producer waits for room, so a waiter must "
+                    "sleep). The same mutual exclusion as the std::mutex it replaces. Read at startup. Off = "
+                    "std::mutex, as before")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(pdz_native_record_handoff_batch, true, "Render",
+                    "Record thread hand-off (Mon 16 Nov, needs pdz_native_record_thread): the game thread shows the "
+                    "record thread its queued draws eight at a time instead of one at a time (one locked store and one "
+                    "wake check per eight draws). Every other command (clear, resolve, kick, flush, texture write, "
+                    "Swap) and every wait of the game thread shows everything queued at once, so the commands, their "
+                    "order and the frame boundaries are the same; only when the record thread first sees a draw "
+                    "changes (at most seven draws later). Read at startup. Off = every command shown at once, as "
+                    "before");
+REXCVAR_DEFINE_INT32(pdz_native_record_onepass, 0, "Render",
+                     "pdz_native_record_thread (13 Nov, docs/CPU_STUDY_2.md, Part D): 1 = a draw's render targets "
+                     "(20 bytes) and viewport (24) are not compared and sent with its payload: the record thread "
+                     "writes them into its device mirror from the draw's own DrawRecord, which the hook filled from "
+                     "the same device fields. 2 = verify: the payload is built as before and the record thread "
+                     "compares the 44 bytes its mirror then holds with the ones the record gives, byte for byte "
+                     "(counted and logged). Read at startup. 0 = off, as before")
+    .range(0, 2)
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_INT32(pdz_native_record_prefetch, 0, "Render",
+                     "pdz_native_record_thread (13 Nov, docs/CPU_STUDY_2.md): while the record thread runs a "
+                     "command it asks the processor for the cache lines of the command this many places ahead "
+                     "(its payload, up to 1.5 KB, and its 2 KB draw record), which the render thread's core wrote; "
+                     "they were fetched one miss at a time when the command started. A prefetch changes nothing "
+                     "the program can observe. Read at startup. 0 = off, as before")
+    .range(0, 8)
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(pdz_native_view_first, false, "Render",
+                    "pdz_native_record_thread (13 Nov, docs/CPU_STUDY_2.md): the record thread's reads of the D3D "
+                    "device struct look in its device mirror first, instead of scanning the command's object copies "
+                    "(10-15 of them) before reaching it. The same bytes are read: the fast path is only taken while "
+                    "no copy overlaps the mirror (native_view.h). Read at startup. Off = as before")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 namespace pdz::native::recthread
 {
@@ -85,6 +125,74 @@ namespace pdz::native::recthread
     using pdz::shadow::DrawRecord;
     using pdz::shadow::Hook;
     using pdz::shadow::Kind;
+
+    // Part D (13 Nov), latched by ChooseAtStartup.
+    bool g_spin_lock = false; // pdz_native_record_spin_lock
+    int32_t g_onepass = 0;    // pdz_native_record_onepass
+    uint64_t g_prefetch_ahead = 0; // pdz_native_record_prefetch (commands ahead; 0 = off)
+    bool g_handoff_batch = false;  // pdz_native_record_handoff_batch
+    constexpr uint64_t kHandoffBatch = 8; // draws queued before the head is shown to the worker
+
+    // The producer lock. Off: std::mutex. On: a three-state lock word (0 free, 1 held, 2 held with a sleeper
+    // possible): taking a free lock is one compare-and-swap, releasing it one exchange, both inline. A thread that
+    // finds it held spins briefly (the usual hold is well under a microsecond), then marks the word 2 and sleeps on
+    // it (WaitOnAddress) until a release wakes it: the lock is held across the producer's waits for room, which
+    // can be milliseconds, so a waiter never spins for long. Exactly one thread holds it at a time, as before.
+    class ProduceLock
+    {
+    public:
+      void lock()
+      {
+        if (!g_spin_lock)
+        {
+          mutex_.lock();
+          return;
+        }
+        uint32_t expected = 0;
+        if (word_.compare_exchange_strong(expected, 1, std::memory_order_acquire, std::memory_order_relaxed))
+        {
+          return;
+        }
+        LockSlow();
+      }
+      void unlock()
+      {
+        if (!g_spin_lock)
+        {
+          mutex_.unlock();
+          return;
+        }
+        if (word_.exchange(0, std::memory_order_release) == 2)
+        {
+          WakeByAddressSingle(&word_);
+        }
+      }
+
+    private:
+      __declspec(noinline) void LockSlow()
+      {
+        for (uint32_t spin = 0; spin < 128; ++spin)
+        {
+          _mm_pause();
+          uint32_t expected = 0;
+          if (word_.load(std::memory_order_relaxed) == 0 &&
+              word_.compare_exchange_strong(expected, 1, std::memory_order_acquire, std::memory_order_relaxed))
+          {
+            return;
+          }
+        }
+        // 2 = "a sleeper may exist": whoever releases a 2 wakes one sleeper. Taking the lock as 2 here keeps the
+        // wake-up chain going when several threads sleep (at worst one wake-up with nobody left to wake).
+        while (word_.exchange(2, std::memory_order_acquire) != 0)
+        {
+          uint32_t two = 2;
+          WaitOnAddress(&word_, &two, sizeof(two), INFINITE);
+        }
+      }
+      std::atomic<uint32_t> word_{0};
+      std::mutex mutex_;
+    };
+    using ProduceGuard = std::lock_guard<ProduceLock>;
     namespace dev = pdz::shadow::dev;
 
     // The queue's sizes (31 Oct, docs/INTERCEPTION_SPEEDUP.md): powers of two latched at startup from
@@ -205,8 +313,9 @@ namespace pdz::native::recthread
     struct State
     {
       // Producer side (produce_mutex).
-      std::mutex produce_mutex;
+      ProduceLock produce_mutex;
       uint64_t cmd_head_local = 0;   // commands queued (producer's copy of cmd_head)
+      uint64_t cmd_head_shown = 0;   // pdz_native_record_handoff_batch: the head last stored to cmd_head (producer)
       uint64_t arena_head = 0;       // bytes reserved (monotonic)
       uint32_t last_device = 0;      // device of the last command with a device mirror
       bool need_full = true;         // next draw sends the whole float blocks
@@ -219,6 +328,7 @@ namespace pdz::native::recthread
       // while the worker's mirror holds exactly that (cleared by any other mirror write and by a device change).
       alignas(16) uint8_t bits_sent[176] = {};
       bool bits_valid = false;
+      bool bits_tv_valid = false; // pdz_native_record_onepass 1: bits_sent's targets / viewport are what the mirror holds
       uint32_t verify_logged = 0;
 
       // Shared. Interception speed-up (31 Oct, docs/INTERCEPTION_SPEEDUP.md): the atomics each side writes for every
@@ -257,6 +367,8 @@ namespace pdz::native::recthread
       double busy_ms_frame = 0.0;
       uint64_t commands_frame = 0;
       uint64_t lost_records = 0; // a draw whose shadow-ring slot was overwritten (a bug: logged)
+      // pdz_native_record_onepass 2 (verify): draws compared / draws whose 44 bytes differed (one writer: the worker).
+      std::atomic<uint64_t> onepass_checked{0}, onepass_differ{0};
 
       // Spike log (pdz_frame_timing_spike_ms; TakeSpikeTotals): cumulative counters the game thread's Swap takes deltas
       // of, and per-interval maxima it takes with an exchange. busy / payload: one writer each (worker / producer
@@ -299,6 +411,22 @@ namespace pdz::native::recthread
     // Producer waits (produce_mutex held). The worker updates ring_done / arena_tail / swaps_done before `completed`,
     // so waiting on `completed` covers every condition.
     // ---------------------------------------------------------------------------------------------------------------
+    // pdz_native_record_handoff_batch: every queued command shown to the worker now (produce_mutex held). The same
+    // store and wake check Publish makes; a no-op when nothing is held back (always, with the switch off).
+    void ShowHead()
+    {
+      State &s = S();
+      if (s.cmd_head_shown != s.cmd_head_local)
+      {
+        s.cmd_head_shown = s.cmd_head_local;
+        s.cmd_head.store(s.cmd_head_local, std::memory_order_seq_cst);
+        if (s.worker_waiting.load(std::memory_order_seq_cst))
+        {
+          SetEvent(s.work_event);
+        }
+      }
+    }
+
     // Returns whether it had to wait.
     template <typename Done>
     bool WaitFor(WaitKind kind, Done done)
@@ -307,6 +435,10 @@ namespace pdz::native::recthread
       if (done())
       {
         return false;
+      }
+      if (g_handoff_batch)
+      {
+        ShowHead(); // the worker must see everything queued before the producer waits for it
       }
       const bool phases = pdz::timing::PhaseLevel() > 0;
       const uint64_t c0 = phases ? __rdtsc() : 0;
@@ -598,6 +730,17 @@ namespace pdz::native::recthread
       c.ring_head = pdz::shadow::Get().head;
       s.cmds[s.cmd_head_local & (g_cmd_count - 1)] = c;
       ++s.cmd_head_local;
+      if (g_handoff_batch)
+      {
+        // Draws come in runs: the head is shown every kHandoffBatch draws; any other command shows it at once (and
+        // WaitFor, Drain and Stop show it before they wait), so a held-back draw is seen at the next command at the
+        // latest (a frame ends with a Swap command).
+        if (c.type == Type::kDraw && s.cmd_head_local - s.cmd_head_shown < kHandoffBatch)
+        {
+          return;
+        }
+        s.cmd_head_shown = s.cmd_head_local;
+      }
       s.cmd_head.store(s.cmd_head_local, std::memory_order_seq_cst);
       if (s.worker_waiting.load(std::memory_order_seq_cst))
       {
@@ -703,7 +846,11 @@ namespace pdz::native::recthread
 
     constexpr uint32_t kDeviceBitsSize =
         ChunkSize(kLoopBytes) + ChunkSize(kTargetsBytes) + ChunkSize(kViewportBytes) + ChunkSize(4);
-    void WriteDeviceBits(Writer &w, const uint8_t *dev_ptr)
+    // `from_record` (a draw; pdz_native_record_onepass 1): the render targets and the viewport are left out: the
+    // worker takes them from the draw's DrawRecord (MirrorFromRecord). The record of what the mirror holds
+    // (bits_sent) is then no longer true for those two parts, so a command without a record (the Swap) sends them
+    // whole (bits_tv_valid).
+    void WriteDeviceBits(Writer &w, const uint8_t *dev_ptr, bool from_record)
     {
       struct Part
       {
@@ -716,10 +863,31 @@ namespace pdz::native::recthread
       static_assert(kLoopBytes + kTargetsBytes + kViewportBytes + 4 <= sizeof(State::bits_sent));
       State &s = S();
       const bool delta = s.bits_valid && REXCVAR_GET(pdz_native_record_delta);
+      const bool onepass = g_onepass == 1;
       uint64_t skipped = 0;
       for (const Part &p : kParts)
       {
         const uint8_t *now = dev_ptr + p.offset;
+        const bool targets_or_viewport = p.offset == kTargetsOffset || p.offset == dev::kViewport;
+        if (onepass && targets_or_viewport)
+        {
+          if (from_record)
+          {
+            s.bits_tv_valid = false; // the worker writes them from the record: bits_sent no longer describes them
+            ++skipped;
+            continue;
+          }
+          if (!s.bits_tv_valid)
+          {
+            w.MirrorKeep(dev_ptr, p.offset, p.bytes);
+            std::memcpy(s.bits_sent + p.at, now, p.bytes);
+            if (p.offset == dev::kViewport)
+            {
+              s.bits_tv_valid = true; // both parts sent (the targets come first in kParts)
+            }
+            continue;
+          }
+        }
         if (delta && std::memcmp(now, s.bits_sent + p.at, p.bytes) == 0)
         {
           ++skipped; // the worker's mirror already holds these bytes
@@ -798,6 +966,55 @@ namespace pdz::native::recthread
       }
     }
 
+    // pdz_native_record_onepass (worker, a draw): the mirror's render targets (RT0..3 + DS) and viewport from the
+    // draw's DrawRecord. shadow::Record loaded them from the same device fields inside the same hook, so they are
+    // the bytes the payload used to carry (re-encoded big-endian, as the device holds them). 1 = written to the
+    // mirror; 2 = verify: the payload still carried them, the mirror is compared and left as it is.
+    static_assert(dev::kDepthStencil == dev::kRenderTargets + 16, "RT0..3 and DS are one 20-byte range");
+    void MirrorFromRecord(State &s, const DrawRecord &r)
+    {
+      uint32_t be[11];
+      for (uint32_t i = 0; i < 4; ++i)
+      {
+        be[i] = _byteswap_ulong(r.render_targets[i]);
+      }
+      be[4] = _byteswap_ulong(r.depth_stencil);
+      for (uint32_t i = 0; i < 6; ++i)
+      {
+        be[5 + i] = _byteswap_ulong(r.viewport[i]);
+      }
+      uint8_t *targets = s.mirror + kTargetsOffset;
+      uint8_t *viewport = s.mirror + dev::kViewport;
+      if (g_onepass == 1)
+      {
+        std::memcpy(targets, be, kTargetsBytes);
+        std::memcpy(viewport, be + 5, kViewportBytes);
+        return;
+      }
+      const bool same = std::memcmp(targets, be, kTargetsBytes) == 0 && std::memcmp(viewport, be + 5, kViewportBytes) == 0;
+      s.onepass_checked.store(s.onepass_checked.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+      if (!same)
+      {
+        const uint64_t n = s.onepass_differ.load(std::memory_order_relaxed) + 1;
+        s.onepass_differ.store(n, std::memory_order_relaxed);
+        if (n <= 8)
+        {
+          uint32_t now[11];
+          std::memcpy(now, targets, kTargetsBytes);
+          std::memcpy(now + 5, viewport, kViewportBytes);
+          std::string a, b;
+          for (uint32_t i = 0; i < 11; ++i)
+          {
+            a += fmt::format(" {:08X}", _byteswap_ulong(now[i]));
+            b += fmt::format(" {:08X}", _byteswap_ulong(be[i]));
+          }
+          REXLOG_WARN("pdz_recthread: onepass verify: draw #{} (kind {}, caller {:08X}): the payload's targets / "
+                      "viewport{} differ from the record's{}",
+                      r.sequence, uint32_t(r.kind), r.caller, a, b);
+        }
+      }
+    }
+
     void Execute(const Cmd &c, const uint8_t *payload)
     {
       State &s = S();
@@ -838,6 +1055,10 @@ namespace pdz::native::recthread
                          c.slot, r.sequence);
           }
           break;
+        }
+        if (g_onepass)
+        {
+          MirrorFromRecord(s, r);
         }
         pdz::native::OnDraw(base, r);
         break;
@@ -1066,6 +1287,31 @@ namespace pdz::native::recthread
             const Cmd &c = s.cmds[tail & (g_cmd_count - 1)];
             const uint8_t *payload = c.payload_bytes ? s.arena.get() + c.payload_pos : nullptr;
             const uint64_t c0 = spike || split ? __rdtsc() : 0;
+            if (g_prefetch_ahead && tail + g_prefetch_ahead < head)
+            {
+              // pdz_native_record_prefetch: a later command's payload and DrawRecord were written by the render
+              // thread's core; asking for their cache lines now lets them arrive while this command runs. A
+              // prefetch reads nothing into the program and cannot fault.
+              const Cmd &next = s.cmds[(tail + g_prefetch_ahead) & (g_cmd_count - 1)];
+              if (next.payload_bytes)
+              {
+                const char *p = reinterpret_cast<const char *>(s.arena.get() + next.payload_pos);
+                const char *end = p + std::min<uint32_t>(next.payload_bytes, 1536);
+                for (; p < end; p += 64)
+                {
+                  _mm_prefetch(p, _MM_HINT_T0);
+                }
+              }
+              if (next.type == Type::kDraw)
+              {
+                const char *p = reinterpret_cast<const char *>(&pdz::shadow::Get().ring[next.slot & pdz::shadow::RingMask()]);
+                const char *end = p + sizeof(DrawRecord);
+                for (; p < end; p += 64)
+                {
+                  _mm_prefetch(p, _MM_HINT_T0);
+                }
+              }
+            }
             Execute(c, payload);
             if (split)
             {
@@ -1154,7 +1400,7 @@ namespace pdz::native::recthread
         return false;
       }
       State &s = S();
-      std::lock_guard<std::mutex> lock(s.produce_mutex);
+      ProduceGuard lock(s.produce_mutex);
       const EnqueueScope enqueue_time;
       if (!s.running.load(std::memory_order_relaxed))
       {
@@ -1224,6 +1470,11 @@ namespace pdz::native::recthread
                                            kCmdCountMax));
     g_arena_bytes = PowerOfTwoAtLeast(uint64_t(std::max(0, REXCVAR_GET(pdz_native_record_arena_mb))), 4, 64) << 20;
     g_oversize = g_arena_bytes / 4;
+    g_spin_lock = REXCVAR_GET(pdz_native_record_spin_lock); // before the first lock is taken (no guest thread yet)
+    g_onepass = REXCVAR_GET(pdz_native_record_onepass);
+    view::g_first_range_first = REXCVAR_GET(pdz_native_view_first);
+    g_prefetch_ahead = uint64_t(std::clamp(REXCVAR_GET(pdz_native_record_prefetch), 0, 8));
+    g_handoff_batch = REXCVAR_GET(pdz_native_record_handoff_batch);
     g_state = new State();
     State &s = S();
     s.cmds.reset(new Cmd[g_cmd_count]);
@@ -1244,6 +1495,12 @@ namespace pdz::native::recthread
                 "frame; pass dump and draw dump refused; verify {}",
                 g_cmd_count, g_arena_bytes >> 20, pdz::shadow::RingSlots(),
                 REXCVAR_GET(pdz_native_record_thread_verify) ? "on (8 KB constant compare per draw)" : "off");
+    if (g_handoff_batch)
+    {
+      REXLOG_INFO("pdz_recthread: pdz_native_record_handoff_batch on: queued draws are shown to the record thread {} "
+                  "at a time; every other command and every wait shows them at once",
+                  kHandoffBatch);
+    }
   }
 
   bool Active() { return g_state && g_state->running.load(std::memory_order_relaxed); }
@@ -1254,7 +1511,7 @@ namespace pdz::native::recthread
               uint32_t a2, uint32_t a3, uint32_t a4, uint32_t a5, uint32_t a6, uint32_t a7)
   {
     State &s = S();
-    std::lock_guard<std::mutex> lock(s.produce_mutex);
+    ProduceGuard lock(s.produce_mutex);
     NoteBase(base);
     WaitShadowRoom();
     pdz::shadow::Count(hook);
@@ -1314,7 +1571,7 @@ namespace pdz::native::recthread
     Writer w{res.ptr, res.ptr + size};
     WriteConsts(w, dev_ptr, &r, full);
     s.need_full = false;
-    WriteDeviceBits(w, dev_ptr);
+    WriteDeviceBits(w, dev_ptr, true);
     plan.Write(w, base);
     s.frame.up_bytes += up_bytes;
     s.frame.other_bytes += other_bytes + kDeviceBitsSize;
@@ -1331,7 +1588,7 @@ namespace pdz::native::recthread
                                 uint32_t a2)
   {
     State &s = S();
-    std::lock_guard<std::mutex> lock(s.produce_mutex);
+    ProduceGuard lock(s.produce_mutex);
     NoteBase(base);
     if (pdz::native::Enabled() && pdz::shadow::IsGuestPointer(device))
     {
@@ -1365,7 +1622,7 @@ namespace pdz::native::recthread
   void OnBeginVerticesLeave(uint8_t *base, uint32_t sequence, uint32_t data)
   {
     State &s = S();
-    std::lock_guard<std::mutex> lock(s.produce_mutex);
+    ProduceGuard lock(s.produce_mutex);
     DrawRecord &r = pdz::shadow::Get().ring[sequence & pdz::shadow::RingMask()];
     if (r.sequence != sequence)
     {
@@ -1399,7 +1656,7 @@ namespace pdz::native::recthread
     Writer w{res.ptr, res.ptr + size};
     WriteConsts(w, dev_ptr, &r, full); // the values the call's flush emitted (unchanged since its entry)
     s.need_full = false;
-    WriteDeviceBits(w, dev_ptr);
+    WriteDeviceBits(w, dev_ptr, true);
     plan.Write(w, base);
     s.frame.other_bytes += plan.size + kDeviceBitsSize;
     // A batch the worker keeps pending until the next entry point (unless it is DrawVerticesUP's inner one).
@@ -1451,7 +1708,7 @@ namespace pdz::native::recthread
   void OnEndVertices(uint8_t *base, uint32_t device)
   {
     State &s = S();
-    std::lock_guard<std::mutex> lock(s.produce_mutex);
+    ProduceGuard lock(s.produce_mutex);
     NoteBase(base);
     if (pdz::shadow::Enabled())
     {
@@ -1470,7 +1727,7 @@ namespace pdz::native::recthread
     {
       return;
     }
-    std::lock_guard<std::mutex> lock(s.produce_mutex);
+    ProduceGuard lock(s.produce_mutex);
     NoteBase(base);
     QueueFlushPoint(base, device, Type::kFlushPending);
   }
@@ -1479,7 +1736,7 @@ namespace pdz::native::recthread
                uint32_t color, uint32_t z_bits, uint32_t stencil)
   {
     State &s = S();
-    std::lock_guard<std::mutex> lock(s.produce_mutex);
+    ProduceGuard lock(s.produce_mutex);
     NoteBase(base);
     if (pdz::shadow::Enabled())
     {
@@ -1533,7 +1790,7 @@ namespace pdz::native::recthread
                       uint32_t dest_texture, uint32_t dest_point, uint32_t level, uint32_t z_bits)
   {
     State &s = S();
-    std::lock_guard<std::mutex> lock(s.produce_mutex);
+    ProduceGuard lock(s.produce_mutex);
     NoteBase(base);
     WaitShadowRoom();
     pdz::shadow::Count(Hook::kResolve);
@@ -1549,7 +1806,7 @@ namespace pdz::native::recthread
     {
       return;
     }
-    std::lock_guard<std::mutex> lock(s.produce_mutex);
+    ProduceGuard lock(s.produce_mutex);
     NoteBase(base);
     const EnqueueScope enqueue_time;
     const bool device_ok = pdz::shadow::IsGuestPointer(device);
@@ -1602,7 +1859,7 @@ namespace pdz::native::recthread
   void OnSwapEnter(uint8_t *base, uint32_t device, uint32_t caller, uint32_t front_buffer, uint32_t parameters)
   {
     State &s = S();
-    std::lock_guard<std::mutex> lock(s.produce_mutex);
+    ProduceGuard lock(s.produce_mutex);
     NoteBase(base);
     WaitShadowRoom();
     pdz::shadow::Count(Hook::kSwap);
@@ -1613,7 +1870,7 @@ namespace pdz::native::recthread
   {
     State &s = S();
     const int64_t now_us = pdz::gpusync::NowUs();
-    std::lock_guard<std::mutex> lock(s.produce_mutex);
+    ProduceGuard lock(s.produce_mutex);
     NoteBase(base);
     const EnqueueScope enqueue_time;
     const uint64_t index = ++s.swaps_queued;
@@ -1639,7 +1896,7 @@ namespace pdz::native::recthread
       const uint8_t *dev_ptr = pdz::shadow::GuestPtr(base, device);
       WriteConsts(w, dev_ptr, nullptr, true);
       s.need_full = false;
-      WriteDeviceBits(w, dev_ptr);
+      WriteDeviceBits(w, dev_ptr, false);
     }
     plan.Write(w, base);
     s.frame.other_bytes += plan.size + (device_ok ? kDeviceBitsSize : 0);
@@ -1667,7 +1924,7 @@ namespace pdz::native::recthread
     {
       return;
     }
-    std::lock_guard<std::mutex> lock(s.produce_mutex);
+    ProduceGuard lock(s.produce_mutex);
     NoteBase(base);
     const EnqueueScope enqueue_time;
     Cmd c;
@@ -1679,7 +1936,7 @@ namespace pdz::native::recthread
   void OnGammaRamp(uint8_t *base, uint32_t ramp)
   {
     State &s = S();
-    std::lock_guard<std::mutex> lock(s.produce_mutex);
+    ProduceGuard lock(s.produce_mutex);
     NoteBase(base);
     const EnqueueScope enqueue_time;
     Plan plan;
@@ -1697,7 +1954,7 @@ namespace pdz::native::recthread
   void OnTextureWrite(uint8_t *base, uint32_t begin, uint32_t end, uint32_t mip_begin, uint32_t mip_end)
   {
     State &s = S();
-    std::lock_guard<std::mutex> lock(s.produce_mutex);
+    ProduceGuard lock(s.produce_mutex);
     NoteBase(base);
     const EnqueueScope enqueue_time;
     Cmd c;
@@ -1718,7 +1975,11 @@ namespace pdz::native::recthread
     State &s = S();
     const double t0 = QpcMs();
     {
-      std::lock_guard<std::mutex> lock(s.produce_mutex);
+      ProduceGuard lock(s.produce_mutex);
+      if (g_handoff_batch)
+      {
+        ShowHead();
+      }
       const uint64_t target = s.cmd_head_local;
       const double deadline = t0 + 5000.0;
       while (s.completed.load(std::memory_order_acquire) < target && QpcMs() < deadline)
@@ -1728,6 +1989,15 @@ namespace pdz::native::recthread
     }
     REXLOG_INFO("pdz_recthread: drained for {} in {:.1f} ms ({} commands queued, {} done)", why, QpcMs() - t0,
                 s.cmd_head.load(std::memory_order_relaxed), s.completed.load(std::memory_order_relaxed));
+    if (g_spin_lock || g_onepass || view::g_first_range_first)
+    {
+      REXLOG_INFO("pdz_recthread: Part D: producer lock {}; device mirror read first {}; onepass {} ({}); onepass "
+                  "verify: {} draws compared, {} differ",
+                  g_spin_lock ? "inline (pdz_native_record_spin_lock)" : "std::mutex",
+                  view::g_first_range_first ? "on (pdz_native_view_first)" : "off", g_onepass,
+                  g_onepass == 1 ? "targets / viewport from the record" : g_onepass == 2 ? "verify" : "off",
+                  s.onepass_checked.load(std::memory_order_relaxed), s.onepass_differ.load(std::memory_order_relaxed));
+    }
   }
 
   void Stop()
@@ -1738,7 +2008,11 @@ namespace pdz::native::recthread
     }
     State &s = S();
     {
-      std::lock_guard<std::mutex> lock(s.produce_mutex);
+      ProduceGuard lock(s.produce_mutex);
+      if (g_handoff_batch)
+      {
+        ShowHead();
+      }
       const double deadline = QpcMs() + 2000.0;
       while (s.completed.load(std::memory_order_acquire) < s.cmd_head_local && QpcMs() < deadline)
       {
@@ -1758,6 +2032,7 @@ namespace pdz::native::recthread
         c.arena_end = s.arena_head;
         s.cmds[s.cmd_head_local & (g_cmd_count - 1)] = c;
         ++s.cmd_head_local;
+        s.cmd_head_shown = s.cmd_head_local;
         s.cmd_head.store(s.cmd_head_local, std::memory_order_seq_cst);
       }
       SetEvent(s.work_event);

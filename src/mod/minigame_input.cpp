@@ -332,9 +332,11 @@ REX_HOOK_RAW(sub_82648BF0)
 }
 
 // The lockbot subgame's update (subgame r3, f1 = dt).
+void PdzMinigameNote(const uint8_t *base, uint32_t subgame); // minigame_log.cpp: a minigame's update ran
 REX_HOOK_RAW(sub_826492E8)
 {
   const uint32_t sub = ctx.r3.u32;
+  PdzMinigameNote(base, sub);
   const double dt = ctx.f1.f64;
   g_active_ns.store(NowNs(), std::memory_order_relaxed);
   g_subgame.store(sub, std::memory_order_relaxed);

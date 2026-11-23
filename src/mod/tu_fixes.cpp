@@ -60,6 +60,7 @@
 
 #include <rex/hook.h>
 #include "guest_function.h" // our indirect calls: nullptr for no function (log 101)
+#include "guest_readable_Sat21Nov.h" // Sun 22 Nov night (audit): pdz::guestmem::Ok
 #include <rex/logging.h>
 #include <rex/ppc/func.h>
 #include <rex/ppc/stack.h>
@@ -114,7 +115,17 @@ namespace
   uint32_t CallVirtual(PPCContext &ctx, uint8_t *base, uint32_t object, uint32_t slot, uint32_t r4 = 0,
                        uint32_t r5 = 0)
   {
-    PPCFunc *fn = pdz::GuestFunction(LoadBe32(base, LoadBe32(base, object) + slot));
+    // Sun 22 Nov night (audit): the object mapped and its vtable in the game image before a slot is called.
+    if (!pdz::guestmem::Ok(base, object, 4))
+    {
+      return 0;
+    }
+    const uint32_t vtable = LoadBe32(base, object);
+    if (vtable < 0x82000000u || vtable >= 0x83000000u || !pdz::guestmem::Ok(base, vtable + slot, 4))
+    {
+      return 0;
+    }
+    PPCFunc *fn = pdz::GuestFunction(LoadBe32(base, vtable + slot));
     if (!fn)
     {
       return 0;
@@ -163,7 +174,8 @@ namespace
     g_teleport = {};
     g_teleport.character = character;
     g_teleport.child = LoadBe32(base, character + 88);
-    if (!IsGuestPointer(g_teleport.child) || !LoadBe32(base, g_teleport.child + 72))
+    if (!IsGuestPointer(g_teleport.child) || !pdz::guestmem::Ok(base, g_teleport.child, 100) || // (Sun 22 Nov night, audit)
+        !LoadBe32(base, g_teleport.child + 72))
     {
       return;
     }
@@ -193,7 +205,7 @@ namespace
       const uint32_t old_matrix = rex::ppc::stack_push(ctx, base, g_teleport.old_matrix, 64);
       const uint32_t new_matrix = rex::ppc::stack_push(ctx, base, zero, 64);
       CallVirtual(ctx, base, character, kWorldMatrix, new_matrix);
-      for (uint32_t child = g_teleport.child; IsGuestPointer(child) && moved < 64;
+      for (uint32_t child = g_teleport.child; IsGuestPointer(child) && pdz::guestmem::Ok(base, child, 100) && moved < 64; // (Sun 22 Nov night, audit)
            child = LoadBe32(base, child + 96), ++moved)
       {
         CallObject(ctx, base, sub_82508F78, child);

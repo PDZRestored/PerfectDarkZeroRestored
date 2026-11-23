@@ -28,10 +28,12 @@
 #include "gpu_census.h"
 #include "gpu_sync.h"
 #include "pm4_skip.h"
+#include "game_pace.h" // PeekScene (pdz_native_skip_unused_pm4's level line)
 #include "native/native.h"
 #include "native/native_draw.h"
 #include "native/native_recthread.h"
 #include "cutscene_dump.h"
+#include "sign_lights.h"
 
 // Draw path
 REX_EXTERN(__imp__sub_826EA128); // D3DDevice_DrawIndexedVertices
@@ -99,35 +101,67 @@ namespace
 // DrawIndexedVertices(device, PrimitiveType, BaseVertexIndex, StartIndex, IndexCount)
 // r4 prim (-> r17), r5 base vertex (compared with/stored to +11540), r6 start
 // index (stack 284), r7 index count (-> r16).
+namespace
+{
+  // The hook's own work for one DrawIndexedVertices call (the registers hold the call's arguments).
+  void DrawIndexedVerticesOnce(PPCContext &ctx, uint8_t *base)
+  {
+    if (Enabled() && pdz::native::recthread::Active())
+    {
+      // pdz_native_record_thread: the record and the draw's copies queued; the worker draws (native_recthread.h).
+      pdz::native::recthread::OnDraw(base, Hook::kDrawIndexedVertices, Kind::kDrawIndexedVertices, ctx.r3.u32,
+                                     uint32_t(ctx.lr), ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32, 0, 0, 0, 0);
+    }
+    else if (Enabled())
+    {
+      pdz::native::RenderLock lock(pdz::native::RenderMutex()); // ring record + native call on one thread
+      Count(Hook::kDrawIndexedVertices);
+      DrawRecord &r = Record(base, ctx.r3.u32, Kind::kDrawIndexedVertices, uint32_t(ctx.lr),
+                             ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32, 0, 0);
+      if (pdz::native::Enabled())
+      {
+        pdz::native::OnDraw(base, r); // native/native_draw.h: the native draw from the same record
+      }
+    }
+    {
+      const pdz::timing::GuestCall guest_call; // pdz_frame_timing_phases: guest.d3d (drawcost)
+      __imp__sub_826EA128(ctx, base);
+    }
+    if (AssertEnabled())
+    {
+      const pdz::timing::OutsideScope assert_time(pdz::timing::Phase::kShadowAssert); // pdz_frame_timing_phases
+      AssertOnDrawReturn(base); // shadow_assert.h: VGT_DRAW_INITIATOR vs the record
+    }
+  }
+} // namespace
+
 REX_HOOK_RAW(sub_826EA128)
 {
   const pdz::gtsample::Mark sampler_mark(pdz::gtsample::Where::kD3dHook); // pdz_game_thread_profile
-  if (Enabled() && pdz::native::recthread::Active())
+  // pdz_fix_sign_lights (sign_lights.cpp): a self-lit sign whose light is out is drawn without its glow. Decided
+  // before anything reads the device, so both renderers draw it. Such a draw (rare: a sign's light has to be out) is
+  // made in parts, one call each with the glow constant scaled for that part and put back after it.
+  if (pdz::signfix::On())
   {
-    // pdz_native_record_thread: the record and the draw's copies queued; the worker draws (native_recthread.h).
-    pdz::native::recthread::OnDraw(base, Hook::kDrawIndexedVertices, Kind::kDrawIndexedVertices, ctx.r3.u32,
-                                   uint32_t(ctx.lr), ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32, 0, 0, 0, 0);
-  }
-  else if (Enabled())
-  {
-    pdz::native::RenderLock lock(pdz::native::RenderMutex()); // ring record + native call on one thread
-    Count(Hook::kDrawIndexedVertices);
-    DrawRecord &r = Record(base, ctx.r3.u32, Kind::kDrawIndexedVertices, uint32_t(ctx.lr),
-                           ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32, 0, 0);
-    if (pdz::native::Enabled())
+    pdz::signfix::Plan plan;
+    if (pdz::signfix::MakePlan(base, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32, &plan))
     {
-      pdz::native::OnDraw(base, r); // native/native_draw.h: the native draw from the same record
+      const uint64_t r3 = ctx.r3.u64, r4 = ctx.r4.u64, r5 = ctx.r5.u64, lr = ctx.lr;
+      const uint32_t device = ctx.r3.u32, start = ctx.r6.u32;
+      for (int i = 0; i < plan.parts; ++i)
+      {
+        pdz::signfix::Saved saved;
+        pdz::signfix::BeforePart(base, device, plan, i, &saved);
+        ctx.r3.u64 = r3, ctx.r4.u64 = r4, ctx.r5.u64 = r5, ctx.lr = lr;
+        ctx.r6.u64 = start + plan.part[i].start;
+        ctx.r7.u64 = plan.part[i].count;
+        DrawIndexedVerticesOnce(ctx, base);
+        pdz::signfix::AfterDraw(base, device, saved);
+      }
+      return;
     }
   }
-  {
-    const pdz::timing::GuestCall guest_call; // pdz_frame_timing_phases: guest.d3d (drawcost)
-    __imp__sub_826EA128(ctx, base);
-  }
-  if (AssertEnabled())
-  {
-    const pdz::timing::OutsideScope assert_time(pdz::timing::Phase::kShadowAssert); // pdz_frame_timing_phases
-    AssertOnDrawReturn(base); // shadow_assert.h: VGT_DRAW_INITIATOR vs the record
-  }
+  DrawIndexedVerticesOnce(ctx, base);
 }
 
 // DrawVertices(device, PrimitiveType, StartVertex, VertexCount)
@@ -430,6 +464,7 @@ REX_HOOK_RAW(sub_826DF960)
   const pdz::gtsample::Mark sampler_mark(pdz::gtsample::Where::kSwapHook);
   // frame_timing.h: closes the frame (pdz_frame_timing; independent of the switches below); the device for the spike
   // line's vblank count.
+  pdz::pm4skip::NoteScene(pdz::pace::PeekScene() == pdz::pace::Scene::kLevel); // pdz_native_skip_unused_pm4's level line
   pdz::timing::OnSwap(base, ctx.r3.u32);
   const uint32_t device = ctx.r3.u32, front_buffer = ctx.r4.u32;
   const bool sync = pdz::gpusync::Enabled(); // gpu_sync.h: Swap in / out for the sync log (pdz_sync_log, null GPU)

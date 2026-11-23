@@ -310,8 +310,36 @@ REX_HOOK_RAW(sub_8214E100)
 }
 
 // sub_826946A8(character, entry, ...): plays an animation entry on a character.
+#ifdef PDZ_COUNTEROP
+#include <rex/cvar.h>
+REXCVAR_DECLARE(bool, pdz_counterop_fix_gun_position); // counter_op_anim.cpp
+#define PDZ_EMPTY_PLAY_GUARD REXCVAR_GET(pdz_counterop_fix_gun_position)
+#else
+#define PDZ_EMPTY_PLAY_GUARD true
+#endif
+#ifdef PDZ_COUNTEROP
+void PdzRideAnimPlay(const uint8_t *base, uint32_t character, uint32_t entry, uint32_t caller); // counter_op_jetpack.cpp
+#endif
 REX_HOOK_RAW(sub_826946A8)
 {
+#ifdef PDZ_COUNTEROP
+  PdzRideAnimPlay(base, ctx.r3.u32, ctx.r4.u32, uint32_t(ctx.lr)); // Sun 22 Nov (item 6): the jetpack ride log
+#endif
+  // An empty entry always crashed (826947E0 -> 821EA0E0 reads entry +0x14: the Counter-Op hand test of 11 Nov, a
+  // human's gun position animation missing from a guard body's set): the play is left out and "not played" returned.
+  if (ctx.r4.u32 < 0x10000u && PDZ_EMPTY_PLAY_GUARD)
+  {
+    static int lines = 0;
+    if (lines < 16)
+    {
+      ++lines;
+      REXLOG_INFO("pdz_anim: play of an empty animation entry ({:08X}) on character {:08X} left out (caller {:08X}); "
+                  "Rare's code read it and crashed",
+                  ctx.r4.u32, ctx.r3.u32, uint32_t(ctx.lr));
+    }
+    ctx.r3.u64 = 0;
+    return;
+  }
   if (const uint32_t watched = bot_watch::Watched(); watched && watched == ctx.r3.u32)
   {
     const uint32_t entry = ctx.r4.u32;

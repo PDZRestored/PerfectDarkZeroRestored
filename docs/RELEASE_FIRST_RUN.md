@@ -234,7 +234,7 @@ Decided: the bind list ships, holding only hashes and vertex declaration formats
   - Embedded in the exe by CMake.
 - **The exe phase of the generator** binds each row's parent (the player's own container, the exe's first) with
   `binder::Bind`, checks the XXH3 hash, translates the result with the others, and writes `manifest.json` (bound VS
-  → parent) for the run-time sibling path.
+  â†’ parent) for the run-time sibling path.
 
 **Measured** (log 009, forced regeneration in `C:\Games\PDZ_FreshTest`):
 - 581 bound VS made, 0 the C++ binder didn't reproduce; the other 7 have DLC parents the test folder doesn't have.
@@ -605,3 +605,65 @@ the disc once the disc's data is laid out as TU3's:
   Datacore finished with the testing cvar `pdz_test_complete_mission`, then a restart choosing Nightclub): kept on the
   Platinum disc and on the US disc + TU3, and each one's save loads on the other (the same 6,144-byte `pdzsave.dat`).
   Not tested: saves made on a Platinum console.
+
+## Shader patches and variants made when the shader is created (12 Nov 2026, `pdz_native_shader_prepare`)
+
+**What it cures.** Single frames of 130-190 ms at a door or when a new area comes into view (Laboratory, 12 Nov; also seen in Counter-Op). Each was the render thread compiling pixel shaders with DXC in the frame that first
+drew them:
+
+- a pixel shader's first-draw patch (co-issue, PsParamGen, cube, rcpf, stacked array, live literals): one compile of
+  30-45 ms when `<shader dir>\coissue` does not hold it;
+- its 7e3 blend variant (`<shader dir>\blend7e3`) or depth20e4 variant (`<shader dir>\depth20e4`): another 10-45 ms.
+
+Two new pixel shaders in one frame are four compiles: about 150 ms. A level's first frame in a folder with empty
+caches was 1.0-1.7 s.
+
+**Why it showed so often.** The caches are per shader folder, and a developer's build keeps that folder beside the
+exe. Every new worktree build therefore starts with empty caches, while the daily build's folder had collected 2,215
+patches and 1,005 variants over weeks, which is why the stutter "never used to happen" there. Two things kept a new
+folder cold: a developer's build skips the pipeline list's first-start pass (`PrepareAtFirstStart`), and the shader
+preload cannot run the patch check there (the research shader folder has no microcode files), so both the patch and
+the variants were left to the first draw. A release is seeded from the pipeline list at its first start, so players
+only met the compiles for pixel shaders the list does not name.
+
+**What it does.** The `CreatePixelShader` hook (`shadow_record.cpp`) copies the shader's container (header block and
+microcode) and queues it once per microcode hash (`pipeline_seed::NotePixelShaderCreated`). The render thread takes
+the queue a little per step (`pipeline_seed::PrepareStep`, about 1 ms a step, 0.4 ms a shader): it loads the shader
+and runs the patch check and the variant builders on a copy while `depth20e4::ahead` collects, so instead of
+compiling they hand each source and its cache file path to one to four worker threads (a quarter of the logical
+processors, below normal priority). A worker compiles with its own compiler and the same arguments and writes the
+cache file under a temporary name, then renames it. The shader's first draw runs the normal path and finds the files
+in the disk cache.
+
+- A draw that comes before its compile is finished waits for it if a worker is on it, and compiles it itself (as
+  before) if no worker has started it: never worse than without the switch.
+- Variants prepared: the ones the pipeline list names for the shader. For a pixel shader the list does not know,
+  mode 2 also prepares the 7e3 alpha-clamp variant (whether a draw will blend into the HDR target with it is not
+  known at creation), behind everything else in the queue. About 12 KB of cache each.
+- Nothing prepared is kept in memory: the counters of the patch check are put back, and the draw's own first use
+  counts the shader as before.
+
+**Switch.** `pdz_native_shader_prepare`: 2 (default) as above; 1 without the extra 7e3 variants; 0 off (compiles at
+first use, as before). One `pdz_native: shader prepare:` line per burst of new shaders (a level's shaders arrive
+together while it loads) with the workers' and the draws' counts.
+
+**Same picture.** The sources, the compiler, its arguments and the cache file names are the ones the first draw
+used. Checked: the 356 patch and variant files a run with first-use compiles left in its folder are byte for byte the
+files the workers wrote in another folder (which holds 210 more, 1.3 MB, for shaders that tour never drew).
+
+**Measured** (Laboratory, a scripted tour of the route walked on 12 Nov, 121 stops, each build folder never run
+before): level frames over 40 ms 22 -> 4, worst frame 1,709 -> 108 ms, compile time on the render thread 5.9 s -> 0.
+With only the shader caches empty: 23 -> 2, worst 1,723 -> 72 ms. Warm: 2 (the level's first two frames, 47 and 51 ms).
+0.9.4, the 0.9.2.1-era build and a later branch give the same 22-26 frames with empty caches, also at
+`--log_level=critical`: not a regression and not the logging. Lab's 270 pixel shaders are created in the last second of loading; the
+workers had 329 sources waiting at the first frame and no draw had to compile one.
+
+**What still gives a slow frame in a new folder** (not shader compiles): the level's first frame (pipelines taken
+from the library and about 21 MB of textures: 108 ms); a first view with many new pipelines and textures at once (the
+main hall: 41 ms); bound vertex shader variants met for the first time, translated while the draw waits (10-16 ms
+each, three in one frame at the water: 86 ms; four in the whole tour).
+
+**Finding the item.** `pdz_frame_timing_item_ms` (default 3, with the spike log on): one `pdz_timing: slow item` line
+for each piece of first-use work on the render thread that took at least that long (a pixel shader's first use with
+its compiles, a variant, a pipeline, a GPU resource), with size and type. `pdz_frame_timing_spike_file`: the spikes
+as short lines in a side file, for runs at `--log_level=critical`.

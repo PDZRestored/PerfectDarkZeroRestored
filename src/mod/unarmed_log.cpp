@@ -236,6 +236,12 @@ namespace
                   "away",
                   g_ap.next + 1, px, LoadF(base, player + 52), pz, d);
     }
+    static uint32_t frames = 0;
+    if (++frames % 120 == 0)
+    {
+      REXLOG_INFO("pdz_test_autopilot: at ({:.0f} {:.0f} {:.0f}), {:.0f} cm from waypoint {} of {}", px,
+                  LoadF(base, player + 52), pz, d, g_ap.next + 1, g_ap.points.size());
+    }
     rex::CallFrame frame(ctx);
     frame.ctx.r3.u64 = player;
     frame.ctx.f1.f64 = 0.0;

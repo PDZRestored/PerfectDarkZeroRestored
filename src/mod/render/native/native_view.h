@@ -31,10 +31,18 @@ namespace pdz::native::view
     static constexpr uint32_t kMaxRanges = 32;
     Range ranges[kMaxRanges];
     uint32_t count = 0;
+    // pdz_native_view_first (13 Nov): a later range overlaps the first one (the device mirror). While none does, an
+    // address inside the first range can only be found there, so Find may look there first.
+    bool first_overlapped = false;
     void Add(uint32_t guest, uint32_t bytes, const uint8_t *host)
     {
       if (count < kMaxRanges && bytes)
       {
+        if (count > 0 && uint64_t(guest) < uint64_t(ranges[0].guest) + ranges[0].bytes &&
+            uint64_t(ranges[0].guest) < uint64_t(guest) + bytes)
+        {
+          first_overlapped = true;
+        }
         ranges[count++] = {guest, bytes, host};
       }
     }
@@ -42,6 +50,12 @@ namespace pdz::native::view
 
   // Set by the record thread around each command (nullptr otherwise).
   inline thread_local const View *t_view = nullptr;
+
+  // pdz_native_view_first (latched at startup by the record thread; docs/CPU_STUDY_2.md): Find tries the first range
+  // (the device mirror: most reads are device fields, and it is the last one the backward scan reaches) before the
+  // scan. The same pointer as the scan gives: with no later range overlapping the first, no later range can hold an
+  // address range that the first one holds.
+  inline bool g_first_range_first = false;
 
   // The copy holding [guest, guest + bytes), or nullptr. Later ranges win (a command's own copies are added after the
   // device mirror).
@@ -51,6 +65,14 @@ namespace pdz::native::view
     if (!v)
     {
       return nullptr;
+    }
+    if (g_first_range_first && v->count && !v->first_overlapped)
+    {
+      const Range &r = v->ranges[0];
+      if (guest >= r.guest && uint64_t(guest) + bytes <= uint64_t(r.guest) + r.bytes)
+      {
+        return r.host + (guest - r.guest);
+      }
     }
     for (uint32_t i = v->count; i-- > 0;)
     {

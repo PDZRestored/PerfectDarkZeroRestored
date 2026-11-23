@@ -6,9 +6,12 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
@@ -27,6 +30,7 @@
 #include <rex/logging.h>
 
 #include "native_depth20e4_hlsl.h"
+#include "../frame_timing.h" // pdz_frame_timing_item_ms: the slow item lines
 
 REXCVAR_DEFINE_INT32(pdz_native_depth20e4, 1, "Render",
                      "Native renderer: guest float24 (20e4) depth in the pixel shader for draws into a D24FS8 depth "
@@ -201,6 +205,212 @@ namespace pdz::native::depth20e4
       return true;
     }
 
+    // Compiles ahead of the draw (ahead::, pdz_native_shader_prepare, Thu 12 Nov hitch hunt). While the render thread
+    // collects (ahead::Begin .. End), every compile of CompilePixelShader / Variant() hands its source and cache file
+    // path to a few low-priority workers instead and returns the placeholder; a worker compiles it with its own
+    // compiler and writes the cache file (temporary name, then renamed), so the draw's first use finds it in the disk
+    // cache. A draw that comes before its job is done waits for it (running) or compiles it itself as before (not
+    // started). The state is never destroyed: the workers are detached.
+    struct AheadJob
+    {
+      std::string source, cache_path;
+      std::vector<uint8_t> dxil; // kept only when the cache file could not be written
+      int state = 0;             // 0 queued, 1 compiling, 2 done, 3 failed
+    };
+    struct Ahead
+    {
+      std::mutex mutex;
+      std::condition_variable work, done;
+      std::unordered_map<uint64_t, std::shared_ptr<AheadJob>> jobs; // by XXH3 of the source
+      std::deque<uint64_t> queue, queue_low;
+      uint32_t threads = 0, running = 0;
+      uint32_t queued = 0, compiled = 0, failed = 0, written = 0, taken_done = 0, taken_waited = 0, taken_inline = 0;
+      double compile_ms = 0.0, waited_ms = 0.0, waited_max_ms = 0.0;
+    };
+    Ahead &AheadState()
+    {
+      static Ahead *a = new Ahead();
+      return *a;
+    }
+    bool g_ahead_collecting = false; // render thread
+    bool g_ahead_low = false;        // what is collected now goes behind the rest (the 7e3 variants nothing asked for yet)
+    std::atomic<bool> g_ahead_any{false};
+
+    // The cache file under a temporary name, then renamed: a reader never sees half a file.
+    bool WriteCacheFileAtomic(const std::string &path, const std::vector<uint8_t> &bytes)
+    {
+      if (path.empty())
+      {
+        return false;
+      }
+      std::error_code ec;
+      std::filesystem::create_directories(DirOf(path), ec);
+      const std::string tmp = fmt::format("{}.{}.tmp", path, GetCurrentThreadId());
+      {
+        std::ofstream f(tmp, std::ios::binary);
+        if (!f)
+        {
+          return false;
+        }
+        f.write(reinterpret_cast<const char *>(bytes.data()), std::streamsize(bytes.size()));
+        if (!f)
+        {
+          f.close();
+          DeleteFileA(tmp.c_str());
+          return false;
+        }
+      }
+      if (!MoveFileExA(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING))
+      {
+        DeleteFileA(tmp.c_str());
+        return false;
+      }
+      return true;
+    }
+
+    bool CompileWith(IDxcCompiler3 *compiler, const std::string &source, std::vector<uint8_t> &out, std::string &errors);
+
+    void AheadWorker()
+    {
+      SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+      Ahead &a = AheadState();
+      IDxcCompiler3 *c = nullptr;
+      auto create = reinterpret_cast<DxcCreateInstanceProc>(dxc::CreateProc());
+      if (!create || FAILED(create(CLSID_DxcCompiler, __uuidof(IDxcCompiler3), reinterpret_cast<void **>(&c))) || !c)
+      {
+        return; // the jobs stay queued: the draws compile them as before
+      }
+      for (;;)
+      {
+        std::shared_ptr<AheadJob> job;
+        {
+          std::unique_lock<std::mutex> lock(a.mutex);
+          a.work.wait(lock, [&] { return !a.queue.empty() || !a.queue_low.empty(); });
+          std::deque<uint64_t> &q = !a.queue.empty() ? a.queue : a.queue_low;
+          const uint64_t h = q.front();
+          q.pop_front();
+          auto it = a.jobs.find(h);
+          if (it == a.jobs.end() || it->second->state != 0)
+          {
+            continue; // a draw took it meanwhile
+          }
+          job = it->second;
+          job->state = 1;
+          ++a.running;
+        }
+        std::vector<uint8_t> out;
+        std::string errors;
+        const auto t0 = std::chrono::steady_clock::now();
+        const bool ok = CompileWith(c, job->source, out, errors);
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        const bool wrote = ok && WriteCacheFileAtomic(job->cache_path, out);
+        {
+          std::lock_guard<std::mutex> lock(a.mutex);
+          --a.running;
+          a.compile_ms += ms;
+          if (ok)
+          {
+            ++a.compiled;
+            a.written += wrote ? 1 : 0;
+            if (!wrote)
+            {
+              job->dxil = std::move(out);
+            }
+            job->state = 2;
+          }
+          else
+          {
+            ++a.failed; // the draw compiles it again and logs why
+            job->state = 3;
+          }
+          std::string().swap(job->source);
+        }
+        a.done.notify_all();
+      }
+    }
+
+    // Render thread, collecting: the source for the workers (once per source).
+    void AheadQueue(const std::string &source, const std::string *cache_path)
+    {
+      if (!cache_path || cache_path->empty())
+      {
+        return;
+      }
+      const uint64_t h = XXH3_64bits(source.data(), source.size());
+      Ahead &a = AheadState();
+      {
+        std::lock_guard<std::mutex> lock(a.mutex);
+        if (a.jobs.count(h))
+        {
+          return;
+        }
+        auto job = std::make_shared<AheadJob>();
+        job->source = source;
+        job->cache_path = *cache_path;
+        a.jobs.emplace(h, std::move(job));
+        (g_ahead_low ? a.queue_low : a.queue).push_back(h);
+        ++a.queued;
+        if (!a.threads)
+        {
+          // A quarter of the logical processors, 1 to 4, below normal priority: the game keeps its cores.
+          a.threads = std::clamp(std::thread::hardware_concurrency() / 4, 1u, 4u);
+          for (uint32_t t = 0; t < a.threads; ++t)
+          {
+            std::thread(AheadWorker).detach();
+          }
+        }
+      }
+      g_ahead_any.store(true, std::memory_order_relaxed);
+      a.work.notify_one();
+    }
+
+    // Render thread, a real compile: the workers' result for this source when there is one. False: compile here.
+    bool AheadTake(const std::string &source, std::vector<uint8_t> &out)
+    {
+      const uint64_t h = XXH3_64bits(source.data(), source.size());
+      Ahead &a = AheadState();
+      std::unique_lock<std::mutex> lock(a.mutex);
+      auto it = a.jobs.find(h);
+      if (it == a.jobs.end())
+      {
+        return false;
+      }
+      std::shared_ptr<AheadJob> job = it->second;
+      if (job->state == 0)
+      {
+        a.jobs.erase(it); // not started: compiled here, now, as before (the worker skips the missing job)
+        ++a.taken_inline;
+        return false;
+      }
+      if (job->state == 1)
+      {
+        const auto t0 = std::chrono::steady_clock::now();
+        a.done.wait(lock, [&] { return job->state >= 2; });
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        ++a.taken_waited;
+        a.waited_ms += ms;
+        a.waited_max_ms = std::max(a.waited_max_ms, ms);
+      }
+      if (job->state != 2)
+      {
+        return false; // failed on the worker: compiled here, so the error is logged as before
+      }
+      ++a.taken_done;
+      if (!job->dxil.empty())
+      {
+        out = job->dxil;
+        return true;
+      }
+      const std::string path = job->cache_path;
+      lock.unlock();
+      if (!ReadBinary(path, out) || !IsSignedContainer(out))
+      {
+        out.clear();
+        return false;
+      }
+      return true;
+    }
+
     // dxcompiler.dll from the fork's build. dxil.dll is loaded first by full path: dxcompiler loads "dxil.dll" by
     // name to validate and sign, and an already loaded module of that name is what the loader returns.
     struct Compiler
@@ -238,11 +448,18 @@ namespace pdz::native::depth20e4
         return false;
       }
 
-      bool Compile(const std::string &source, std::vector<uint8_t> &out, std::string &errors)
+      bool Compile(const std::string &source, std::vector<uint8_t> &out, std::string &errors,
+                   const std::string *cache_path = nullptr)
       {
         if (g_batch.collecting)
         {
           g_batch.sources.emplace(XXH3_64bits(source.data(), source.size()), source);
+          out.assign(kCollectPlaceholder, kCollectPlaceholder + sizeof(kCollectPlaceholder));
+          return true;
+        }
+        if (g_ahead_collecting)
+        {
+          AheadQueue(source, cache_path); // pdz_native_shader_prepare: compiled on a worker, into the cache file
           out.assign(kCollectPlaceholder, kCollectPlaceholder + sizeof(kCollectPlaceholder));
           return true;
         }
@@ -254,6 +471,10 @@ namespace pdz::native::depth20e4
             out = it->second; // kept until batch::Clear (two shaders may share a source)
             return true;
           }
+        }
+        if (g_ahead_any.load(std::memory_order_relaxed) && AheadTake(source, out))
+        {
+          return true; // the workers' compile of this source (waited for if it was still running)
         }
         ++compiles;
         return CompileWith(compiler, source, out, errors);
@@ -370,12 +591,49 @@ namespace pdz::native::depth20e4
     }
     const bool depth_only = ps->dxil.empty();
     const uint64_t key = depth_only ? 0 : ps->hash;
+    if (g_ahead_collecting)
+    {
+      // pdz_native_shader_prepare: only the source goes to the workers (unless the cache file is there already);
+      // nothing is kept or counted here, the draw's own call builds the variant from the cache file.
+      std::string why, source;
+      if (depth_only)
+      {
+        source = DepthOnlySource(edge);
+      }
+      else if (!ps->coissue_hlsl.empty())
+      {
+        source = BuildVariantSource(ps->coissue_hlsl, why, edge);
+      }
+      else
+      {
+        const std::string path = FindHlsl(ps);
+        std::string hlsl;
+        if (!path.empty() && ReadText(path, hlsl))
+        {
+          source = BuildVariantSource(hlsl, why, edge);
+        }
+      }
+      if (!source.empty() && !g_stats.compiler_failed && g_compiler.Init())
+      {
+        const std::string cache_path = fmt::format("{}\\depth20e4\\{:016x}_{:016x}.dxil", ShaderCache::Get().directory(),
+                                                   key, XXH3_64bits(source.data(), source.size()));
+        if (!FileExists(cache_path))
+        {
+          std::vector<uint8_t> placeholder;
+          std::string errors;
+          g_compiler.Compile(source, placeholder, errors, &cache_path);
+        }
+      }
+      return nullptr;
+    }
     std::unordered_map<uint64_t, Entry> &variants = g_variants[edge];
     auto it = variants.find(key);
     if (it != variants.end())
     {
       return it->second.failed ? nullptr : &it->second.dxil;
     }
+    const double item_t0 = pdz::timing::SpikeOn() ? pdz::timing::ItemClockMs() : 0.0;
+    const uint32_t item_compiles = g_compiler.compiles;
     Entry &e = variants[key];
     e.failed = true;
     std::string why, source;
@@ -475,6 +733,21 @@ namespace pdz::native::depth20e4
                   e.dxil.size(), from_disk ? "read from the disk cache" : "compiled", ms,
                   g_stats.built == kLogBuilds ? "; further builds only in the periodic counters" : "");
     }
+    if (item_t0 != 0.0)
+    {
+      // pdz_frame_timing_item_ms: the whole first use (source, cache read or compile).
+      const double item_ms = pdz::timing::ItemClockMs() - item_t0;
+      if (pdz::timing::SlowItemWanted(item_ms))
+      {
+        pdz::timing::SlowItem("depth20e4 variant", item_ms,
+                              fmt::format("ps {:016x} edge {}: {} ({} bytes of source, {} bytes DXIL)", key, edge,
+                                          from_disk ? "read from the disk cache"
+                                                    : (g_compiler.compiles != item_compiles
+                                                           ? "COMPILED on the render thread (not in the disk cache)"
+                                                           : "taken from the prepare workers"),
+                                          source.size(), e.dxil.size()));
+      }
+    }
     return &e.dxil;
   }
 
@@ -505,7 +778,8 @@ namespace pdz::native::depth20e4
                 key, why);
   }
 
-  bool CompilePixelShader(const std::string &source, std::vector<uint8_t> &dxil, std::string &errors)
+  bool CompilePixelShader(const std::string &source, std::vector<uint8_t> &dxil, std::string &errors,
+                          const std::string *cache_path)
   {
     dxil.clear();
     if (g_stats.compiler_failed || !g_compiler.Init())
@@ -513,7 +787,7 @@ namespace pdz::native::depth20e4
       errors = "no shader compiler (dxcompiler.dll + dxil.dll, see pdz_native_dxc_dir)";
       return false;
     }
-    return g_compiler.Compile(source, dxil, errors);
+    return g_compiler.Compile(source, dxil, errors, cache_path);
   }
 
   bool IsSignedDxil(const std::vector<uint8_t> &dxil) { return IsSignedContainer(dxil); }
@@ -562,7 +836,7 @@ namespace pdz::native::depth20e4
       g_first_use_logged = 0;
     }
 
-    bool Collecting() { return g_batch.collecting; }
+    bool Collecting() { return g_batch.collecting || g_ahead_collecting; }
 
     Result CompileCollected(uint32_t threads)
     {
@@ -657,6 +931,62 @@ namespace pdz::native::depth20e4
       }
     }
   } // namespace batch
+
+  namespace ahead
+  {
+    bool Begin(bool low_priority)
+    {
+      if (g_batch.collecting || g_stats.compiler_failed || !g_compiler.Init())
+      {
+        return false;
+      }
+      g_ahead_collecting = true;
+      g_ahead_low = low_priority;
+      return true;
+    }
+
+    void End()
+    {
+      g_ahead_collecting = false;
+      g_ahead_low = false;
+    }
+
+    bool Collecting() { return g_ahead_collecting; }
+
+    uint32_t Pending()
+    {
+      if (!g_ahead_any.load(std::memory_order_relaxed))
+      {
+        return 0;
+      }
+      Ahead &a = AheadState();
+      std::lock_guard<std::mutex> lock(a.mutex);
+      return a.queued - a.compiled - a.failed - a.taken_inline;
+    }
+
+    Counters GetCounters()
+    {
+      Counters c;
+      if (!g_ahead_any.load(std::memory_order_relaxed))
+      {
+        return c;
+      }
+      Ahead &a = AheadState();
+      std::lock_guard<std::mutex> lock(a.mutex);
+      c.threads = a.threads;
+      c.queued = a.queued;
+      c.compiled = a.compiled;
+      c.failed = a.failed;
+      c.written = a.written;
+      c.taken_done = a.taken_done;
+      c.taken_waited = a.taken_waited;
+      c.taken_inline = a.taken_inline;
+      c.compile_ms = a.compile_ms;
+      c.waited_ms = a.waited_ms;
+      c.waited_max_ms = a.waited_max_ms;
+      return c;
+    }
+  } // namespace ahead
 
   void PreloadCompiler()
   {

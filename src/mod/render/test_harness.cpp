@@ -29,9 +29,12 @@
 //                                            pad-only press never waits in the keystroke queue through a loading
 //                                            screen)
 //   stick  <t> <duration> <lx> <ly> [rx ry]  thumbsticks (-32768..32767) for duration seconds
+//   trigger <t> <duration> <lt> [rt]          analog triggers (0..255) for duration seconds (pad state only; Sat 21 Nov)
 //   p2 <any of the above>                    the same for a second pad, user index 1
 //   p2 signin <t> [name]                     from t on, user 1 is a signed-in local profile (default "Player 2")
-//   cvar   <t> <name> <value>                at t, sets a hot-reload cvar by name (rex::cvar::SetFlagByName), logged
+//   p2 unplug <t0> <t1>                      pad 2 switches itself off at t0 and is back at t1 (one per script;
+//                                            see 'p2 unplug' below)
+//   cvar   <t> <name> <value>               at t, sets a hot-reload cvar by name (rex::cvar::SetFlagByName), logged
 //                                            'pdz_test: t=... cvar <name> = <value>': A/B of a setting at one view in
 //                                            one run (shadows 2: bias / PCF / stable cascades side by side)
 // Buttons: A B X Y START BACK LB RB LT RT UP DOWN LEFT RIGHT LS RS, joined with '+' (e.g. A+START).
@@ -53,6 +56,20 @@
 // update (sub_8250AD20) then joins it (sub_82472858), as on a console when a second player signs in at the lobby.
 // t = 0 signs user 1 in from boot (the SDK's start-up notifications trigger the scan); a START on pad 2 in the lobby
 // then joins (sub_82472E98). Profile settings reads / writes for user 1 still fail in the SDK (NO_SUCH_USER).
+//
+// p2 unplug <t0> <t1> (Fri 20 Nov night, play log 031: player 2's controller switched itself off in a Counter-Op
+// level): from t0 to t1 pad 2 looks like a real controller that turned off, as the SDK's InputSystem::
+// UpdateConnectedUser(1, false / true) and xam_user.cpp IsLocalGuest make it: XInputGetState(1) and
+// XInputGetCapabilities(1) answer ERROR_DEVICE_NOT_CONNECTED (0x48F, the state left as it was), pad 2's due
+// keystrokes are dropped, and user 1 is not signed in: XamUserGetSigninState(1) = 0, XamUserGetName(1) =
+// X_E_NO_SUCH_USER, sub_82ADA4A8(1) = XUID 0 and 0x525 (the 'p2 signin' answers stop, and a real local guest's are
+// overridden). At t0 and again at t1 XN_SYS_INPUTDEVICESCHANGED (0x12, 0) then XN_SYS_SIGNINCHANGED (0xA, 1 << 1)
+// are broadcast, so Rare's profile task (sub_8250A340) rescans: at t0 user 1 reads "not signed in" while his profile
+// (+0x26DF) is still signed in, the case pdz_counterop_pad_drop_hold (counter_op_pads.cpp) holds the task for; at t1
+// he is signed in again with the same name and XUID. With pdz_test_pad_driver the script's pad 2 device leaves the
+// SDK's enumeration instead (ScriptedPadPresent(1) false), so the SDK itself disconnects user 1, signs its guest
+// out and broadcasts (its XN_SYS_SIGNINCHANGED needs local_guest_users). Logs 'pdz_test: p2 unplug: ...' at t0
+// and t1.
 //
 // Saves: the harness does not touch the save path itself; scripted runs are launched with --user_data_root on a
 // throwaway copy (PDZRenderResearch\native\testdata\userdata), so anything the game saves lands there. The SDK's
@@ -103,6 +120,12 @@ REXCVAR_DEFINE_BOOL(pdz_test_log_xui, false, "Render",
                     "(sub_8278DCA8), the MISSION SELECT cursor / choice (sub_8227AD78) and the game's message boxes "
                     "(sub_82400EE0 / sub_82400DB0), with the script time ('pdz_test: t=..s scene / xui keystroke / "
                     "mission select / notification'). Off = no work beyond the cvar read.");
+
+REXCVAR_DECLARE(bool, pdz_test_pad_driver); // test_pad_driver.cpp
+#if PDZ_COUNTEROP
+bool PdzCounterOpTestSeek(uint32_t pad, int16_t sticks[4], uint8_t &rt); // counter_op.cpp (pdz_counterop_test_seek)
+void PdzCounterOpRiverTestPad(uint8_t *base, uint32_t user, uint32_t state); // counter_op_river.cpp (round 13b r: pdz_counterop_test_river_agent_drive)
+#endif
 
 REX_EXTERN(__imp__sub_82AD4A18); // XInputGetState(user, state) -> XamInputGetState(user, 0, state)
 REX_EXTERN(__imp__sub_82AD4A10); // XInputGetCapabilities(user, flags, caps) -> XamInputGetCapabilities (no TU3 caller)
@@ -164,6 +187,10 @@ namespace pdz::test
       double signin_t = 0.0;
       std::string signin_name = "Player 2";
       std::atomic<bool> signin_broadcast{false}, signin_reported{false};
+      // 'p2 unplug <t0> <t1>': phase 0 before t0, 1 unplugged (t0 passed), 2 back (t1 passed).
+      bool unplug = false;
+      double unplug_t0 = 0.0, unplug_t1 = 0.0;
+      std::atomic<int> unplug_phase{0};
       // 'cvar <t> <name> <value>', in time order; applied by user 0's input poll (the game thread).
       struct CvarSet
       {
@@ -333,6 +360,20 @@ namespace pdz::test
             pad.events.push_back(e);
           }
         }
+        else if (cmd == "trigger")
+        {
+          // Sat 21 Nov (spectate job): analog triggers for a duration (0..255 each; pad state only, no keystrokes):
+          // the audioscope's zoom follows how far the left trigger is pulled.
+          double dur = 0;
+          int lt = 0, rt = 0;
+          ok = bool(ls >> e.t0 >> dur >> lt);
+          ls >> rt;
+          e.t1 = e.t0 + dur;
+          e.keys = false;
+          e.lt = uint8_t(std::clamp(lt, 0, 255));
+          e.rt = uint8_t(std::clamp(rt, 0, 255));
+          if (ok) pad.events.push_back(e);
+        }
         else if (cmd == "stick")
         {
           double dur = 0;
@@ -367,6 +408,17 @@ namespace pdz::test
           }
           s.signin = ok;
         }
+        else if (cmd == "unplug" && p == 1)
+        {
+          double t0 = 0.0, t1 = 0.0;
+          ok = bool(ls >> t0 >> t1) && t0 >= 0.0 && t1 > t0;
+          if (ok)
+          {
+            s.unplug = true;
+            s.unplug_t0 = t0;
+            s.unplug_t1 = t1;
+          }
+        }
         else
         {
           ok = false;
@@ -387,6 +439,11 @@ namespace pdz::test
                   s.has_p2 ? fmt::format("; pad 2 (user 1, connected): {} timed events, {} keystrokes",
                                          s.pads[1].events.size(), s.pads[1].keys.size())
                            : std::string());
+      if (s.unplug)
+      {
+        REXLOG_INFO("pdz_test: p2 unplug: pad 2 switches off at t={:.1f}s and is back at t={:.1f}s", s.unplug_t0,
+                    s.unplug_t1);
+      }
       if (s.signin)
       {
         std::string root;
@@ -435,6 +492,58 @@ namespace pdz::test
       REXLOG_INFO("pdz_test: t={:.1f}s user 1 signed in as '{}': XN_SYS_SIGNINCHANGED broadcast", t, s.signin_name);
     }
 
+    // 'p2 unplug <t0> <t1>': pad 2 is switched off right now (t0 passed, t1 not yet).
+    bool SecondPadUnplugged()
+    {
+      const Script &s = g_script;
+      return s.unplug && s.unplug_phase.load(std::memory_order_acquire) == 1;
+    }
+
+    // 'p2 unplug': the switch-off at t0 and the return at t1, once each (several in one call when a long load
+    // passed both), as UpdateConnectedUser on a real disconnect / reconnect: the state flips first, then
+    // XN_SYS_INPUTDEVICESCHANGED and XN_SYS_SIGNINCHANGED (user 1's bit). With pdz_test_pad_driver the SDK sees
+    // the device leave / return and broadcasts itself.
+    void UpdateUnplug(double t)
+    {
+      Script &s = g_script;
+      if (!s.unplug)
+      {
+        return;
+      }
+      int phase = s.unplug_phase.load(std::memory_order_acquire);
+      while (phase < 2 && t >= (phase == 0 ? s.unplug_t0 : s.unplug_t1))
+      {
+        if (!s.unplug_phase.compare_exchange_strong(phase, phase + 1, std::memory_order_acq_rel))
+        {
+          continue; // another thread moved it on; phase now holds its value
+        }
+        ++phase;
+        const bool driver = REXCVAR_GET(pdz_test_pad_driver);
+        if (!driver)
+        {
+          if (rex::system::KernelState *ks = REX_KERNEL_STATE())
+          {
+            ks->BroadcastNotification(0x00000012, 0);   // XN_SYS_INPUTDEVICESCHANGED
+            ks->BroadcastNotification(0x0000000A, 0x2); // XN_SYS_SIGNINCHANGED, user 1's bit
+          }
+        }
+        const char *how = driver ? "the script's pad 2 device leaves / rejoins the SDK's enumeration (the SDK "
+                                   "broadcasts)"
+                                 : "XN_SYS_INPUTDEVICESCHANGED + XN_SYS_SIGNINCHANGED (1 << 1) broadcast";
+        if (phase == 1)
+        {
+          REXLOG_INFO("pdz_test: p2 unplug: t={:.1f}s pad 2 switched off: XInputGetState(1) / "
+                      "XInputGetCapabilities(1) = ERROR_DEVICE_NOT_CONNECTED, user 1 not signed in; {}",
+                      t, how);
+        }
+        else
+        {
+          REXLOG_INFO("pdz_test: p2 unplug: t={:.1f}s pad 2 back: connected, user 1 signed in as before; {}", t,
+                      how);
+        }
+      }
+    }
+
     inline uint16_t Load16BE(uint8_t *base, uint32_t address)
     {
       const uint8_t *p = pdz::shadow::GuestPtr(base, address);
@@ -468,9 +577,9 @@ namespace pdz::test
     // went out, so the profile task's rescan is what first sees it).
     bool SecondUserSignedIn()
     {
-      if (!InputScriptActive())
+      if (!InputScriptActive() || REXCVAR_GET(pdz_test_pad_driver))
       {
-        return false;
+        return false; // pdz_test_pad_driver: the SDK signs user 1 in itself while his device is connected
       }
       EnsureLoaded();
       Script &s = g_script;
@@ -482,11 +591,27 @@ namespace pdz::test
       {
         return false;
       }
+      if (SecondPadUnplugged())
+      {
+        return false; // 'p2 unplug': signed out while the pad is away
+      }
       if (!s.signin_reported.exchange(true))
       {
         REXLOG_INFO("pdz_test: user 1 reported signed in locally as '{}'", s.signin_name);
       }
       return true;
+    }
+
+    // 'p2 unplug' without pdz_test_pad_driver: user 1 must read "not signed in" right now, also over a real local
+    // guest's answers (with the pad driver the SDK's own guest goes with the device).
+    bool SecondUserUnplugged()
+    {
+      if (!InputScriptActive() || REXCVAR_GET(pdz_test_pad_driver))
+      {
+        return false;
+      }
+      EnsureLoaded();
+      return !g_script.failed && SecondPadUnplugged();
     }
   } // namespace
 
@@ -528,6 +653,103 @@ namespace pdz::test
   }
 
   uint32_t ScriptedPresses() { return g_script.pads[0].presses_applied + g_script.pads[1].presses_applied; }
+
+  // pdz_test_pad_driver (test_pad_driver.cpp): the scripted state of pad 0 / 1 right now, for the SDK input driver
+  // that stands in for two real controllers (called on the SDK's input polls, any thread; the events never change
+  // after the load). The 'cvar' lines and the press log are handled here in this mode (pad 0's poll).
+  struct PadNow
+  {
+    uint16_t buttons = 0;
+    uint8_t lt = 0, rt = 0;
+    int16_t sticks[4] = {};
+  };
+  bool PadDriverMode() { return REXCVAR_GET(pdz_test_pad_driver) && InputScriptActive(); }
+  bool ScriptedPadPresent(uint32_t pad)
+  {
+    if (pad > 1 || !InputScriptActive())
+    {
+      return false;
+    }
+    EnsureLoaded();
+    if (pad == 1 && !g_script.failed && g_script.unplug)
+    {
+      // 'p2 unplug' with pdz_test_pad_driver: the device is absent from t0 to t1 (RefreshDevices on each SDK input
+      // poll then runs UpdateConnectedUser(1, false / true) itself).
+      UpdateUnplug(ScriptTime());
+      if (SecondPadUnplugged())
+      {
+        return false;
+      }
+    }
+    return !g_script.failed && (pad == 0 || g_script.has_p2);
+  }
+  bool ScriptedPadState(uint32_t pad_index, PadNow &out)
+  {
+    if (!ScriptedPadPresent(pad_index))
+    {
+      return false;
+    }
+    static std::mutex mutex;
+    std::lock_guard lock(mutex);
+    Script &s = g_script;
+    const double t = ScriptTime();
+    if (pad_index == 0)
+    {
+      while (s.next_cvar < s.cvars.size() && t >= s.cvars[s.next_cvar].t)
+      {
+        const Script::CvarSet &c = s.cvars[s.next_cvar++];
+        rex::cvar::SetFlagByName(c.name, c.value);
+        REXLOG_INFO("pdz_test: t={:.2f} cvar {} = {} (script; now {})", t, c.name, c.value,
+                    rex::cvar::GetFlagByName(c.name));
+      }
+    }
+    Pad &pad = s.pads[pad_index];
+    for (const Event &e : pad.events)
+    {
+      if (t >= e.t0 && t < e.t1)
+      {
+        out.buttons |= e.buttons;
+        out.lt = std::max(out.lt, e.lt);
+        out.rt = std::max(out.rt, e.rt);
+        if (e.sticks)
+        {
+          out.sticks[0] = e.lx;
+          out.sticks[1] = e.ly;
+          out.sticks[2] = e.rx;
+          out.sticks[3] = e.ry;
+        }
+      }
+    }
+#if PDZ_COUNTEROP
+    {
+      // pdz_counterop_test_seek: sticks / trigger worked out by the Counter-Op tick, out through this pad.
+      int16_t seek[4] = {};
+      uint8_t seek_rt = 0;
+      if (PdzCounterOpTestSeek(pad_index, seek, seek_rt))
+      {
+        std::memcpy(out.sticks, seek, sizeof(seek));
+        out.rt = std::max(out.rt, seek_rt);
+      }
+    }
+#endif
+    const uint64_t key = (uint64_t(out.buttons) << 48) ^ (uint64_t(out.lt) << 40) ^ (uint64_t(out.rt) << 32);
+    if (key != pad.last_key)
+    {
+      pad.last_key = key;
+      if (out.buttons || out.lt || out.rt)
+      {
+        ++pad.presses_applied;
+        if (t - pad.last_logged_t > 0.5)
+        {
+          pad.last_logged_t = t;
+          REXLOG_INFO("pdz_test: t={:.1f}s scripted buttons {:04X} lt {} rt {} on script pad {} (an SDK input device: "
+                      "pdz_test_pad_driver)",
+                      t, out.buttons, out.lt, out.rt, pad_index + 1);
+        }
+      }
+    }
+    return true;
+  }
 } // namespace pdz::test
 
 // XInputGetState(user r3, state r4): the original fills the state; for user 0, and for user 1 when the script has
@@ -538,7 +760,8 @@ namespace
   // The scripted pad state over the one XInputGetState returned (r3 = its result).
   void ApplyPadScript(PPCContext &ctx, uint8_t *base, uint32_t user, uint32_t state)
   {
-    if (user > 1 || !pdz::test::InputScriptActive() || !pdz::shadow::IsGuestPointer(state))
+    if (user > 1 || !pdz::test::InputScriptActive() || !pdz::shadow::IsGuestPointer(state) ||
+        pdz::test::PadDriverMode()) // pdz_test_pad_driver: the SDK's own devices carry the script
     {
       return;
     }
@@ -551,6 +774,12 @@ namespace
     }
     const double t = ScriptTime();
     MaybeBroadcastSignin(t);
+    UpdateUnplug(t);
+    if (user == 1 && SecondPadUnplugged())
+    {
+      ctx.r3.u64 = 0x48F; // 'p2 unplug': ERROR_DEVICE_NOT_CONNECTED, the state untouched (as the SDK)
+      return;
+    }
     if (user == 0)
     {
       while (s.next_cvar < s.cvars.size() && t >= s.cvars[s.next_cvar].t)
@@ -620,12 +849,23 @@ namespace
 } // namespace
 
 void PdzAutopilotPad(uint8_t *base, uint32_t user, uint32_t state); // unarmed_log.cpp
+#if PDZ_COUNTEROP
+namespace counter_op_pad
+{
+  void OnPadState(uint8_t *base, uint32_t user, uint32_t state, uint32_t result); // counter_op_jetpack.cpp
+}
+#endif
 
 REX_HOOK_RAW(sub_82AD4A18)
 {
   const uint32_t user = ctx.r3.u32, state = ctx.r4.u32;
   __imp__sub_82AD4A18(ctx, base);
   ApplyPadScript(ctx, base, user, state);
+#if PDZ_COUNTEROP
+  // Counter-Op (CALL-IN P3): player 2's buttons held over from before his take stay up until released once.
+  counter_op_pad::OnPadState(base, user, state, ctx.r3.u32);
+  if (ctx.r3.u32 == 0) { ::PdzCounterOpRiverTestPad(base, user, state); } // round 13b r: River's drive test tool (off: one bool test)
+#endif
   if (ctx.r3.u32 == 0)
   {
     PdzAutopilotPad(base, user, state); // unarmed_log.cpp: pdz_test_autopilot's left stick (testing tool)
@@ -650,7 +890,7 @@ REX_HOOK_RAW(sub_82AD4A10)
 {
   const uint32_t user = ctx.r3.u32, caps = ctx.r5.u32;
   __imp__sub_82AD4A10(ctx, base);
-  if (user != 1 || ctx.r3.u32 == 0 || !pdz::test::InputScriptActive() || !pdz::shadow::IsGuestPointer(caps))
+  if (user != 1 || !pdz::test::InputScriptActive() || pdz::test::PadDriverMode())
   {
     return;
   }
@@ -659,6 +899,15 @@ REX_HOOK_RAW(sub_82AD4A10)
   if (g_script.failed || !g_script.has_p2)
   {
     return;
+  }
+  if (SecondPadUnplugged())
+  {
+    ctx.r3.u64 = 0x48F; // 'p2 unplug': ERROR_DEVICE_NOT_CONNECTED, caps untouched (as the SDK)
+    return;
+  }
+  if (ctx.r3.u32 == 0 || !pdz::shadow::IsGuestPointer(caps))
+  {
+    return; // a real pad answered
   }
   std::memset(Mutable(base, caps), 0, 20);
   Mutable(base, caps)[0] = 1; // XINPUT_DEVTYPE_GAMEPAD
@@ -687,7 +936,7 @@ namespace
   {
     using namespace pdz::test;
     if (!InputScriptActive() || !pdz::shadow::IsGuestPointer(keystroke) || (user > 1 && user != 0xFF) ||
-        (flags != 0 && (flags & 0x1) == 0))
+        (flags != 0 && (flags & 0x1) == 0) || PadDriverMode())
     {
       return;
     }
@@ -705,6 +954,15 @@ namespace
       Pad &pad = s.pads[p];
       if ((user != 0xFF && user != p) || pad.next_key >= pad.keys.size() || pad.keys[pad.next_key].t > t)
       {
+        continue;
+      }
+      if (p == 1 && SecondPadUnplugged())
+      {
+        // 'p2 unplug': a switched-off pad sends nothing; its due keystrokes are lost, not delivered at t1.
+        while (pad.next_key < pad.keys.size() && pad.keys[pad.next_key].t <= t)
+        {
+          ++pad.next_key;
+        }
         continue;
       }
       if (!pick || pad.keys[pad.next_key].t < pick->keys[pick->next_key].t)
@@ -800,7 +1058,16 @@ REX_HOOK_RAW(sub_82AD9FF8)
 {
   const uint32_t user = ctx.r3.u32;
   __imp__sub_82AD9FF8(ctx, base);
-  if (user == 1 && ctx.r3.u32 == 0 && pdz::test::SecondUserSignedIn())
+  if (user != 1)
+  {
+    return;
+  }
+  if (pdz::test::SecondUserUnplugged())
+  {
+    ctx.r3.u64 = 0; // 'p2 unplug': not signed in (the SDK's IsLocalGuest(1) is false without the pad)
+    return;
+  }
+  if (ctx.r3.u32 == 0 && pdz::test::SecondUserSignedIn())
   {
     ctx.r3.u64 = 1; // eXUserSigninState_SignedInLocally
   }
@@ -811,6 +1078,11 @@ REX_HOOK_RAW(sub_82AD9FF0)
 {
   const uint32_t user = ctx.r3.u32, buffer = ctx.r4.u32, length = ctx.r5.u32;
   __imp__sub_82AD9FF0(ctx, base);
+  if (user == 1 && pdz::test::SecondUserUnplugged())
+  {
+    ctx.r3.u64 = 0x80070525u; // 'p2 unplug': X_E_NO_SUCH_USER, the buffer untouched (as the SDK)
+    return;
+  }
   if (user != 1 || !length || !pdz::shadow::IsGuestPointer(buffer) || !pdz::test::SecondUserSignedIn())
   {
     return;
@@ -832,6 +1104,13 @@ REX_HOOK_RAW(sub_82ADA4A8)
 {
   const uint32_t user = ctx.r3.u32, out = ctx.r4.u32;
   __imp__sub_82ADA4A8(ctx, base);
+  if (user == 1 && pdz::shadow::IsGuestPointer(out) && pdz::test::SecondUserUnplugged())
+  {
+    // 'p2 unplug': the SDK writes XUID 0 and X_E_NO_SUCH_USER, which this wrapper turns into 0x525.
+    pdz::test::Store64(base, out, 0);
+    ctx.r3.u64 = 0x525;
+    return;
+  }
   if (user != 1 || !pdz::shadow::IsGuestPointer(out) || !pdz::test::SecondUserSignedIn())
   {
     return;

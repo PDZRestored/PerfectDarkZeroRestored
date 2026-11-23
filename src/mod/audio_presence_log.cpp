@@ -21,6 +21,7 @@
 //
 // Wave channel counts aren't read at run time: out/audio/cue_channels.tsv
 // lists them per cue.
+#include "lab_stealth.h"
 #include "audio_presence_log.h"
 
 #include <chrono>
@@ -182,6 +183,7 @@ namespace audio_presence_log
 // DarkAudioSound stop (sub_822055C0, r3 = the sound): first stop per name.
 REX_HOOK_RAW(sub_822055C0)
 {
+  lab_stealth::SoundStopped(base, ctx.r3.u32, uint32_t(ctx.lr)); // (round 11l: the alarm sound and the sirens)
   if (REXCVAR_GET(pdz_audio_presence_log) && ctx.r3.u32)
   {
     const std::string name = Name(base, ctx.r3.u32);

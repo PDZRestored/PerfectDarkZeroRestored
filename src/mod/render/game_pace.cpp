@@ -59,6 +59,8 @@
 #include "game_thread_sampler.h" // cpusplit: the front-end pace section
 #include "native/native_recthread.h" // pdz_native_record_thread: a frame in flight (the cutscene picture's lead)
 #include "native/native_textures.h"  // pdz_native_texture_prewarm: OnLevelChange (log 315)
+#include "../guest_readable_Sat21Nov.h" // Sun 22 Nov night (audit): pdz::guestmem::Ok
+#include "latency_log.h"              // Sun 22 Nov night (audit): LevelReset at a level change
 
 #include <algorithm>
 #include <chrono>
@@ -126,6 +128,20 @@ REXCVAR_DEFINE_BOOL(pdz_sp_120, true, "Render",
                     "everywhere (or pdz_null_refresh_hz's fixed rate). docs/FPS120_REPORT.md")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+// Mon 16 Nov (0.9.5 rc, the Quality preset's 60 fps lock): with pdz_sp_120 off the game used to fall back to the
+// unpaced path (host_vblank_pacing's latch: no guest pacing, Rare's fixed 1/60 s cutscene / camera step with its
+// catch-up steps, Rare's solver step, none of the paced fixes). In a hand test at that 60 the ladder climb camera and
+// the zoom slide juddered while 120 was smooth. Co-op, multiplayer and pdz_sp_60_levels have always run their 60 on
+// the paced path instead (one game frame every round(rate / 60) guest vblanks, the real-time step, fixed present
+// pacing). With this on, pdz_sp_120 = false takes that same path with every single player level locked to 60.
+REXCVAR_DEFINE_BOOL(pdz_sp_60_paced, true, "Render",
+                    "With pdz_sp_120 off (single player at 60): pace the game the way the 120 fps mode paces its 60 "
+                    "fps scenes (co-op, multiplayer, pdz_sp_60_levels): guest vblanks at the display's rate, one game "
+                    "frame every round(rate / 60) of them, the real-time cutscene and camera step, fixed present "
+                    "pacing. Every single player level is then locked to 60. Off: the older unpaced 60 (the frame "
+                    "latched at every second host vblank, Rare's fixed 1/60 s steps), where camera slides (ladder, "
+                    "zoom) can judder. Nothing changes while pdz_sp_120 is on")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_STRING(pdz_sp_60_levels, "", "Render",
                       "With pdz_sp_120: single player levels that run at a locked 60 instead (one game frame every "
                       "2 vblanks at 120 Hz, the same fixed pacing as co-op and multiplayer; their cutscenes as in any 60 "
@@ -135,6 +151,38 @@ REXCVAR_DEFINE_STRING(pdz_sp_60_levels, "", "Render",
                       "outpost, bridge, arena; the internal codes work too (holo, club, ware, roof, mans, labo, airp, "
                       "cs1, cs2, jung, ruin, town, brid, cave). Read at each level start; one 'pdz_pace: level' line "
                       "per level. Example: rooftops,jungle")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+// Tue 17 Nov (0.9.5 rc, the Quality preset and the frame rate rows' Auto): 120 where the PC holds it, the paced 60
+// where it does not, decided per level from the first seconds of play.
+REXCVAR_DEFINE_BOOL(pdz_sp_auto, false, "Render",
+                    "With pdz_sp_120 (the Custom preset's Auto): every single player level starts at the paced rate "
+                    "(120 fps) and is measured through the whole level in windows of pdz_sp_auto_seconds of play "
+                    "(frames of a cutscene are left out). On a fixed-refresh display each frame's time is counted in "
+                    "whole display refreshes; a window whose 95th percentile is over pdz_sp_auto_p95_ms (more than one "
+                    "frame in twenty missed its refresh) is a missed window, and two missed windows in a row switch "
+                    "the level to the paced 60 (as a level on pdz_sp_60_levels) until it ends, never back up. With "
+                    "pdz_present_pacing vrr the rate floats and is never switched: a window under 110 fps only gets a "
+                    "line. 'pdz_pace: pdz_sp_auto' lines: the first window, every missed or low window, the switch. "
+                    "The next level tries 120 again. Read at each level start")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+// Tue 17 Nov: the Quality preset is a fixed 60 (pdz_sp_120 off on the paced path). The settings window writes this
+// line when Custom is picked, so saved values that equal the earlier Quality preset (Auto with 60 m shadows and full
+// beams) and do not say Custom are run, and shown, as the new Quality (MigrateEarlierQuality below).
+REXCVAR_DEFINE_BOOL(pdz_visual_custom, false, "Render",
+                    "Written by the settings window: the Visual preset row is on Custom. Without it, saved values "
+                    "that equal the earlier Quality preset (pdz_sp_auto with long shadows at 60 m and full beams) "
+                    "run as the Quality preset does now: single player at a fixed 60")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_DOUBLE(pdz_sp_auto_p95_ms, 8.6, "Render",
+                      "pdz_sp_auto: the limit for the 95th percentile frame time, in ms at 120 Hz (scaled to the paced "
+                      "rate at other rates). Frame times are rounded to whole refreshes first, so timing jitter of a "
+                      "frame that kept its refresh does not count. A value under one refresh (for example 1) always "
+                      "switches down: for tests")
+    .range(0.0, 100.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(pdz_sp_auto_seconds, 10.0, "Render", "pdz_sp_auto: the seconds of play in each measured window")
+    .range(1.0, 120.0)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_INT32(pdz_splitscreen_cap, 0, "Render",
@@ -289,6 +337,19 @@ namespace
   // pdz_sp_60_levels (game thread, the present step): the level last seen and whether it is on the list.
   uint32_t g_level_key = ~0u; // state object low bits, mode and level id; ~0 = not in a level
   bool g_level_listed = false;
+  // pdz_sp_60_paced with pdz_sp_120 off (latched by ChooseAtStartup): the paced path with every single player level
+  // locked to 60, as if all were on pdz_sp_60_levels.
+  bool g_all_levels_60 = false;
+  // pdz_sp_auto (game thread, the present step): the measurement of the current level's first seconds of play.
+  bool g_auto_measuring = false;      // still collecting
+  bool g_auto_prev_valid = false;     // the previous frame was a frame of play (its time is in g_auto_prev_qpc)
+  int64_t g_auto_prev_qpc = 0;
+  uint64_t g_auto_prev_cs = 0;        // g_cs_calls at the previous frame (it moves while a cutscene plays)
+  double g_auto_elapsed_ms = 0.0;     // play measured so far
+  std::vector<float> g_auto_ms;       // each measured frame's time
+  std::string g_auto_level;           // the level's name, for the line
+  uint32_t g_auto_windows = 0;        // windows measured in this level
+  uint32_t g_auto_missed = 0;         // missed windows in a row (fixed pacing)
   // pdz_splitscreen_cap (game thread, the present step): Rare's participant list (every player and bot of a co-op or
   // multiplayer level; the offsets counter_op.cpp and cut_scenarios.cpp use): +4 next, +944 kind (2 player, 3 bot),
   // +1680 the participant's local user (0-3 for a player on this machine). The local players are counted at the level
@@ -657,10 +718,20 @@ namespace
     {
       return nullptr;
     }
+    // Sun 22 Nov night (audit): each hop, and each page of the name, only while it is there.
+    using pdz::guestmem::Ok;
+    if (!Ok(base, table + uint32_t(id) * 4, 4))
+    {
+      return nullptr;
+    }
     const int32_t index = int32_t(GuestU32(base, table + uint32_t(id) * 4));
-    const uint32_t entry = index >= 0 && index < 4096 ? GuestU32(base, entries + uint32_t(index) * 4) : 0;
-    const uint32_t name = entry >= 0x10000u ? GuestU32(base, entry) : 0;
-    for (uint32_t i = 0; name >= 0x10000u && i < 64 && base[name + i]; ++i)
+    const uint32_t entry = index >= 0 && index < 4096 && Ok(base, entries + uint32_t(index) * 4, 4)
+                               ? GuestU32(base, entries + uint32_t(index) * 4)
+                               : 0;
+    const uint32_t name = entry >= 0x10000u && Ok(base, entry, 4) ? GuestU32(base, entry) : 0;
+    for (uint32_t i = 0; name >= 0x10000u && i < 64 &&
+                         ((i != 0 && ((name + i) & 0xFFFu) != 0) || Ok(base, name + i, 1)) && base[name + i];
+         ++i)
     {
       raw += char(base[name + i]);
     }
@@ -720,7 +791,9 @@ namespace
   {
     uint32_t users = 0;
     uint32_t p = GuestU32(base, kParticipantList);
-    for (uint32_t n = 0; p >= 0x10000u && p < 0xF0000000u && (p & 3u) == 0 && n < 64;
+    // Sun 22 Nov night (audit): a node only while its words (next, kind, user) are there.
+    for (uint32_t n = 0; p >= 0x10000u && p < 0xF0000000u && (p & 3u) == 0 && n < 64 &&
+                         pdz::guestmem::Ok(base, p, kParticipantUser + 4);
          p = GuestU32(base, p + kParticipantNext), ++n)
     {
       if (GuestU32(base, p + kParticipantKind) != kParticipantKindPlayer)
@@ -756,6 +829,88 @@ namespace
       return uint32_t(setting);
     }
     return players >= 3 && g_hz >= 90 ? 40u : 0u;
+  }
+
+  // pdz_sp_auto: one frame of play (the present step, once per frame), measured in windows through the whole level.
+  // Returns true once, at the second missed window in a row on a fixed-refresh display: the caller locks the level to
+  // 60 until it ends. On a VRR display it never returns true (low windows are only logged).
+  // A frame's time is counted in whole refreshes of the paced rate: on the fixed pacing a frame that kept its
+  // refresh still reads 7.5 to 9 ms at this point (the game thread's own jitter; a 120 fps run's raw p95 is 8.7 to
+  // 9.0 ms), and a frame that missed it reads two refreshes. So the 95th percentile of the rounded times is over one
+  // refresh exactly when more than one frame in twenty was late.
+  bool AutoMeasureFrame()
+  {
+    const int64_t now = QpcNow();
+    const uint64_t cs = g_cs_calls.load(std::memory_order_relaxed);
+    const bool cutscene = cs != g_auto_prev_cs;
+    g_auto_prev_cs = cs;
+    const bool had_prev = g_auto_prev_valid;
+    const double dt_ms = double(now - g_auto_prev_qpc) * 1000.0 / double(QpcFrequency());
+    g_auto_prev_qpc = now;
+    g_auto_prev_valid = !cutscene;
+    if (cutscene || !had_prev || dt_ms <= 0.0 || dt_ms > 250.0) // 250 ms: the window lost focus, a load: not play
+    {
+      return false;
+    }
+    g_auto_ms.push_back(float(dt_ms));
+    g_auto_elapsed_ms += dt_ms;
+    if (g_auto_elapsed_ms < REXCVAR_GET(pdz_sp_auto_seconds) * 1000.0)
+    {
+      return false;
+    }
+    // The window is full: judge it, then start the next one (the level is measured to its end).
+    const double rate = g_vrr && g_cap_on && g_vrr_cap_hz > 0.0 ? g_vrr_cap_hz : double(g_hz);
+    const double period = 1000.0 / rate;
+    const double limit = REXCVAR_GET(pdz_sp_auto_p95_ms) * period / (1000.0 / 120.0);
+    const size_t frames = g_auto_ms.size();
+    const double seconds = g_auto_elapsed_ms / 1000.0;
+    const double fps = double(frames) / seconds;
+    std::vector<float> rounded(frames);
+    size_t late = 0;
+    for (size_t i = 0; i < frames; ++i)
+    {
+      const double refreshes = std::max(1.0, std::round(double(g_auto_ms[i]) / period));
+      late += refreshes > 1.0 ? 1 : 0;
+      rounded[i] = float(refreshes * period);
+    }
+    const size_t at = std::min(frames - 1, size_t(double(frames) * 0.95));
+    std::nth_element(rounded.begin(), rounded.begin() + std::ptrdiff_t(at), rounded.end());
+    std::nth_element(g_auto_ms.begin(), g_auto_ms.begin() + std::ptrdiff_t(at), g_auto_ms.end());
+    const double p95 = double(rounded[at]), raw_p95 = double(g_auto_ms[at]);
+    const uint32_t window = ++g_auto_windows;
+    g_auto_ms.clear();
+    g_auto_elapsed_ms = 0.0;
+    if (g_vrr)
+    {
+      // A VRR display: the rate floats, the level is never switched. A line for the first window and each low one.
+      const double low = 110.0 * double(g_hz) / 120.0;
+      if (window == 1 || fps < low)
+      {
+        REXLOG_INFO("pdz_pace: pdz_sp_auto: level {}: window {} ({:.1f} s of play): {:.1f} fps, raw p95 {:.2f} ms: {} "
+                    "(VRR display: the rate floats, never switched to 60)",
+                    g_auto_level, window, seconds, fps, raw_p95,
+                    fps < low ? fmt::format("below {:.0f} fps", low) : std::string("kept"));
+      }
+      return false;
+    }
+    const bool missed = p95 > limit;
+    g_auto_missed = missed ? g_auto_missed + 1 : 0;
+    const bool down = g_auto_missed >= 2;
+    if (window == 1 || missed)
+    {
+      REXLOG_INFO("pdz_pace: pdz_sp_auto: level {}: window {} ({:.1f} s of play) at {:.0f} fps: {} frames, {} late "
+                  "({:.1f} %), p95 {:.2f} ms in whole refreshes (raw {:.2f} ms), limit {:.2f} ms: {}",
+                  g_auto_level, window, seconds, rate, frames, late, 100.0 * double(late) / double(frames), p95,
+                  raw_p95, limit,
+                  down     ? "the second missed window in a row: the level is switched to the paced 60 until it ends"
+                  : missed ? "missed; one more in a row switches the level to the paced 60"
+                           : "kept");
+    }
+    if (down)
+    {
+      g_auto_measuring = false;
+    }
+    return down;
   }
 } // namespace
 
@@ -816,6 +971,7 @@ bool PdzFrontendPace()
       tex_key = want;
       tex_playing = false;
       pdz::native::OnLevelChange(tex_key.c_str());
+      pdz::latency::LevelReset(); // Sun 22 Nov night (audit): pdz_latency_log's cached player
     }
     if (level && !tex_playing && !tex_key.empty())
     {
@@ -837,15 +993,37 @@ bool PdzFrontendPace()
     {
       g_level_key = key;
       g_level_listed = false;
+      g_auto_measuring = false;
       if (level && mode == 0)
       {
         std::string raw;
         int id = -1;
         const SpLevel *sp = CurrentSpLevel(base, state_object, raw, id);
-        g_level_listed = ListedFor60(sp, raw);
+        g_level_listed = g_all_levels_60 || ListedFor60(sp, raw);
+        // pdz_sp_auto: measure this level in windows of play (only where 60 is a different rate).
+        g_auto_measuring = !g_level_listed && REXCVAR_GET(pdz_sp_auto) && CutsceneDivider() > 1;
+        if (g_auto_measuring)
+        {
+          g_auto_level = sp ? std::string(sp->name) : (raw.empty() ? "?" : raw);
+          g_auto_ms.clear();
+          g_auto_ms.reserve(4096);
+          g_auto_elapsed_ms = 0.0;
+          g_auto_windows = 0;
+          g_auto_missed = 0;
+          g_auto_prev_valid = false;
+          g_auto_prev_cs = g_cs_calls.load(std::memory_order_relaxed);
+        }
         REXLOG_INFO("pdz_pace: level {} (id {}, Rare's '{}'): {}", sp ? std::string(sp->name) : (raw.empty() ? "?" : raw),
-                    id, raw, g_level_listed ? "locked 60 (pdz_sp_60_levels)" : "120 (pdz_sp_120)");
+                    id, raw,
+                    g_all_levels_60    ? "locked 60 (pdz_sp_120 off, paced: pdz_sp_60_paced)"
+                    : g_level_listed   ? "locked 60 (pdz_sp_60_levels)"
+                    : g_auto_measuring ? "120, measured in windows through the level (pdz_sp_auto)"
+                                       : "120 (pdz_sp_120)");
       }
+    }
+    if (g_auto_measuring && level && AutoMeasureFrame())
+    {
+      g_level_listed = true; // as a level on pdz_sp_60_levels: the divider, the cap and the line below follow
     }
     // pdz_splitscreen_cap: the local players sharing the screen (counted at the level start and every 60 frames;
     // 0 outside a level), the cap for them, and the divider that gives it: the paced rate over a whole number, never
@@ -2103,15 +2281,38 @@ namespace pdz::pace
       REXLOG_INFO("pdz: this PC: GPU {} | display {:.2f} Hz, VRR {} | pacing {} ({} Hz guest vblanks, campaign {}) | "
                   "CPU {} cores, {} threads | second record thread {}",
                   gpu, d.hz, d.vrr ? "yes (" + d.vrr_how + ")" : (d.edid ? "no" : "unknown"), g_pacing_name,
-                  EffectiveHz(), REXCVAR_GET(pdz_sp_120) ? "auto 120 / 60" : "60", physical,
+                  EffectiveHz(), REXCVAR_GET(pdz_sp_120) ? "auto 120 / 60" : g_all_levels_60 ? "60 (paced)" : "60", physical,
                   std::thread::hardware_concurrency(), second);
     }
   } // namespace
 
   static void ChooseAtStartupImpl(bool null_backend);
 
+  // Tue 17 Nov: saved settings that are the earlier Quality preset (Auto, long shadows at 60 m, full beams) and do not
+  // say Custom run as the Quality preset does now: single player at a fixed 60. Only the values in memory change; the
+  // settings window writes the new lines at its next Save.
+  static void MigrateEarlierQuality()
+  {
+    if (!REXCVAR_GET(pdz_sp_120) || !REXCVAR_GET(pdz_sp_auto) || REXCVAR_GET(pdz_visual_custom))
+    {
+      return;
+    }
+    const double distance = std::atof(rex::cvar::GetFlagByName("pdz_long_shadows_distance").c_str());
+    if (rex::cvar::GetFlagByName("pdz_long_shadows") != "true" || (distance != 3.0 && distance != 0.0) ||
+        rex::cvar::GetFlagByName("pdz_far_lighting_beams_no_fade") != "true" ||
+        rex::cvar::GetFlagByName("pdz_far_lighting") == "false")
+    {
+      return;
+    }
+    rex::cvar::SetFlagByName("pdz_sp_120", "false");
+    rex::cvar::SetFlagByName("pdz_sp_auto", "false");
+    REXLOG_INFO("pdz_pace: the saved settings are the earlier Quality preset (Auto frame rate): run as Quality is now, "
+                "single player at a fixed 60 (pdz_sp_120 off for this run; Custom keeps Auto)");
+  }
+
   void ChooseAtStartup(bool null_backend)
   {
+    MigrateEarlierQuality();
     ChooseAtStartupImpl(null_backend);
     LogStartupSummary();
   }
@@ -2129,7 +2330,8 @@ namespace pdz::pace
       const std::string wanted = WantedPacing(false);
       const HostInfo host = DetectHost();
       const uint32_t reported = PrimaryDisplayHz();
-      const bool sp120 = want == 0 && REXCVAR_GET(pdz_sp_120);
+      // pdz_sp_60_paced: pdz_sp_120 off takes the same paced path (every single player level locked to 60).
+      const bool sp120 = want == 0 && (REXCVAR_GET(pdz_sp_120) || REXCVAR_GET(pdz_sp_60_paced));
       double guest_hz = want > 0 ? double(want) : 0.0;
       if (guest_hz <= 0.0)
       {
@@ -2175,7 +2377,8 @@ namespace pdz::pace
                     wanted == "auto" ? "auto: not present (the auto choice between fixed and vrr follows)" : wanted);
       }
     }
-    if (want == 0 && REXCVAR_GET(pdz_sp_120))
+    const bool paced_60 = !REXCVAR_GET(pdz_sp_120) && REXCVAR_GET(pdz_sp_60_paced);
+    if (want == 0 && (REXCVAR_GET(pdz_sp_120) || paced_60))
     {
       const uint32_t display = PrimaryDisplayHz();
       // fixed paces any display at its own refresh (or an even division of it); vrr / latch / present assume 120 Hz.
@@ -2191,6 +2394,12 @@ namespace pdz::pace
       {
         want = 120;
         auto120 = true;
+        g_all_levels_60 = paced_60;
+        if (paced_60)
+        {
+          REXLOG_INFO("pdz_pace: pdz_sp_120 is off: single player locked to 60 on the paced path (pdz_sp_60_paced): "
+                      "one game frame every round(rate / 60) guest vblanks, as co-op and multiplayer");
+        }
       }
     }
     if (want != 0)

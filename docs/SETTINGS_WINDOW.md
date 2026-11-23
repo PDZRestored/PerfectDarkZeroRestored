@@ -18,7 +18,7 @@ Never in a developer's build or with `pdz_setup_quiet`. Play and Safe mode save 
 | Tab | Settings | Writes |
 |---|---|---|
 | Display | Monitor, Borderless / Fullscreen, Resolution (Fullscreen only; Desktop by default), Render scale 100 / 75 / 50 %, VSync / VRR On / VRR (G-Sync / FreeSync) / Off (each with its own help line; Off warns: tearing and judder), Field of view 73-103 degrees across 16:9 with Default (Rare's) | `monitor`, `fullscreen`, `fullscreen_exclusive`, `resolution` (Fullscreen with a chosen size only), `pdz_native_scale` (75 / 50 % of the desktop's auto scale, nearest integer, 50 % one lower where both would be the same; 100 % = no line, and a value the file had is dropped at once; the saved value is shown again when the window reopens, 0.9.2), `pdz_present_pacing` (fixed / vrr; a hand-set present / latch is kept by On), `vsync` (read from the settings file: the GPU plugin that owns it isn't loaded when the window opens, 0.9.2), `pdz_fov_scale` |
-| Frame rate | Campaign Auto / 120 / 60 (single player only; Auto: what this screen gets, in a line, then that co-op shares the screen and so uses the Split screen choice: co-op levels keep the 60 divider in `game_pace.cpp`); Multiplayer 60, greyed out; Split screen Auto / 60 / 40 / 30 (2026-11-08: the rate while 2 or more local players share the screen in a co-op or multiplayer level; Auto = 60 with 2 players, 40 with 3 or 4 on 120 Hz pacing; see below) | `pdz_sp_120`, `pdz_splitscreen_cap` (0 = Auto) |
+| Frame rate | Campaign Auto / 120 / 60 (single player only; since 2026-11-17 Auto = `pdz_sp_auto`: 120 fps, and the paced 60 for a level whose first 10 s of play do not keep 120; 120 and 60 are fixed; the default is 120; the note under the row says what this screen gets, in a line, then that co-op shares the screen and so uses the Split screen choice: co-op levels keep the 60 divider in `game_pace.cpp`); Multiplayer 60, greyed out; Split screen Auto / 60 / 40 / 30 (2026-11-08: the rate while 2 or more local players share the screen in a co-op or multiplayer level; Auto = 60 with 2 players, 40 with 3 or 4 on 120 Hz pacing; see below) | `pdz_sp_120`, `pdz_sp_auto`, `pdz_splitscreen_cap` (0 = Auto) |
 | Map packs | each pack, its maps and status; Add / Remove; Add pack files...; Check installed packs | the packs (below) |
 | Controls | mouse sensitivity, invert, Step zoom (off), one row per action with two keys each (rebind by pressing), Reset controls to defaults; an orange warning line under the buttons while Start has only keys the menus use (Enter, Esc, left / right click, the wheel) or none: there is then no Start in menus, add a plain key (P is Start in menus by default); it follows every change of the rows (2026-11-08); a Locktopus group (0.9.4): Steer with Mouse / Keys / Both, Mouse sensitivity Low .. High (800 .. 80 counts, 400 in the middle), the keys as text from the current binds, and a practice dial on Rare's own locks with the lock's name under it, New lock and Agent / Secret Agent / Perfect Agent (dimmed under "Click to test" until a click or Space makes it active; docs/MOUSE_KEYBOARD.md) | `pdz_mouse_sensitivity`, `pdz_mouse_invert`, `pdz_zoom_steps`, `pdz_minigame_inputs`, `pdz_minigame_mouse_counts` (each only when changed; a Locktopus change also sets `pdz_fix_minigame_keyboard = true`) and the changed `keybind_*` lines in `mapping.toml` (comments kept) |
 | Advanced | Open settings file, Open logs folder, Rebuild shaders (removes `generated.json`), Reset to defaults, Network play | `net_lan` |
@@ -34,6 +34,69 @@ Never in a developer's build or with `pdz_setup_quiet`. Play and Safe mode save 
 
 **Test:** `pdz_settings_test_capture=<folder>` shows each tab, writes `tab<N>.bmp` and closes. All five tabs were
 captured in the test folder.
+
+## Graphics and Gameplay tabs (0.9.5, 2026-11-16)
+
+Seven tabs, in this order (also the capture files' numbers and the side bar buttons' ids 180-186): Display 0,
+Graphics 1, Frame rate 2, Gameplay 3, Map packs 4, Controls 5, Advanced 6. Rule: what changes the look is on
+Graphics, what changes play is on Gameplay; plain bug fixes have no switch; fine-tuning stays in the settings file.
+
+| Tab | Row | Choices -> lines | Release default |
+|---|---|---|---|
+| Graphics | Render scale | 200% / 150% / 100% / 75% / 50%. 75% / 50% -> `pdz_native_scale` (as before). 150% / 200% -> `pdz_supersample` 150 / 200 (supersampling: the native renderer draws at a higher integer scale, at most 6, and shrinks the finished frame with an area filter; checked against the graphics card's memory at the start, lowered with a log warning if it would not fit); `pdz_native_scale` then has no line. The segment order changed: 100% is now the third segment (index 2), so a test's `click=` id for a Render scale segment moved by two | 100% (no lines) |
+| Graphics | Upscaling | Smooth / Sharpen / FSR -> `present_effect = "bilinear" / "cas" / "fsr"` | FSR |
+| Graphics | Anti-aliasing | None / FXAA / SMAA -> `swap_post_effect = "none" / "fxaa" / "smaa"` | SMAA |
+| Graphics | Anisotropic filtering | Rare's / 2x / 4x / 8x / 16x -> `anisotropic_override = -1 / 2 / 3 / 4 / 5` | 16x (5) |
+| Graphics | Visual preset | Performance / Quality / Custom: sets the four rows below, the Frame rate tab's Campaign row and `pdz_far_lighting_beams` (see "Visual preset") | Performance |
+| Graphics | Far lighting (Custom only) | switch -> `pdz_far_lighting` | on |
+| Graphics | Long shadows (Custom only) | Off / 40 m / 60 m / 80 m -> `pdz_long_shadows`, `pdz_long_shadows_distance = 2.0 / 3.0 / 4.0` | Off |
+| Graphics | Full streetlight beams (Custom only) | switch -> `pdz_far_lighting_beams_no_fade` | off |
+| Graphics | Single-player frame rate (Custom only) | Auto / 120 fps / 60 fps -> `pdz_sp_auto`, `pdz_sp_120` (the same setting as Campaign on the Frame rate tab; each follows the other). Auto: 120 fps, and the paced 60 on a level that keeps missing it (see "Auto frame rate") | 120 fps |
+| Gameplay | Game | Restored / Original: sets the three switches below, all on / all off; neither is lit when they are mixed. It reads and changes no graphics setting | Restored |
+| Gameplay | Guard cover fixes | switch -> `pdz_ai_cover_fixes` | on |
+| Gameplay | Stealth | switch -> `pdz_lab_guard_stealth` (the stealth layer's master switch: an optional layer for the quiet part; a guard who sees the player or hears her go loud is the game's own guard again; off = every part of the layer off on Nightclub, Subway, Mansion and the Laboratory) | on |
+| Gameplay | Guard voices | slider -12 to +9 dB -> `pdz_guard_voice_db`, with a Default (+3 dB) button; under Stealth since the 0.9.5 rc (2026-11-16), before that on Display; control ids 600-602 unchanged | +3 dB |
+| Gameplay | Aim enhancements | switch -> `pdz_aim_still_lock`, `pdz_aim_respect_headshots`, `pdz_aim_assist_zoomed` together | on |
+
+- **Auto frame rate (2026-11-17, `pdz_sp_auto`; a Custom choice only).** With `pdz_sp_120` on, every single
+  player level starts at the paced rate (120 fps on a 120 Hz display) and is measured to its end in windows of 10 s
+  of play (`pdz_sp_auto_seconds`; frames of a cutscene are left out). Fixed-refresh display: each frame's time is
+  counted in whole display refreshes; a window whose 95th percentile is over 8.6 ms (`pdz_sp_auto_p95_ms`: more than
+  one frame in twenty missed its refresh) is a missed window, and two missed windows in a row put the level on the
+  paced 60 until it ends (never back up), exactly as a level on `pdz_sp_60_levels`. VRR display
+  (`pdz_present_pacing = "vrr"`): the rate floats and is never switched; a window under 110 fps only gets a line.
+  The next level tries 120 again. `pdz_pace: pdz_sp_auto: level ...` lines: the first window, each missed or low
+  window, the switch. Nothing is measured where 60 is not a different rate (a 60 Hz display). Test:
+  `--pdz_sp_auto_p95_ms=1` switches down after two windows.
+- **Visual preset (2026-11-16).** Performance: far lighting on with the hidden-room beams (`pdz_far_lighting`,
+  `pdz_far_lighting_beams`), long shadows off, full streetlight beams off, Campaign 120 fps.
+  Quality: the same plus long shadows to 60 m on every level (`pdz_long_shadows_skip_levels = ""`: Outpost
+  included), full streetlight beams, Campaign 60 fps: a fixed, paced 60 on every level (2026-11-17, second change
+  that day; Auto is a Custom choice). Saved values that are the earlier Quality (Auto with those rows) and carry no
+  `pdz_visual_custom = true` line run and open as Quality at 60; Save writes `pdz_visual_custom` when Custom is picked. Custom: the four rows, which are
+  hidden for the other two. A preset click sets the rows; Save then writes them as if set by hand. The preset shown
+  on opening is what the saved values say (anything that fits neither is Custom); changing Campaign on the Frame
+  rate tab moves the preset to Custom if the values then fit neither. Long shadows at a fixed 120 fps remove the skip list
+  line, so Outpost keeps Rare's shadows. `pdz_far_lighting_beams` has no row of its own any more (id 645 reserved);
+  a hand-set `false` reads as Custom and is kept until a preset is picked. Bug fixes (the water reflection) have
+  no row. Help texts per choice, as for VSync.
+- **Only what changed is written.** Each row remembers its value as loaded; Play, Safe mode and the close box write
+  a row's lines only when the row differs, in place with their comments (`WriteKeys`). A value set by hand that is
+  none of a row's choices (`swap_post_effect = "fxaa_extreme"`, `anisotropic_override = 0`) shows no choice lit and
+  is kept unless a choice is picked. The window logs `pdz_settings: graphics / gameplay rows changed: ...`.
+- **Read from the file:** `swap_post_effect` and `anisotropic_override` belong to the GPU plugin, which isn't loaded
+  while the window is open (as `vsync`). Everything applies from the start that follows.
+- **No 2x MSAA row** (removed 2026-11-16): `native_2x_msaa` changes nothing in this game (it draws no multisampled
+  surfaces and the native renderer has none). The line stays in the settings file; the window never writes it. Its
+  control id 642 stays reserved, so the other ids did not move.
+- **Help strip:** on these two tabs the strip is taller (`kHelpTallH`, up to six lines) because their agreed help
+  texts are longer than two lines; the other tabs keep two. The layout check knows both limits.
+- **Reset to defaults** (Advanced) puts both tabs back to the release defaults above.
+- **Test items:** `click=<id>` in `pdz_settings_test_rebind` clicks any control: a tab button 180-186, a segment
+  2000 + group x 8 + index (groups: Upscaling 640, Anti-aliasing 641, Anisotropic 643, Game 660), a switch by its own
+  id (Far lighting 644, Full streetlight beams 648, cover 662, stealth 663, aim 664); more groups: Long shadows 646,
+  Visual preset 647, Single-player frame rate 649. `close=1` ends the script with the
+  close box (saves, the game doesn't start) instead of Play.
 
 ## Split-screen frame cap (`pdz_splitscreen_cap`, 2026-11-08; untested in game)
 

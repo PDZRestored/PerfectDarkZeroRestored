@@ -38,6 +38,7 @@
 
 #include "native.h"
 #include "native_async_upload.h" // pdz_native_async_upload: textures prepared on the upload workers
+#include "native_menu_card.h" // pdz_counterop_menu_card_file: the player's picture for the COUNTER OPERATIVE entry
 #include "native_shaders.h" // pdz_native_texture_prewarm: the level-start summary's shader first-use counters
 #include "native_draw.h" // SplitActive (split screen diagnostics)
 #include "native_pipeline.h" // the level-start summary's PSO counts (prepared by the warm-up / built at the draw)
@@ -117,6 +118,14 @@ REXCVAR_DEFINE_BOOL(pdz_fix_mirror_view_zero, true, "Render",
                     "Native renderer fix (on): a resolve mirror's alias view for a fetch of another size (its "
                     "texels outside the resolved region) starts as zero, as the code always assumed, instead of the "
                     "new memory's old content (garbage on AMD)");
+// Fri 20 Nov night (the Jungle Counter-Op crash, logs 028-030): an upload read guest memory that was no longer there.
+REXCVAR_DEFINE_BOOL(pdz_native_texture_guarded_read, true, "Render",
+                    "Native renderer fix (on, Fri 20 Nov): a texture upload never reads guest memory that is not "
+                    "there. A queued upload is dropped when a level load or unload starts, an upload worker checks "
+                    "the texture's first and last page first, and a read that still faults ends that one upload "
+                    "(the texture is made again at its next use) instead of the whole game. One log line each time. "
+                    "Off = before: such a read crashed the game (Jungle in Counter-Operative)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(pdz_native_texture_untile_cached, false, "Render",
                     "Native renderer: the per-block untiler (tiled textures, and linear ones with a format conversion) "
                     "builds each row in a cached scratch buffer and copies the finished row into the upload heap with "
@@ -206,6 +215,8 @@ REXCVAR_DECLARE(bool, pdz_native_depth_stencil_alias); // native_surfaces.cpp: t
 
 namespace pdz::native
 {
+  bool GuardedRangeTouch(const uint8_t *p, uint32_t bytes); // Sun 22 Nov night (audit): defined at the end
+
   // ---------------------------------------------------------------------------
   // Fetch constant decoding (xenos.h xe_gpu_texture_fetch_t bit layout)
   // ---------------------------------------------------------------------------
@@ -986,12 +997,19 @@ namespace pdz::native
       }
       return XXH3_64bits(page, sizeof(page));
     }
+    // Sun 22 Nov night (audit): the record thread's hashes go through the upload's guard too (0 when the read
+    // faulted: the texture is then compared and made again at its next use). Defined below.
+    __declspec(noinline) uint64_t GuardedHash(const uint8_t *p, uint32_t bytes);
     uint64_t ContentHash(uint32_t base_address)
     {
       const pdz::timing::PhaseScope phase(pdz::timing::Phase::kTextureHash); // pdz_frame_timing_phases
       pdz::timing::CountEvent(pdz::timing::Event::kTexHash);                // pdz_frame_timing_spike_ms
       pdz::timing::CountEvent(pdz::timing::Event::kTexHashBytes, 4096);
       const uint8_t *p = PhysPtr(base_address);
+      if (p && REXCVAR_GET(pdz_native_texture_guarded_read))
+      {
+        return GuardedHash(p, 4096);
+      }
       return p ? XXH3_64bits(p, 4096) : 0;
     }
     // Base level (all array slices) as stored in guest memory, capped at 64 MB; `tight_linear`: a linear base level up
@@ -1007,6 +1025,10 @@ namespace pdz::native
       pdz::timing::CountEvent(pdz::timing::Event::kTexHash);                // pdz_frame_timing_spike_ms
       pdz::timing::CountEvent(pdz::timing::Event::kTexHashBytes, bytes);
       const uint8_t *p = PhysPtr(base_address);
+      if (p && REXCVAR_GET(pdz_native_texture_guarded_read))
+      {
+        return GuardedHash(p, bytes); // Sun 22 Nov night (audit)
+      }
       return p ? XXH3_64bits(p, bytes) : 0;
     }
     // Whether the SNORM view reproduces the fetch's signs exactly: every component the fetch swizzle reads from
@@ -1576,6 +1598,84 @@ namespace pdz::native
       return true;
     }
 
+    // pdz_native_texture_guarded_read (Fri 20 Nov night). UploadGuestTexture run under a structured-exception guard:
+    // a read of guest memory the guest has just freed (its pages decommitted / no access) ends this upload, not the
+    // process. crash_dump.cpp leaves a fault inside the guard alone (InGuardedGuestRead), as it does for the IP
+    // profiler's guarded unwind. Destructors of the interrupted frames do not run (a few small vectors leak; the
+    // upload of a failed texture is never used).
+    thread_local bool t_guarded_read = false;
+    std::atomic<uint32_t> g_guarded_faults{0};
+    struct GuardedUploadArgs
+    {
+      NativeDevice *dev;
+      std::vector<uint8_t> *scratch;
+      HostTexture *t;
+      const FetchDecoded *f;
+      const FormatInfo *fi;
+      uint64_t *upload_bytes;
+      asyncup::CopyTarget *async;
+      bool ok;
+    };
+    __declspec(noinline) void GuardedUploadCall(GuardedUploadArgs *a)
+    {
+      a->ok = UploadGuestTexture(*a->dev, *a->scratch, *a->t, *a->f, *a->fi, a->upload_bytes, a->async);
+    }
+    __declspec(noinline) bool GuardedUploadRun(GuardedUploadArgs *a)
+    {
+      bool faulted = false;
+      t_guarded_read = true;
+      __try
+      {
+        GuardedUploadCall(a);
+      }
+      __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION || GetExceptionCode() == EXCEPTION_IN_PAGE_ERROR
+                    ? EXCEPTION_EXECUTE_HANDLER
+                    : EXCEPTION_CONTINUE_SEARCH)
+      {
+        faulted = true;
+      }
+      t_guarded_read = false;
+      return faulted;
+    }
+    bool UploadGuestTextureGuarded(NativeDevice &dev, std::vector<uint8_t> &scratch, HostTexture &t,
+                                   const FetchDecoded &f, const FormatInfo &fi, uint64_t *upload_bytes = nullptr,
+                                   asyncup::CopyTarget *async = nullptr)
+    {
+      if (!REXCVAR_GET(pdz_native_texture_guarded_read))
+      {
+        return UploadGuestTexture(dev, scratch, t, f, fi, upload_bytes, async);
+      }
+      GuardedUploadArgs a{&dev, &scratch, &t, &f, &fi, upload_bytes, async, false};
+      if (GuardedUploadRun(&a))
+      {
+        const uint32_t n = g_guarded_faults.fetch_add(1) + 1;
+        if (n <= 20 || n % 100 == 0)
+        {
+          REXLOG_WARN("pdz_native: texture {:08X} {} {}x{}: its guest memory is no longer there (a read faulted on {}); "
+                      "this upload is dropped, the texture is made again at its next use (#{}; "
+                      "pdz_native_texture_guarded_read)",
+                      f.base_address, fi.name, f.width, f.height, async ? "an upload worker" : "the record thread", n);
+        }
+        return false;
+      }
+      return a.ok;
+    }
+    // A cheap check that a physical address is readable now (one byte; upload workers only, never the game thread).
+    bool PhysByteReadable(uint32_t address)
+    {
+      const uint8_t *p = address < 0x20000000u ? PhysPtr(address) : nullptr;
+      if (!p)
+      {
+        return false;
+      }
+      uint8_t b = 0;
+      SIZE_T got = 0;
+      return ReadProcessMemory(GetCurrentProcess(), p, &b, 1, &got) && got == 1;
+    }
+    // Bumped when a level load / unload starts (OnGuestMemoryChange): queued uploads of an older value are dropped.
+    std::atomic<uint32_t> g_upload_epoch{0};
+    std::atomic<uint32_t> g_epoch_drops{0}, g_probe_drops{0};
+
     uint32_t FullExtentBytes(const FetchDecoded &f, const FormatInfo &fi, bool tight_linear)
     {
       const LevelLayout l = ComputeLevel(f, fi, 0);
@@ -1627,6 +1727,28 @@ namespace pdz::native
       return reason;
     }
 
+    // pdz_native_texture_guarded_read: the worker's hash of a new texture's guest memory under the same guard as its
+    // upload (0 when the read faulted: the texture is then compared and made again at its next use).
+    __declspec(noinline) uint64_t GuardedHashCall(const uint8_t *p, uint32_t bytes) { return XXH3_64bits(p, bytes); }
+    __declspec(noinline) uint64_t GuardedHash(const uint8_t *p, uint32_t bytes)
+    {
+      uint64_t h = 0;
+      const bool outer = t_guarded_read; // Sun 22 Nov night (audit): the record thread's hashes come here too
+      t_guarded_read = true;
+      __try
+      {
+        h = GuardedHashCall(p, bytes);
+      }
+      __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION || GetExceptionCode() == EXCEPTION_IN_PAGE_ERROR
+                    ? EXCEPTION_EXECUTE_HANDLER
+                    : EXCEPTION_CONTINUE_SEARCH)
+      {
+        h = 0;
+        g_guarded_faults.fetch_add(1, std::memory_order_relaxed);
+      }
+      t_guarded_read = outer;
+      return h;
+    }
     // FullHash without the phase / event accounting (an upload worker: those are the record thread's).
     uint64_t FullHashQuiet(uint32_t base_address, uint32_t bytes)
     {
@@ -1635,7 +1757,11 @@ namespace pdz::native
         return 0;
       }
       const uint8_t *p = PhysPtr(base_address);
-      return p ? XXH3_64bits(p, bytes) : 0;
+      if (!p)
+      {
+        return 0;
+      }
+      return REXCVAR_GET(pdz_native_texture_guarded_read) ? GuardedHash(p, bytes) : XXH3_64bits(p, bytes);
     }
 
     // A new upload texture's fields (no resource yet): CreateUploadTexture on the record thread, TextureJob on an
@@ -1730,7 +1856,7 @@ namespace pdz::native
         t_created = Clock::now();
       }
       uint64_t upload_bytes = 0;
-      if (!UploadGuestTexture(dev, im.scratch, *t, f, fi, &upload_bytes))
+      if (!UploadGuestTextureGuarded(dev, im.scratch, *t, f, fi, &upload_bytes))
       {
         dev.ReleaseLater(t->resource);
         delete t;
@@ -1805,6 +1931,7 @@ namespace pdz::native
     bool discovered = false;                 // pdz_native_texture_discover: whole base level compared when taken
     uint32_t extent = 0;                     // guest bytes of the base level (the pending-memory cap's estimate)
     std::chrono::steady_clock::time_point queued_time{};
+    uint32_t epoch = 0;                      // g_upload_epoch when queued (pdz_native_texture_guarded_read)
 
     bool Run(asyncup::CopyTarget &target) override
     {
@@ -1812,6 +1939,27 @@ namespace pdz::native
       if (!dev)
       {
         return false;
+      }
+      if (REXCVAR_GET(pdz_native_texture_guarded_read))
+      {
+        // Queued before a level load / unload started: its guest memory may be gone or reused (logs 028-030).
+        if (epoch != g_upload_epoch.load(std::memory_order_acquire))
+        {
+          g_epoch_drops.fetch_add(1, std::memory_order_relaxed);
+          return false;
+        }
+        if (!PhysByteReadable(range_begin) || !PhysByteReadable(range_end - 1) ||
+            (f.mip_address && !PhysByteReadable(f.mip_address)))
+        {
+          const uint32_t n = g_probe_drops.fetch_add(1) + 1;
+          if (n <= 20 || n % 100 == 0)
+          {
+            REXLOG_WARN("pdz_native: texture {:08X} {}x{}: guest memory {:08X}-{:08X} not readable when its upload "
+                        "worker started: dropped, made again at its next use (#{}; pdz_native_texture_guarded_read)",
+                        f.base_address, f.width, f.height, range_begin, range_end, n);
+          }
+          return false;
+        }
       }
       HostTexture *nt = NewUploadTexture(f, *fi, is_signed, srgb, content_hash, false, false);
       const D3D12_RESOURCE_DESC desc = UploadDesc(*nt, f);
@@ -1824,7 +1972,7 @@ namespace pdz::native
       }
       thread_local std::vector<uint8_t> scratch;
       uint64_t upload = 0;
-      if (!UploadGuestTexture(*dev, scratch, *nt, f, *fi, &upload, &target))
+      if (!UploadGuestTextureGuarded(*dev, scratch, *nt, f, *fi, &upload, &target))
       {
         nt->resource->Release(); // never executed on any queue (a failed job's list is not submitted)
         delete nt;
@@ -2237,6 +2385,97 @@ namespace pdz::native
                       im.frame);
         }
       }
+    }
+  } // namespace
+
+  // pdz_counterop_menu_card_file (native_menu_card.h; Counter-Op round 12): the host texture made from the player's
+  // PNG, served by Lookup in place of Rare's co-op card picture while the counter-op entry's card is on screen. Not
+  // an upload-cache entry: never hashed, never evicted, never matched by any guest key; remade when the file named
+  // by the switch changes. Record thread only.
+  namespace
+  {
+    HostTexture *g_menu_card = nullptr;
+    uint64_t g_menu_card_generation = 0; // the menucard load g_menu_card was made from (or failed to be made from)
+
+    HostTexture *MenuCardTexture(NativeDevice &dev)
+    {
+      const uint64_t wanted = menucard::Generation();
+      if (g_menu_card_generation == wanted)
+      {
+        return g_menu_card; // null: none loaded, or the texture could not be made (logged once)
+      }
+      uint64_t generation = 0;
+      const std::shared_ptr<const std::vector<uint8_t>> pixels = menucard::Pixels(generation);
+      g_menu_card_generation = generation;
+      if (g_menu_card)
+      {
+        DestroyTexture(dev, g_menu_card); // the picture of an earlier file (released after the frames that used it)
+        g_menu_card = nullptr;
+      }
+      const uint32_t size = menucard::kSize;
+      if (!pixels || pixels->size() != size_t(size) * size * 4)
+      {
+        return nullptr;
+      }
+      D3D12_RESOURCE_DESC desc{};
+      desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+      desc.Width = size;
+      desc.Height = size;
+      desc.DepthOrArraySize = 1;
+      desc.MipLevels = 1; // Rare's card picture has no mips either
+      desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM; // as Rare's (BC2_UNORM, no gamma): the PNG's bytes as they are
+      desc.SampleDesc.Count = 1;
+      desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+      D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};
+      UINT rows = 0;
+      UINT64 row_bytes = 0, total = 0;
+      dev.device()->GetCopyableFootprints(&desc, 0, 1, 0, &fp, &rows, &row_bytes, &total);
+      if (total == 0 || total > (64ull << 20) || rows != size || row_bytes != uint64_t(size) * 4)
+      {
+        REXLOG_WARN("pdz_counterop: menu card: no upload layout for the picture ({} bytes, {} rows): the COUNTER "
+                    "OPERATIVE entry keeps Rare's co-op picture",
+                    total, rows);
+        return nullptr;
+      }
+      const UploadSlice slice = dev.Upload(uint32_t(total), D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
+      ID3D12Resource *resource =
+          slice.cpu ? dev.CreateTexture(desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, "pdz_native menu card") : nullptr;
+      if (!slice.cpu || !resource)
+      {
+        REXLOG_WARN("pdz_counterop: menu card: the host texture could not be made: the COUNTER OPERATIVE entry keeps "
+                    "Rare's co-op picture");
+        return nullptr;
+      }
+      uint8_t *dst = static_cast<uint8_t *>(slice.cpu) + fp.Offset;
+      for (uint32_t y = 0; y < size; ++y)
+      {
+        std::memcpy(dst + size_t(y) * fp.Footprint.RowPitch, pixels->data() + size_t(y) * size * 4, size_t(size) * 4);
+      }
+      D3D12_TEXTURE_COPY_LOCATION dst_loc{};
+      dst_loc.pResource = resource;
+      dst_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+      dst_loc.SubresourceIndex = 0;
+      D3D12_TEXTURE_COPY_LOCATION src_loc{};
+      src_loc.pResource = slice.resource;
+      src_loc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+      src_loc.PlacedFootprint = fp;
+      src_loc.PlacedFootprint.Offset += slice.offset;
+      dev.list()->CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, nullptr);
+      HostTexture *t = new HostTexture();
+      t->resource = resource;
+      t->state = D3D12_RESOURCE_STATE_COPY_DEST;
+      t->resource_format = desc.Format;
+      t->width = t->key_width = size;
+      t->height = t->key_height = size;
+      t->depth = t->key_depth = 1;
+      t->mips = t->key_mips = 1;
+      t->array_size = 1;
+      t->dimension = 1;
+      t->format = 6; // k_8_8_8_8 (logs and dumps only: it has no guest key)
+      t->upload_frame = dev.frame_index();
+      t->upload_bytes = total;
+      g_menu_card = t;
+      return t;
     }
   } // namespace
 
@@ -2674,6 +2913,29 @@ namespace pdz::native
       fe.texture = t;
       fe.frame = im.frame;
     }
+    // pdz_counterop_menu_card_file (native_menu_card.h): while the COUNTER OPERATIVE entry's card is on screen, a
+    // fetch of the shape of Rare's card picture (1024 x 1024 DXT2_3, 2D, no gamma) gets the player's picture. The
+    // guest texture above was found / uploaded / validated as always and stays in the cache untouched. Off (the
+    // default, and whenever another scene was created since): one atomic load.
+    if (menucard::Armed() && (f.format & 63) == menucard::kGuestFormat && f.width == menucard::kSize &&
+        f.height == menucard::kSize && f.dimension == 1 && !f.stacked && f.signs == 0 && !t->mirror && !t->mirror_view)
+    {
+      if (HostTexture *card = MenuCardTexture(*dev))
+      {
+        const D3D12_CPU_DESCRIPTOR_HANDLE srv = SrvFor(*dev, *card, f.swizzle, kSwzRGBA);
+        if (srv.ptr)
+        {
+          t->last_used_frame = im.frame; // Rare's picture stays cached for the moment the card is left
+          card->last_used_frame = im.frame;
+          dev->Transition(card->resource, card->state,
+                          D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+          menucard::NoteShown(f.base_address, im.frame);
+          view.srv = srv;
+          view.texture = card;
+          return view;
+        }
+      }
+    }
     if (t->lock_dirty)
     {
       // Only reachable with pdz_native_texture_lock_check off: this draw samples a texture the game locked for writing
@@ -2875,6 +3137,7 @@ namespace pdz::native
       job->prewarm = prewarm;
       job->discovered = discovered;
       job->extent = extent;
+      job->epoch = g_upload_epoch.load(std::memory_order_acquire);
       im.pending.emplace(key, job);
       ++im.win.prefetched;
       asyncup::Submit(job);
@@ -3375,6 +3638,7 @@ namespace pdz::native
 
   void Textures::NoteLevelChange(const char *key)
   {
+    menucard::Disarm(); // pdz_counterop_menu_card_file: never inside a level (or on the way back from one)
     Impl &im = *impl_;
     std::lock_guard<std::mutex> lock(im.prewarm_mutex);
     im.prewarm_level_pending = key ? key : "";
@@ -3385,6 +3649,7 @@ namespace pdz::native
   {
     Impl &im = *impl_;
     pipeline_seed::PreloadStep(0.75); // pdz_native_shader_preload: front end and loading, before a level's first draws
+    pipeline_seed::PrepareStep(1.0);  // pdz_native_shader_prepare: the pixel shaders the game just created
     const auto now = std::chrono::steady_clock::now();
     // A level change from the game thread.
     std::string new_key;
@@ -3693,7 +3958,7 @@ namespace pdz::native
       return;
     }
     uint8_t *guest = PhysPtr(f.base_address);
-    if (!guest)
+    if (!guest || !GuardedRangeTouch(guest, l.slice_stride_bytes)) // Sun 22 Nov night (audit): still there
     {
       return;
     }
@@ -4169,4 +4434,57 @@ namespace pdz::native
   }
 
   const char *TextureFormatName(uint32_t format) { return kFormats[format & 63].name; }
+  // pdz_native_texture_guarded_read: crash_dump.cpp's question (a fault on this thread is the guard's), and the
+  // level load / unload starts (counter_op_hands.cpp's hooks of Rare's level load job and level unload).
+  bool InGuardedGuestRead() { return t_guarded_read; }
+  // Sun 22 Nov night (audit): the first and last byte of [p, p + bytes) of guest memory can be read now; a range the
+  // guest decommitted faults inside this guard instead of ending the process (crash_dump.cpp leaves it alone). Two
+  // loads, no system call; any thread. True with pdz_native_texture_guarded_read off (as before) or no range.
+  namespace
+  {
+    __declspec(noinline) bool TouchFaulted(const uint8_t *p, uint32_t bytes)
+    {
+      bool faulted = false;
+      const bool outer = t_guarded_read;
+      t_guarded_read = true;
+      __try
+      {
+        volatile uint8_t sink = *static_cast<const volatile uint8_t *>(p);
+        sink = *static_cast<const volatile uint8_t *>(p + (bytes - 1));
+        (void)sink;
+      }
+      __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION || GetExceptionCode() == EXCEPTION_IN_PAGE_ERROR
+                    ? EXCEPTION_EXECUTE_HANDLER
+                    : EXCEPTION_CONTINUE_SEARCH)
+      {
+        faulted = true;
+      }
+      t_guarded_read = outer;
+      return faulted;
+    }
+  } // namespace
+  bool GuardedRangeTouch(const uint8_t *p, uint32_t bytes)
+  {
+    if (!p || !bytes || !REXCVAR_GET(pdz_native_texture_guarded_read))
+    {
+      return true;
+    }
+    if (!TouchFaulted(p, bytes))
+    {
+      return true;
+    }
+    g_guarded_faults.fetch_add(1, std::memory_order_relaxed);
+    return false;
+  }
+  void OnGuestMemoryChange(const char *why)
+  {
+    const uint32_t e = g_upload_epoch.fetch_add(1, std::memory_order_acq_rel) + 1;
+    static std::atomic<uint32_t> logged{0};
+    if (logged.fetch_add(1) < 40)
+    {
+      REXLOG_INFO("pdz_native: {}: texture uploads queued before now are dropped (epoch {}; so far {} dropped this "
+                  "way, {} unreadable at the worker, {} reads faulted; pdz_native_texture_guarded_read)",
+                  why, e, g_epoch_drops.load(), g_probe_drops.load(), g_guarded_faults.load());
+    }
+  }
 } // namespace pdz::native

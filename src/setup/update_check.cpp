@@ -38,8 +38,8 @@ namespace pdz::update_check
   namespace
   {
     constexpr const wchar_t *kLatestUrl =
-        L"https://api.github.com/repos/EddieVanHelgen/PerfectDarkZeroRestored/releases/latest";
-    constexpr const char *kReleasePage = "https://github.com/EddieVanHelgen/PerfectDarkZeroRestored/releases/tag/";
+        L"https://api.github.com/repos/PDZRestored/PerfectDarkZeroRestored/releases/latest";
+    constexpr const char *kReleasePage = "https://github.com/PDZRestored/PerfectDarkZeroRestored/releases/tag/";
     constexpr DWORD kTimeoutMs = 3000;          // each of resolve, connect, send and receive
     constexpr size_t kMaxBody = 512 * 1024;     // the latest-release JSON is a few KB
 

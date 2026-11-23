@@ -35,6 +35,7 @@ REXCVAR_DECLARE(bool, pdz_native_cube_fix);
 REXCVAR_DECLARE(bool, pdz_native_rcpf_zero);
 REXCVAR_DECLARE(bool, pdz_native_stacked_array);
 REXCVAR_DECLARE(bool, pdz_native_live_literals);
+REXCVAR_DECLARE(bool, pdz_fix_fog_true_distance); // the fog by the true distance (Tue 17 Nov), native_coissue.cpp
 
 namespace pdz::native
 {
@@ -103,10 +104,31 @@ namespace pdz::native::coissue
   const HlslFixStats &GetRcpfStats();
   const HlslFixStats &GetArrayStats();
   const HlslFixStats &GetLiveLiteralStats();
+  // pdz_fix_fog_true_distance (native_hlslfix.h PatchFogTrueDistance): with_sites = shaders with the fog line, sites =
+  // shaders patched.
+  const HlslFixStats &GetFogStats();
   // "co-issue fix on: checked C, hazardous H (I instructions), patched P (D from disk, T ms), failed F | param gen on:
   // checked C (F from the cache's containers), enabled E, patched P, already A, failed F | cube fix on: checked C,
   // using U, patched P, failed F | rcpf zero on: ... | stacked array on: ... | live literals on: ...".
   std::string StatsText();
   // After the pipeline list's collect pass (depth20e4::batch), which ran Apply on copies: its counts forgotten.
   void ResetForSeed();
+  // pdz_native_shader_prepare (depth20e4::ahead): Apply run on a copy of a shader while this object lives leaves
+  // every counter and once-only log flag as it was (the draw's own Apply counts the shader).
+  class CountersHold
+  {
+  public:
+    CountersHold();
+    ~CountersHold();
+    CountersHold(const CountersHold &) = delete;
+    CountersHold &operator=(const CountersHold &) = delete;
+
+  private:
+    Stats stats_;
+    ParamGenStats param_gen_;
+    CubeFixStats cube_;
+    HlslFixStats rcpf_, array_, live_, fog_;
+    uint32_t fog_family_[3];
+    bool pcf_logged_, blend_logged_, fade_logged_;
+  };
 } // namespace pdz::native::coissue

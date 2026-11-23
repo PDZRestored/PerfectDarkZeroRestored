@@ -102,6 +102,7 @@
 // now (no blackout needed: the two lights are set to Random where they are).
 // Set it back to 0 before the next command.
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -119,6 +120,7 @@
 #include "hook_profile.h" // pdz_hook_profile (must follow <rex/hook.h>)
 
 #include "guest_function.h" // our indirect calls: nullptr for no function (log 101)
+#include "guest_readable_Sat21Nov.h" // Sun 22 Nov night (audit): pdz::guestmem::Ok
 
 REXCVAR_DEFINE_BOOL(pdz_lab_gun_warning2, false, "Gameplay",
                     "Laboratory: the hub scientist's recorded second gun warning (LV05_SPEECH_SCIENTIST_15 \"You heard "
@@ -329,7 +331,9 @@ namespace
 
   bool IsCharacter(const uint8_t *base, uint32_t character)
   {
-    return IsGuestPointer(character) && IsGuestPointer(Load32(base, character));
+    // Sun 22 Nov night (audit): the character's memory is mapped (the cached scientists / speakers may be stale).
+    return IsGuestPointer(character) && pdz::guestmem::Ok(base, character, kCharacterSpeaking + 4) &&
+           IsGuestPointer(Load32(base, character));
   }
 
   float Health(PPCContext &ctx, uint8_t *base, uint32_t character)
@@ -338,7 +342,12 @@ namespace
     {
       return 0.0f;
     }
-    PPCFunc *fn = pdz::GuestFunction(Load32(base, Load32(base, character) + kHealthSlot), "lab_cut_content health");
+    const uint32_t vtable = Load32(base, character);
+    if (vtable < 0x82000000u || vtable >= 0x83000000u)
+    {
+      return 0.0f; // Sun 22 Nov night (audit): no class of the game's (GuestFunction refuses _purecall)
+    }
+    PPCFunc *fn = pdz::GuestFunction(Load32(base, vtable + kHealthSlot), "lab_cut_content health");
     if (!fn)
     {
       return 0.0f;
@@ -541,9 +550,20 @@ namespace
 
   // The state for this run: a new script pointer or a clock that went back
   // (a restart) starts over.
+  // Stealth round 3c (Sun 15 Nov night, fix 1): a level start (lab_cut::LevelReset, from the stealth layer's clear).
+  // A mission restart keeps the AI clock running and can put the new script where the old one was: neither test
+  // below sees it, and the cut lines that play once would not play in the new attempt.
+  std::atomic<bool> g_level_reset{false};
   State &StateFor(const uint8_t *base, uint32_t script)
   {
     const float now = Clock(base);
+    if (g_level_reset.exchange(false, std::memory_order_relaxed) && g_state.script == script)
+    {
+      const int32_t test_last = g_state.test_last; // (the test tool's last command is not run again by a restart)
+      g_state = State{};
+      g_state.script = script;
+      g_state.test_last = test_last;
+    }
     if (g_state.script != script || now + 1.0f < g_state.last_clock)
     {
       g_state = State{};
@@ -1156,9 +1176,112 @@ REX_HOOK_RAW(sub_821E1B48)
 // sub_82319B18: the Laboratory scientist task's update (r3 = the task, +0x10
 // the scientist). Before Rare's code: the glyph exchange's moment (c). After:
 // the scientist register, his health (b), and the module's frame tick.
+// Round 11k (for lab_stealth.cpp): which scientist task and which alarm task ran for a character in the last
+// moments, and a cue played on a character.
+namespace lab_cut
+{
+  // Stealth round 3c (Sun 15 Nov night, fix 1): a level start. A flag only (any thread); the state starts over at
+  // its next use.
+  void LevelReset()
+  {
+    g_level_reset.store(true, std::memory_order_relaxed);
+  }
+
+  struct TaskNote
+  {
+    std::atomic<uint32_t> character{0}, task{0}, clock{0};
+  };
+  TaskNote g_sci_notes[24], g_alarm_notes[24];
+  void Note(TaskNote *notes, const uint8_t *base, uint32_t task)
+  {
+    if (!IsGuestPointer(task))
+    {
+      return;
+    }
+    const uint32_t character = Load32(base, task + kSciCharacter); // (+0x10 in both task classes)
+    if (!IsGuestPointer(character))
+    {
+      return;
+    }
+    const uint32_t clock = Load32(base, kAiClock);
+    int free_slot = -1;
+    for (int i = 0; i < 24; ++i)
+    {
+      const uint32_t who = notes[i].character.load(std::memory_order_relaxed);
+      if (who == character)
+      {
+        notes[i].task.store(task, std::memory_order_relaxed);
+        notes[i].clock.store(clock, std::memory_order_relaxed);
+        return;
+      }
+      if (!who && free_slot < 0)
+      {
+        free_slot = i;
+      }
+    }
+    if (free_slot >= 0)
+    {
+      notes[free_slot].task.store(task, std::memory_order_relaxed);
+      notes[free_slot].clock.store(clock, std::memory_order_relaxed);
+      notes[free_slot].character.store(character, std::memory_order_relaxed);
+    }
+  }
+  uint32_t Noted(const TaskNote *notes, const uint8_t *base, uint32_t character)
+  {
+    const float now = Clock(base);
+    for (int i = 0; i < 24; ++i)
+    {
+      if (notes[i].character.load(std::memory_order_relaxed) != character)
+      {
+        continue;
+      }
+      const uint32_t bits = notes[i].clock.load(std::memory_order_relaxed);
+      float at;
+      std::memcpy(&at, &bits, 4);
+      const uint32_t task = notes[i].task.load(std::memory_order_relaxed);
+      return (now >= at && now - at < 0.5f && IsGuestPointer(task) && Load32(base, task + kSciCharacter) == character) ? task : 0;
+    }
+    return 0;
+  }
+  // The Laboratory scientist task (820A3190) that ran for this character in the last half second; 0: none.
+  uint32_t SciTaskOf(const uint8_t *base, uint32_t character)
+  {
+    const uint32_t task = Noted(g_sci_notes, base, character);
+    return task && Load32(base, task) == 0x820A3190 ? task : 0;
+  }
+  // Rare's alarm task (8209339C) ran for this character in the last half second.
+  bool AlarmRunning(const uint8_t *base, uint32_t character)
+  {
+    return Noted(g_alarm_notes, base, character) != 0;
+  }
+  void SayOnCharacter(PPCContext &ctx, uint8_t *base, uint32_t character, const char *cue)
+  {
+    SayOn(ctx, base, character, cue);
+  }
+} // namespace lab_cut
+
+#if PDZ_COUNTEROP
+void *PdzCounterOpSoloEnter(uint8_t *base); // counter_op_triggers.cpp (round 10): the single-player scope
+void PdzCounterOpSoloLeave(void *scope);
+namespace
+{
+  struct CounterOpSolo
+  {
+    void *scope;
+    explicit CounterOpSolo(uint8_t *base) : scope(PdzCounterOpSoloEnter(base)) {}
+    ~CounterOpSolo() { PdzCounterOpSoloLeave(scope); }
+  };
+} // namespace
+#endif
 REX_HOOK_RAW(sub_82319B18)
 {
+#if PDZ_COUNTEROP
+  // Counter-Op round 10: the scientist task reads "the nearer player" (the agent or her partner) outside the level
+  // script's calls: in a Counter-Op game it only knows the agent (no cowering to player 2, no 8/47 for him).
+  const CounterOpSolo counter_op_solo(base);
+#endif
   const uint32_t task = ctx.r3.u32;
+  lab_cut::Note(lab_cut::g_sci_notes, base, task);
   const bool glyph = REXCVAR_GET(pdz_lab_glyph_talk);
   const bool injured = REXCVAR_GET(pdz_lab_injured_warning);
   const bool hints = REXCVAR_GET(pdz_lab_more_hints);
@@ -1211,6 +1334,7 @@ REX_HOOK_RAW(sub_82319B18)
 REX_HOOK_RAW(sub_821DF070)
 {
   const uint32_t task = ctx.r3.u32;
+  lab_cut::Note(lab_cut::g_alarm_notes, base, task);
   const bool watch = REXCVAR_GET(pdz_lab_alarm_anim) && IsGuestPointer(task);
   const uint32_t before = watch ? Load32(base, task + kAlarmResult) : 0;
   __imp__sub_821DF070(ctx, base);

@@ -51,6 +51,19 @@
 #include "../game_constants.h"
 #include "hook_profile.h" // pdz_hook_profile (must follow <rex/hook.h>)
 
+// Sat 21 Nov evening (the owner: the cursor popped up in play without the mouse moving: at pause / unpause, in loading
+// hitches, around F12): while the game window is in front and focused the cursor is never shown (menus and pause
+// too; the mouse does nothing there), through the SDK's Window::SetCursorForceHidden: a blank cursor is set (a
+// stalled message pump has nothing to show; SDL's window class has no cursor of its own) and SDL's own motion events
+// (when relative mode ends) no longer reveal it. It shows again when the game loses focus (alt-tab) and in the
+// settings window (its own window). F1-F24, Print Screen, Pause and Scroll Lock (tool / debug keys: F12 marks) and
+// pointer warps no longer count as keyboard / mouse use, so they no longer switch the last device used.
+REXCVAR_DEFINE_BOOL(pdz_fix_cursor_hidden, true, "Mouse",
+                    "The mouse cursor is never shown while the game window is in front and focused (in play, menus and "
+                    "pause; the mouse does nothing in the game's menus): no more cursor at pause / unpause, in loading "
+                    "hitches or around F12. It shows when the game loses focus (alt-tab) and in the settings window. "
+                    "The F keys and other tool keys no longer count as switching to keyboard / mouse. Off = before")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(pdz_mouse_look, true, "Mouse",
                     "Mouse aim: on foot the mouse turns the view directly (1:1, no dead zone, response curve, "
                     "acceleration or turn cap) instead of emulating the right stick; slower when zoomed, in proportion "
@@ -90,6 +103,10 @@ REXCVAR_DEFINE_DOUBLE(pdz_mouse_test_motion, 0.0, "Mouse",
                       "moves through the OS (Windows SendInput) while the game window is in front: the whole path of a "
                       "real mouse. A 'pdz_mouse: test motion' line every 2 s. 0 = off")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(pdz_test_key_tap, 0, "Testing",
+                     "TESTING TOOL (Sat 21 Nov evening): each new non-zero value taps that Windows virtual key once "
+                     "through the OS (SendInput, key down then up) while the game window is in front, e.g. 123 = F12")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_DOUBLE(pdz_mouse_test_motion_y, 0.0, "Mouse",
                       "TESTING TOOL: as pdz_mouse_test_motion, counts per second downward")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -112,6 +129,13 @@ REXCVAR_DEFINE_BOOL(pdz_mouse_direct_steer, true, "Mouse",
                     "the same either way. The CamSpy, the guided rocket, the hovercraft and the jetpack keep the "
                     "mouse as the right stick. Needs pdz_mouse_look")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(pdz_mouse_direct_camspy, true, "Mouse",
+                    "Mouse aim with the CamSpy (Thu 19 Nov night): the mouse turns the CamSpy's own view directly, as "
+                    "Jo's view on foot (pdz_mouse_sensitivity's degrees per count, whatever the frame rate, no stick "
+                    "dead zone, curve or turn cap; the game's pitch limit). Off = the mouse is the right stick the "
+                    "CamSpy reads (slow: about a tenth of Jo's turn). The controller is the game's own either way. "
+                    "Needs pdz_mouse_look")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(pdz_mouse_direct_steer_log, false, "Mouse",
                     "Diagnostic: once a second while guest user 0 is on a mounted turret, a 'pdz_mouse: turret aim' "
                     "line (its yaw / pitch, this second's mouse counts and turn and the change of its aim, turret "
@@ -126,6 +150,10 @@ REXCVAR_DEFINE_DOUBLE(pdz_mouse_test_face_pitch, 999.0, "Mouse",
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REX_EXTERN(__imp__sub_825AF590);
+
+#ifdef PDZ_COUNTEROP
+void PdzCounterOpHudLevelEnd(); // counter_op_hud.cpp
+#endif
 
 namespace pdz::mouse
 {
@@ -170,6 +198,12 @@ namespace pdz::mouse
     std::atomic<int64_t> g_syn_polls{0}, g_syn_nonzero{0}, g_syn_counts_x{0}, g_syn_counts_y{0};
     std::atomic<double> g_syn_sum{0.0}, g_syn_last_x{0.0}, g_syn_last_y{0.0};
     std::atomic<int> g_last_device{-1}; // 1 = keyboard / mouse, 0 = a controller, -1 = not decided yet
+    // pdz_fix_cursor_hidden (the watchdog thread): what was last applied (-1 = nothing yet), the kept-hidden count last
+    // logged, and the game's own visibility request last seen.
+    int g_cursor_forced = -1;
+    uint32_t g_cursor_kept_logged = 0;
+    std::chrono::steady_clock::time_point g_cursor_kept_at{};
+    int g_cursor_asked = -1;
     // TakeRawMouseMotion: every mouse motion event the window sees, signed counts, whoever owns the pointer.
     std::atomic<int64_t> g_raw_dx{0}, g_raw_dy{0};
 
@@ -181,6 +215,10 @@ namespace pdz::mouse
     std::atomic<bool> g_steering{false};
     // The steered thing's aim takes the mouse directly (pdz_mouse_direct_steer: a turret), not as the right stick.
     std::atomic<bool> g_steered_direct{false};
+    // Sun 22 Nov (pdz_fix_camspy_turn_sound): the last time the mouse turned the CamSpy's view directly (steady clock
+    // ns), and how much (degrees, yaw / pitch), for its rotate sound (restored_sounds_r2_Tue17Nov.cpp).
+    std::atomic<int64_t> g_camspy_mouse_ns{0};
+    std::atomic<float> g_camspy_mouse_yaw{0.0f}, g_camspy_mouse_pitch{0.0f};
     // The player whose own view the mouse aims (ApplyMouseLook: guest user 0, our view class): only his steering
     // counts (a bot gunner on a turret runs the same look update).
     std::atomic<uint32_t> g_human_player{0};
@@ -204,6 +242,18 @@ namespace pdz::mouse
 
     // The mounted turret's caller of the look update (sub_8258CEA0 -> sub_825B3AC0).
     constexpr uint32_t kTurretCaller = 0x8258DF48;
+    // Thu 19 Nov night: the CamSpy's caller of the look update (sub_8253F7D8 at 8253FA94, only while its control flag
+    // +1571 is set; owner = its user at +1536, view = the CamSpy, vtable 820BFA40: yaw +1380 / pitch +1376, plain
+    // fields, degrees, no limits of its own: Rare's look update clamps the pitch to the look tuning's limit, as on
+    // foot). Rare's flight update reads the angles after the look update returns (8253FEB0, 82540270), so a turn
+    // made right after it (AfterSteeredLook) is used in the same frame. Rare's look update only adds stick speed x
+    // dt, so nothing overwrites ours.
+    constexpr uint32_t kCamSpyCaller = 0x8253FA98;
+    bool DirectCaller(uint32_t caller)
+    {
+      return (caller == kTurretCaller && REXCVAR_GET(pdz_mouse_direct_steer)) ||
+             (caller == kCamSpyCaller && REXCVAR_GET(pdz_mouse_direct_camspy));
+    }
 
     // A steered view's yaw / pitch fields, from its own vtable: +24 / +28 must be 'lfs f1,D(r3); blr' and +32 / +36
     // 'stfs f1,D(r3); blr' with the same D for each angle (the turret, vtable 820C5BE0: 8258BA10 / 8258BA18 read
@@ -408,11 +458,10 @@ namespace pdz::mouse
     // pdz_mouse_direct_steer: a mounted turret whose view has plain yaw / pitch fields takes the mouse into its aim
     // (AfterSteeredLook); everything else (and a view of another shape) the right stick, as before.
     AngleFields fields;
-    const bool direct = caller == kTurretCaller && REXCVAR_GET(pdz_mouse_direct_steer) &&
-                        REXCVAR_GET(pdz_mouse_look) && FindAngleFields(base, object, fields);
-    if (caller == kTurretCaller && REXCVAR_GET(pdz_mouse_direct_steer) && !direct && LogOnce(0xFFFF0003u))
+    const bool direct = DirectCaller(caller) && REXCVAR_GET(pdz_mouse_look) && FindAngleFields(base, object, fields);
+    if (DirectCaller(caller) && !direct && LogOnce(caller == kTurretCaller ? 0xFFFF0003u : 0xFFFF0007u))
     {
-      REXLOG_INFO("pdz_mouse: turret {:08X} (vtable {:08X}): {}: the mouse stays the right stick", object,
+      REXLOG_INFO("pdz_mouse: {} {:08X} (vtable {:08X}): {}: the mouse stays the right stick", SteeredName(caller), object,
                   Be32(base, object),
                   REXCVAR_GET(pdz_mouse_look) ? "its yaw / pitch getters and setters aren't plain fields"
                                               : "pdz_mouse_look is off");
@@ -426,7 +475,15 @@ namespace pdz::mouse
     look.ConsumeForSteering(direct); // the pointer stays ours; its motion becomes the right stick (TakeSteerStick)
     if (!g_steering.exchange(true, std::memory_order_relaxed) || was_direct != direct)
     {
-      if (direct)
+      if (direct && caller == kCamSpyCaller)
+      {
+        REXLOG_INFO("pdz_mouse: the CamSpy takes the mouse into its own view (object {:08X}, vtable {:08X}, yaw +{} pitch "
+                    "+{}): {:.4f} deg per count as Jo's view (pdz_mouse_sensitivity {:.2f}), mouse up = {}, the game's "
+                    "pitch limit; no stick model (pdz_mouse_direct_camspy)",
+                    object, Be32(base, object), fields.yaw, fields.pitch, REXCVAR_GET(pdz_mouse_sensitivity) * kDegreesPerCount,
+                    REXCVAR_GET(pdz_mouse_sensitivity), REXCVAR_GET(pdz_mouse_invert) ? "look down (pdz_mouse_invert)" : "look up");
+      }
+      else if (direct)
       {
         // Rare's clamp after the look update (sub_8258CEA0 at 8258DF78): pitch x 0.01745 (820EAE48), wrapped
         // (sub_82703490), then fsel against the floats at 82D35BE8 (top) / 82D35BE4 (bottom), replaced by the
@@ -714,6 +771,30 @@ namespace pdz::mouse
   void PumpTestMotion()
   {
 #ifdef _WIN32
+    {
+      // pdz_test_key_tap (Sat 21 Nov evening): one key tap per new value, only while one of our windows is in front.
+      static std::atomic<int32_t> tapped{0};
+      const int32_t vk = REXCVAR_GET(pdz_test_key_tap);
+      if (vk != tapped.load(std::memory_order_relaxed))
+      {
+        tapped.store(vk, std::memory_order_relaxed);
+        DWORD fg = 0;
+        GetWindowThreadProcessId(GetForegroundWindow(), &fg);
+        bool sent = false;
+        if (vk > 0 && vk < 256 && fg == GetCurrentProcessId())
+        {
+          INPUT in[2]{};
+          in[0].type = in[1].type = INPUT_KEYBOARD;
+          in[0].ki.wVk = in[1].ki.wVk = WORD(vk);
+          in[1].ki.dwFlags = KEYEVENTF_KEYUP;
+          sent = SendInput(2, in, sizeof(INPUT)) == 2;
+        }
+        if (vk)
+        {
+          REXLOG_INFO("pdz_mouse: test key tap: virtual key {} {}", vk, sent ? "sent" : "NOT sent (the game window is not in front)");
+        }
+      }
+    }
     const double rate_x = REXCVAR_GET(pdz_mouse_test_motion), rate_y = REXCVAR_GET(pdz_mouse_test_motion_y);
     if (rate_x == 0.0 && rate_y == 0.0)
     {
@@ -1009,6 +1090,9 @@ namespace pdz::mouse
 
   void MouseLook::OnClosing(rex::ui::UIEvent &)
   {
+#ifdef PDZ_COUNTEROP
+    PdzCounterOpHudLevelEnd(); // the game closed inside a Counter-Op level: its ring / radar / prompt counts
+#endif
     bool give_back = false;
     {
       std::lock_guard lock(mu_);
@@ -1146,6 +1230,63 @@ namespace pdz::mouse
         lock.unlock();
         Post(std::move(task));
         lock.lock();
+      }
+      // Sat 21 Nov evening: pdz_fix_cursor_hidden.
+      if (window_)
+      {
+        const bool fix = REXCVAR_GET(pdz_fix_cursor_hidden);
+        rex::input::mnk::SetQuietToolKeys(fix);
+        const bool overlay = OverlayWantsMouse();
+        const bool want = fix && has_focus_ && !overlay;
+        if (int(want) != g_cursor_forced)
+        {
+          const bool first = g_cursor_forced < 0;
+          g_cursor_forced = int(want);
+          if (fix || !first)
+          {
+            REXLOG_INFO("pdz_cursor: {} ({})", want ? "HIDDEN" : "may show",
+                        want ? "the game window is in front and focused"
+                        : !fix ? "pdz_fix_cursor_hidden is off: the game's own rules"
+                        : !has_focus_ ? "the game window lost focus (alt-tab or another window in front)"
+                                      : "a debug overlay wants the mouse");
+          }
+          UiTask task = [this, want] {
+            rex::ui::Window *window = nullptr;
+            {
+              std::lock_guard hold(mu_);
+              window = window_;
+            }
+            if (window)
+            {
+              window->SetCursorForceHidden(want);
+            }
+          };
+          lock.unlock();
+          Post(std::move(task));
+          lock.lock();
+        }
+        // The game's own visibility requests (mouse capture taken / given back) and SDL's reveals, kept hidden.
+        const int asked = int(window_->GetCursorVisibility());
+        if (asked != g_cursor_asked)
+        {
+          if (g_cursor_asked >= 0 && fix)
+          {
+            REXLOG_INFO("pdz_cursor: the game asked for the cursor {} (mouse look {}, menu mode {}){}", asked == 0 ? "visible" : asked == 1 ? "auto-hidden" : "hidden",
+                        phase_ == Phase::kEngaged ? "engaged" : phase_ == Phase::kIdle ? "idle" : "changing", rex::input::mnk::IsMenuMode() ? "on" : "off",
+                        want ? ": KEPT HIDDEN (pdz_fix_cursor_hidden)" : "");
+          }
+          g_cursor_asked = asked;
+        }
+        const uint32_t kept = rex::ui::Window::CursorRevealsKeptHidden();
+        if (kept != g_cursor_kept_logged && now - g_cursor_kept_at >= std::chrono::seconds(1))
+        {
+          REXLOG_INFO("pdz_cursor: KEPT HIDDEN: {} show request(s) since the last line (SDL mouse motion events or a visible request "
+                      "while the game window is focused; {} in all) | mouse look {}, menu mode {}, last device {}",
+                      kept - g_cursor_kept_logged, kept, phase_ == Phase::kEngaged ? "engaged" : phase_ == Phase::kIdle ? "idle" : "changing",
+                      rex::input::mnk::IsMenuMode() ? "on" : "off", g_last_device.load(std::memory_order_relaxed) == 1 ? "keyboard / mouse" : "controller");
+          g_cursor_kept_logged = kept;
+          g_cursor_kept_at = now;
+        }
       }
     }
   }
@@ -1456,7 +1597,7 @@ namespace pdz::mouse
   void AfterSteeredLook(uint8_t *base, uint32_t owner, uint32_t object, uint32_t caller, Steer steer)
   {
     const bool log = REXCVAR_GET(pdz_mouse_direct_steer_log);
-    if (steer == Steer::kNotTaken || caller != kTurretCaller || (steer != Steer::kDirect && !log))
+    if (steer == Steer::kNotTaken || (caller != kTurretCaller && caller != kCamSpyCaller) || (steer != Steer::kDirect && !log))
     {
       return;
     }
@@ -1494,10 +1635,17 @@ namespace pdz::mouse
     t.pitch = pitch_now;
     if (steer == Steer::kDirect)
     {
-      const MouseLook::SteerTurn st = MouseLook::Get().ConsumeSteer(::ZoomScale(base, owner));
+      // (The CamSpy: Jo's degrees per count, no zoom scale of the player's: the CamSpy's view is its own.)
+      const MouseLook::SteerTurn st = MouseLook::Get().ConsumeSteer(caller == kCamSpyCaller ? 1.0 : ::ZoomScale(base, owner));
       if (st.turn.yaw != 0.0 || st.turn.pitch != 0.0)
       {
         ::Turn(base, object, st.turn.yaw, st.turn.pitch, false, f.yaw, f.pitch);
+        if (caller == kCamSpyCaller)
+        {
+          g_camspy_mouse_yaw.store(float(st.turn.yaw), std::memory_order_relaxed);
+          g_camspy_mouse_pitch.store(float(st.turn.pitch), std::memory_order_relaxed);
+          g_camspy_mouse_ns.store(now, std::memory_order_relaxed);
+        }
       }
       t.counts_x += st.counts_x;
       t.counts_y += st.counts_y;
@@ -1509,16 +1657,32 @@ namespace pdz::mouse
     if (log && now - t.second_ns >= 1000000000LL)
     {
       const double secs = double(now - t.second_ns) / 1e9;
-      REXLOG_INFO("pdz_mouse: turret aim: {} | {} updates in {:.2f} s ({:.0f}/s) | yaw {:+.2f} pitch {:+.2f} deg | "
+      REXLOG_INFO("pdz_mouse: {} aim: {} | {} updates in {:.2f} s ({:.0f}/s) | yaw {:+.2f} pitch {:+.2f} deg | "
                   "this second: mouse counts x {:+.0f} y {:+.0f}, mouse turn yaw {:+.3f} pitch {:+.3f}, aim moved yaw "
                   "{:+.3f} pitch {:+.3f} | since mount: counts x {:+.0f} y {:+.0f}",
-                  steer == Steer::kDirect ? "direct" : "mouse as the right stick (pdz_mouse_direct_steer off)",
+                  SteeredName(caller), steer == Steer::kDirect ? "direct" : "mouse as the right stick (direct switch off)",
                   t.frames, secs, t.frames / secs, yaw_now, pitch_now, t.counts_x, t.counts_y, t.turn_yaw,
                   t.turn_pitch, t.moved_yaw, t.moved_pitch, t.total_x, t.total_y);
       t.second_ns = now;
       t.frames = 0;
       t.counts_x = t.counts_y = t.turn_yaw = t.turn_pitch = t.moved_yaw = t.moved_pitch = 0.0;
     }
+  }
+
+  // Sun 22 Nov (pdz_fix_camspy_turn_sound): how long ago the mouse last turned the CamSpy's view directly
+  // (pdz_mouse_direct_camspy), in seconds (1e9 if never), and that turn's yaw / pitch in degrees.
+  double CamSpyMouseTurnAgo(float *yaw, float *pitch)
+  {
+    const int64_t at = g_camspy_mouse_ns.load(std::memory_order_relaxed);
+    if (yaw)
+    {
+      *yaw = g_camspy_mouse_yaw.load(std::memory_order_relaxed);
+    }
+    if (pitch)
+    {
+      *pitch = g_camspy_mouse_pitch.load(std::memory_order_relaxed);
+    }
+    return at == 0 ? 1e9 : double(NowNs() - at) / 1e9;
   }
 } // namespace pdz::mouse
 

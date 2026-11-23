@@ -190,6 +190,53 @@ float4 ps_pack(float4 pos : SV_Position) : SV_Target
 }
 )HLSL";
 
+    // Downsample (supersampling): the area filter. src_origin = the source's size; out_width / out_height = the
+    // output's. t1 is not read (the shared root signature has two SRVs; the source is bound to both).
+    const char kDownSource[] = R"HLSL(
+cbuffer Constants : register(b0)
+{
+  int2 src_size;
+  int2 dst_origin;
+  uint mode;
+  uint flags;
+  float exp_scale;
+  uint out_width;
+  uint out_height;
+  uint pad0, pad1, pad2;
+};
+Texture2D<float4> t0 : register(t0);
+RWTexture2D<float4> u0 : register(u0);
+
+[numthreads(8, 8, 1)]
+void cs_down(uint3 id : SV_DispatchThreadID)
+{
+  if (id.x >= out_width || id.y >= out_height)
+  {
+    return;
+  }
+  float2 ratio = float2(src_size) / float2(out_width, out_height);
+  float2 lo = float2(id.xy) * ratio; // the output pixel's footprint, in source texels
+  float2 hi = lo + ratio;
+  int2 first = int2(floor(lo));
+  float3 sum = float3(0.0, 0.0, 0.0);
+  float weight = 0.0;
+  for (int j = 0; j < 5; ++j)
+  {
+    int y = first.y + j;
+    float wy = max(0.0, min(hi.y, float(y + 1)) - max(lo.y, float(y)));
+    for (int i = 0; i < 5; ++i)
+    {
+      int x = first.x + i;
+      float w = wy * max(0.0, min(hi.x, float(x + 1)) - max(lo.x, float(x)));
+      float3 c = t0.Load(int3(min(x, src_size.x - 1), min(y, src_size.y - 1), 0)).rgb;
+      sum += c * c * w;
+      weight += w;
+    }
+  }
+  u0[id.xy] = float4(sqrt(sum / max(weight, 1e-6)), 1.0);
+}
+)HLSL";
+
     struct Constants
     {
       int32_t src_origin[2];
@@ -216,6 +263,9 @@ float4 ps_pack(float4 pos : SV_Position) : SV_Target
       // the pass is not recorded again.
       bool pack_tried = false;
       ID3D12PipelineState *pack_pso = nullptr;
+      // Downsample (supersampling): built at its first use; a failure is logged once.
+      bool down_tried = false;
+      ID3D12PipelineState *down_pso = nullptr;
     };
     State g_state;
 
@@ -520,9 +570,76 @@ float4 ps_pack(float4 pos : SV_Position) : SV_Target
     return true;
   }
 
+  bool Downsample(NativeDevice &dev, const DownsampleDesc &desc)
+  {
+    if (!Init(dev) || !desc.src || !desc.output || !desc.width || !desc.height || !desc.src_width || !desc.src_height)
+    {
+      return false;
+    }
+    State &s = g_state;
+    if (!s.down_tried)
+    {
+      s.down_tried = true;
+      if (ID3DBlob *cs = CompileShader(dev, "cs_down", "cs_5_0", kDownSource, sizeof(kDownSource) - 1))
+      {
+        D3D12_COMPUTE_PIPELINE_STATE_DESC cdesc{};
+        cdesc.pRootSignature = s.root;
+        cdesc.CS.pShaderBytecode = cs->GetBufferPointer();
+        cdesc.CS.BytecodeLength = cs->GetBufferSize();
+        const HRESULT hr = dev.device()->CreateComputePipelineState(&cdesc, IID_PPV_ARGS(&s.down_pso));
+        cs->Release();
+        if (FAILED(hr))
+        {
+          s.down_pso = nullptr;
+          REXLOG_ERROR("pdz_native: supersampling: the downsample compute PSO failed: 0x{:08X}", uint32_t(hr));
+        }
+      }
+    }
+    if (!s.down_pso)
+    {
+      return false;
+    }
+    RecList *list = dev.list();
+    Descriptor srvs = dev.AllocSrv(2);
+    Descriptor uav = dev.AllocSrv(1);
+    if (!srvs.cpu.ptr || !uav.cpu.ptr)
+    {
+      return false;
+    }
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc{};
+    srv_desc.Format = desc.format;
+    srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv_desc.Texture2D.MipLevels = 1;
+    D3D12_CPU_DESCRIPTOR_HANDLE second = srvs.cpu;
+    second.ptr += dev.srv_descriptor_size();
+    dev.device()->CreateShaderResourceView(desc.src, &srv_desc, srvs.cpu);
+    dev.device()->CreateShaderResourceView(desc.src, &srv_desc, second); // t1: not read, but the table has two
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav_desc{};
+    uav_desc.Format = desc.format;
+    uav_desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    dev.device()->CreateUnorderedAccessView(desc.output, nullptr, &uav_desc, uav.cpu);
+
+    Constants c{};
+    c.src_origin[0] = int32_t(desc.src_width);
+    c.src_origin[1] = int32_t(desc.src_height);
+    c.out_width = desc.width;
+    c.out_height = desc.height;
+    c.exp_scale = 1.0f;
+    dev.ListStateChanged();
+    list->SetPipelineState(s.down_pso);
+    list->SetComputeRootSignature(s.root);
+    list->SetComputeRoot32BitConstants(0, 12, &c, 0);
+    list->SetComputeRootDescriptorTable(1, srvs.gpu);
+    list->SetComputeRootDescriptorTable(2, uav.gpu);
+    list->Dispatch((desc.width + 7) / 8, (desc.height + 7) / 8, 1);
+    return true;
+  }
+
   uint32_t PipelineCount()
   {
-    return uint32_t(g_state.blit_psos.size()) + (g_state.gamma_pso ? 1u : 0u) + (g_state.pack_pso ? 1u : 0u);
+    return uint32_t(g_state.blit_psos.size()) + (g_state.gamma_pso ? 1u : 0u) + (g_state.pack_pso ? 1u : 0u) +
+           (g_state.down_pso ? 1u : 0u);
   }
   uint32_t RootSignatureCount() { return g_state.root ? 1u : 0u; }
 } // namespace pdz::native::passes

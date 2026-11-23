@@ -1543,9 +1543,19 @@ namespace pdz::native
     {
       create_time.emplace(pdz::timing::Event::kResourceCycles);
     }
+    const double item_t0 = count && pdz::timing::SpikeOn() ? pdz::timing::ItemClockMs() : 0.0;
     const HRESULT hr = device_->CreateCommittedResource(&rex::ui::d3d12::util::kHeapPropertiesDefault,
                                                         target ? D3D12_HEAP_FLAG_NONE : provider_->GetHeapFlagCreateNotZeroed(),
                                                         &desc, initial_state, clear_value, IID_PPV_ARGS(&resource));
+    // pdz_frame_timing_item_ms: a texture, render target or depth buffer created on the render thread.
+    if (const double item_ms = item_t0 != 0.0 ? pdz::timing::ItemClockMs() - item_t0 : 0.0;
+        pdz::timing::SlowItemWanted(item_ms))
+    {
+      pdz::timing::SlowItem("GPU resource", item_ms,
+                            fmt::format("{}: {}x{}x{}, {} mips, DXGI format {}{}", debug_name ? debug_name : "?",
+                                        desc.Width, desc.Height, desc.DepthOrArraySize, desc.MipLevels,
+                                        uint32_t(desc.Format), target ? " (target, zeroed)" : ""));
+    }
     if (FAILED(hr))
     {
       REXLOG_ERROR("pdz_native: CreateCommittedResource({}, {}x{}x{}, format {}) failed: 0x{:08X}", debug_name,
@@ -1574,8 +1584,17 @@ namespace pdz::native
     ID3D12Resource *resource = nullptr;
     pdz::timing::CountEvent(pdz::timing::Event::kResourceCreate); // pdz_frame_timing_spike_ms
     const pdz::timing::EventTimer create_time(pdz::timing::Event::kResourceCycles);
+    const double item_t0 = pdz::timing::SpikeOn() ? pdz::timing::ItemClockMs() : 0.0;
     const HRESULT hr = device_->CreateCommittedResource(&props, provider_->GetHeapFlagCreateNotZeroed(), &desc,
                                                         initial_state, nullptr, IID_PPV_ARGS(&resource));
+    // pdz_frame_timing_item_ms: a buffer (an upload heap grown, a readback buffer ...).
+    if (const double item_ms = item_t0 != 0.0 ? pdz::timing::ItemClockMs() - item_t0 : 0.0;
+        pdz::timing::SlowItemWanted(item_ms))
+    {
+      pdz::timing::SlowItem("GPU resource", item_ms,
+                            fmt::format("buffer {}: {} bytes, heap type {}", debug_name ? debug_name : "?", desc.Width,
+                                        uint32_t(heap)));
+    }
     if (FAILED(hr))
     {
       REXLOG_ERROR("pdz_native: CreateCommittedResource(buffer {}, {} bytes) failed: 0x{:08X}", debug_name, size,

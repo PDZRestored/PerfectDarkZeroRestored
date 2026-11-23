@@ -139,6 +139,17 @@ namespace pdz::native
   bool UserClipPlanesToHost(const shadow::DrawRecord &r, uint32_t mask, const HostViewport &hv, float out[6][4]);
 
   // What the bound surfaces contribute to the PSO (filled by native_draw.cpp from the surface layer).
+  // pdz_native_draw_memo (13 Nov, docs/CPU_STUDY_2.md): 0 = off, 1 = a draw whose inputs equal the previous draw's
+  // reuses its decoded render state, host viewport and pipeline, 2 = verify (everything is worked out as before and
+  // compared with what would have been reused). Latched once a frame by native_draw.cpp (NewFrame).
+  inline int g_draw_memo = 0;
+  struct DrawMemoStats
+  {
+    uint64_t state_hits = 0, state_misses = 0, view_hits = 0, view_misses = 0, pipe_hits = 0, pipe_misses = 0;
+    uint64_t checked = 0, differ = 0; // verify
+  };
+  inline DrawMemoStats g_draw_memo_stats;
+
   struct TargetFormats
   {
     uint32_t rt_count = 0;
@@ -254,6 +265,8 @@ namespace pdz::native
   private:
     PipelineCache() = default;
     struct Impl;
+    const Pipeline *LookupFull(const NativeShader *vs, const NativeShader *ps, uint32_t prim, const RenderState &rs,
+                               const TargetFormats &tf, D3D12_INDEX_BUFFER_STRIP_CUT_VALUE strip_cut);
     Impl *impl_ = nullptr;
     bool ready_ = false;
     bool init_attempted_ = false;
@@ -304,5 +317,19 @@ namespace pdz::native
     // pdz_native_shader_preload: the list's shaders and variants loaded a little per call (about `budget_ms`) until all
     // are; the record thread's PrewarmStep (the draw thread's: ShaderCache and the variants are its own).
     void PreloadStep(double budget_ms);
+
+    // pdz_native_shader_prepare (Thu 12 Nov hitch hunt): a pixel shader's patch (co-issue, PsParamGen, ...) and its
+    // 7e3 blend / depth20e4 variants compiled before its first draw instead of in it. In a folder whose shader caches
+    // do not hold them yet (every new build folder; a pixel shader the pipeline list does not name) each was a DXC
+    // compile of 30-45 ms on the render thread at the draw: two new pixel shaders in a frame gave the 130-190 ms
+    // single-frame hitches of log 048.
+    //   NotePixelShaderCreated: the game's CreatePixelShader hook (game thread, any thread): the container (header
+    //     block + microcode, guest byte order) is copied and queued, once per microcode hash.
+    //   PrepareStep: the render thread, a little per call: the shader is loaded, its patch check and variants run on
+    //     a copy with depth20e4::ahead collecting, so their sources go to the workers, which write the cache files
+    //     the draw's first use then reads. Variants: those the pipeline list names for the shader; for a shader the
+    //     list does not know, the 7e3 alpha-clamp variant too (mode 2), behind everything else.
+    void NotePixelShaderCreated(uint64_t hash, const uint8_t *container_be, uint32_t header_bytes, uint32_t ucode_bytes);
+    void PrepareStep(double budget_ms);
   } // namespace pipeline_seed
 } // namespace pdz::native

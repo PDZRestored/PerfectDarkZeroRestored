@@ -44,8 +44,12 @@
 #endif
 
 #include "../mod/audio_presence_log.h"
+#include "../mod/guest_readable_Sat21Nov.h" // Sun 22 Nov night (audit)
+#include "../mod/lab_stealth.h"
 #include "../mod/mp_music.h"
+#include "../mod/music_cause_log.h"
 #include "../mod/restorations.h"
+#include "../mod/render/sign_lights.h"
 
 #include <string>
 
@@ -126,13 +130,31 @@ namespace
     {
       return s;
     }
-    for (const char *p = reinterpret_cast<const char *>(base + address); *p && s.size() < 96; ++p)
+    // (Sun 22 Nov night (audit): each page of the text tested as mapped before it is read.)
+    for (uint32_t a = address; s.size() < 96; ++a)
     {
-      s += *p;
+      if ((a == address || (a & 0xFFFu) == 0) && !pdz::guestmem::Ok(base, a, 1))
+      {
+        break;
+      }
+      const char c = char(base[a]);
+      if (!c)
+      {
+        break;
+      }
+      s += c;
     }
     return s;
   }
 } // namespace
+
+#ifdef PDZ_COUNTEROP
+void PdzCounterOpLevelSetup(uint8_t *base); // mod/counter_op.cpp (Sun 22 Nov)
+#endif
+// Sun 22 Nov night (audit): level-start resets of the restored sounds' remembered objects (flags only, any thread).
+namespace pdz::restored_sounds { void LevelReset(); } // mod/restored_sounds_Tue17Nov.cpp
+namespace pdz::hums { void LevelReset(); }            // mod/hums_Fri20Nov.cpp
+namespace pdz::r3 { void LevelReset(); }              // mod/restored_sounds_r3_Wed18Nov.cpp
 
 #if PDZ_MUSIC_LIFTED
 // Level music setup: TU3 dropped starting the layers.
@@ -140,13 +162,29 @@ REX_HOOK_RAW(sub_82200738)
 {
   // game state block (T 82D6BFD8): +32 level object, its +36 = the music record
   const uint32_t holder = Load32(base, 0x82D6BFD8 + 32);
-  const uint32_t record = holder ? Load32(base, holder + 36) : 0;
-  if (record)
+  // (Sun 22 Nov night (audit): the level object and the music record read only where mapped.)
+  const uint32_t record = holder && pdz::guestmem::Ok(base, holder, 40) ? Load32(base, holder + 36) : 0;
+  if (record && pdz::guestmem::Ok(base, record, 52))
   {
     REXLOG_INFO("pdz music: level music type {}, layers '{}' / '{}'", Load32(base, record + 12),
                 GuestString(base, Load32(base, record + 24)), GuestString(base, Load32(base, record + 48)));
   }
   mus_sub_821F8450(ctx, base);
+  // Stealth round 3c (Sun 15 Nov night, fix 1): Rare runs this setup once at every level start, a mission restart
+  // included (where the AI clock keeps running): the stealth layer forgets the attempt before.
+  lab_stealth::LevelStartSignal(1);
+#ifdef PDZ_COUNTEROP
+  PdzCounterOpLevelSetup(base); // Sun 22 Nov (pdz_counterop_restart_keeps): a Restart mission keeps Counter-Op
+#endif
+  pdz::signfix::LevelReset(); // pdz_fix_sign_lights: the level's signs are looked up again
+  // Sun 22 Nov night (audit): the restored sounds forget the objects they remembered from the level / attempt before.
+  pdz::restored_sounds::LevelReset(); // the body falls' dead figures, controllers and ragdolls
+  pdz::hums::LevelReset();            // the hums' props and lights
+  pdz::r3::LevelReset();              // the strip-light fittings and the single pigeons
+  if (music_cause_log::Enabled())
+  {
+    music_cause_log::AfterSetup(base);
+  }
 }
 
 REX_HOOK_RAW(sub_822008B8)
@@ -154,19 +192,48 @@ REX_HOOK_RAW(sub_822008B8)
   mus_sub_821F8600(ctx, base);
 }
 
+// pdz_music_log (round 11k): one line per level music change with what caused it (music_cause_log.cpp).
 REX_HOOK_RAW(sub_82200928)
 {
+  if (!music_cause_log::Enabled())
+  {
+    mus_sub_821F8708(ctx, base);
+    return;
+  }
+  const music_cause_log::Pick before = music_cause_log::BeforePick(ctx, base);
   mus_sub_821F8708(ctx, base);
+  music_cause_log::AfterPick(ctx, base, before);
 }
 
 REX_HOOK_RAW(sub_82200C68)
 {
+  if (!music_cause_log::Enabled())
+  {
+    mus_sub_821F8B28(ctx, base);
+    return;
+  }
+  const music_cause_log::Type before = music_cause_log::BeforeType(ctx, base);
   mus_sub_821F8B28(ctx, base);
+  music_cause_log::AfterType(base, before);
 }
 
 REX_HOOK_RAW(sub_822082E8)
 {
   mus_sub_82200920(ctx, base);
+}
+#else // no lifted music code: the game's own level music setup runs as it is, and the level-start resets follow it
+REX_EXTERN(__imp__sub_82200738);
+REX_HOOK_RAW(sub_82200738)
+{
+  __imp__sub_82200738(ctx, base);
+  lab_stealth::LevelStartSignal(1);
+#ifdef PDZ_COUNTEROP
+  PdzCounterOpLevelSetup(base);
+#endif
+  pdz::signfix::LevelReset();
+  pdz::restored_sounds::LevelReset();
+  pdz::hums::LevelReset();
+  pdz::r3::LevelReset();
 }
 #endif // PDZ_MUSIC_LIFTED
 

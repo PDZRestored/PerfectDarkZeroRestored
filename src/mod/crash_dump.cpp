@@ -13,6 +13,12 @@
 // no dump. A SIGABRT handler now writes the same breadcrumbs (the stack from
 // the abort, through the caller of the fatal call) and a minidump, then lets
 // the abort go on.
+//
+// Sun 22 Nov (Counter-Op round 17): two closes to the desktop with no crash line and no dump were the SDK's
+// KeBugCheckEx (Rare's code called the console's bug check; the SDK logged the stop only at debug level, then a
+// breakpoint). The SDK now always logs the stop code, its parameters and the guest caller, and calls our hook
+// first: it logs the last 20 Counter-Op / jetpack lines (a small ring kept by a log sink) and writes the same
+// minidump as a crash.
 #include <windows.h>
 #include <dbghelp.h>
 #include <atomic>
@@ -20,8 +26,16 @@
 #include <cstring>
 #include <string>
 #include <fmt/format.h>
+#include <deque>
+#include <mutex>
+#include <rex/kernel/xboxkrnl/bug_check.h>
 #include <rex/logging.h>
+#include <spdlog/sinks/base_sink.h>
 #include "render/guest_ip_profile.h" // InProfilerUnwind
+namespace pdz::native
+{
+  bool InGuardedGuestRead(); // native_textures.cpp (pdz_native_texture_guarded_read)
+}
 #pragma comment(lib, "dbghelp.lib")
 
 namespace
@@ -52,6 +66,10 @@ namespace
     if (pdz::ipprof::InProfilerUnwind())
     {
       return EXCEPTION_CONTINUE_SEARCH; // pdz_guest_ip_profile's guarded unwind handles its own faults
+    }
+    if (pdz::native::InGuardedGuestRead())
+    {
+      return EXCEPTION_CONTINUE_SEARCH; // pdz_native_texture_guarded_read: the texture upload's guard handles it
     }
     if (code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_ILLEGAL_INSTRUCTION && code != EXCEPTION_PRIV_INSTRUCTION &&
         code != EXCEPTION_INT_DIVIDE_BY_ZERO && code != EXCEPTION_STACK_OVERFLOW && code != EXCEPTION_IN_PAGE_ERROR)
@@ -143,12 +161,88 @@ namespace
     std::abort();
   }
 
+  // The last 20 log lines about Counter-Op or jetpacks, for the stop line (a bug check leaves no other trace of what
+  // the mod was doing just before).
+  class RecentCounterOpSink final : public spdlog::sinks::base_sink<std::mutex>
+  {
+  public:
+    std::deque<std::string> Lines()
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      return lines_;
+    }
+
+  protected:
+    void sink_it_(const spdlog::details::log_msg &msg) override
+    {
+      const std::string_view text(msg.payload.data(), msg.payload.size());
+      if (text.find("pdz_counterop") == std::string_view::npos && text.find("jetpack") == std::string_view::npos)
+      {
+        return;
+      }
+      SYSTEMTIME st;
+      GetLocalTime(&st);
+      lines_.push_back(fmt::format("{:02}:{:02}:{:02}.{:03} {}", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
+                                   text.substr(0, 400)));
+      if (lines_.size() > 20)
+      {
+        lines_.pop_front();
+      }
+    }
+    void flush_() override {}
+
+  private:
+    std::deque<std::string> lines_;
+  };
+  std::shared_ptr<RecentCounterOpSink> g_recent_sink;
+  std::once_flag g_recent_once;
+
+  void BugCheckHook(uint32_t code, const uint32_t params[4], uint32_t guest_lr, const char *guest_stack)
+  {
+    if (g_crash_busy.exchange(true))
+    {
+      return;
+    }
+    REXLOG_ERROR("pdz crash: the game stopped itself (bug check 0x{:08X}, parameters 0x{:08X} 0x{:08X} 0x{:08X} 0x{:08X}) from "
+                 "guest 0x{:08X}; guest stack:{}; thread 0x{:X}",
+                 code, params[0], params[1], params[2], params[3], guest_lr, guest_stack ? guest_stack : "", GetCurrentThreadId());
+    if (g_recent_sink)
+    {
+      const auto lines = g_recent_sink->Lines();
+      int i = 0;
+      for (const auto &line : lines)
+      {
+        REXLOG_ERROR("pdz crash: recent Counter-Op / jetpack line {} of {}: {}", ++i, lines.size(), line);
+      }
+      if (lines.empty())
+      {
+        REXLOG_ERROR("pdz crash: no recent Counter-Op / jetpack lines");
+      }
+    }
+    CONTEXT ctx = {};
+    RtlCaptureContext(&ctx);
+    Report(ctx, nullptr);
+  }
+
   struct InstallCrashHandler
   {
     InstallCrashHandler()
     {
       AddVectoredExceptionHandler(0, CrashHandler); // last: after the SDK's own
       std::signal(SIGABRT, AbortHandler);
+      rex::kernel::xboxkrnl::SetBugCheckHook(BugCheckHook);
     }
   } g_install_crash_handler;
+} // namespace
+
+namespace pdz::crash
+{
+  // Called once the logging system is up (the sink must be added after it exists).
+  void InstallRecentLinesSink()
+  {
+    std::call_once(g_recent_once, [] {
+      g_recent_sink = std::make_shared<RecentCounterOpSink>();
+      rex::AddSink(g_recent_sink);
+    });
+  }
 } // namespace
