@@ -98,6 +98,22 @@ REXCVAR_DEFINE_BOOL(pdz_counterop_test_river_agent_refill, false, "Testing",
                     "is under 50 (each refill logged): hits on her still show as lost health, but she does not die")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+// Mon 23 Nov (release 1.0.0). In play on River player 2 was seated as the driver of an enemy hovercraft and his right
+// stick did nothing: he could not turn it. Rare's hovercraft update (82675B20) has two ways to steer: when the
+// controller's commanded heading (+0x62C) is not its "none" value it turns the craft to that heading and skips the
+// driver's look update (the right stick, 825B3AC0) altogether; otherwise the seated driver's stick steers. The
+// heading is commanded by the AI driver's vehicle task (82196870 / 82196C78) and reset only by the hovercraft's own
+// set-up (82671220): Rare never puts a human into a seat an AI driver has just left, so nothing clears it at the
+// hand-over, and the craft kept the last heading the guard had asked for. While player 2 is the driver of the craft
+// he was handed, the commanded heading is put back to Rare's "none" value (the constant the update compares with).
+// The agent's own craft never has a commanded heading and is not touched; nothing here reads or writes a pad.
+REXCVAR_DEFINE_BOOL(pdz_counterop_river_driver_steer, true, "Gameplay",
+                    "Counter-Operative (Mon 23 Nov, default on), River: while player 2 drives the enemy hovercraft he "
+                    "was handed, the heading its AI driver last asked for is cleared, so his right stick turns the "
+                    "craft as the game's player hovercraft controls do. Off = as before (the craft keeps the AI's "
+                    "heading and his right stick does nothing)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 // Round 13b (helper r): the real order.
 REXCVAR_DEFINE_BOOL(pdz_counterop_river_hovercraft_first, true, "Gameplay",
                     "Counter-Operative (round 13b; on by default since round 14), River: while the agent sits in a hovercraft, the driver of an enemy "
@@ -1312,6 +1328,31 @@ namespace counter_op_river
       rs.left_told = false;
       REXLOG_INFO("pdz_counterop: river: player 2 is SEATED as the driver of the hovercraft {:08X}, {:.1f} s after the "
                   "mount (Rare's player hovercraft controls and camera from here)", rs.riding, since);
+    }
+    // Mon 23 Nov (pdz_counterop_river_driver_steer): the AI driver's commanded heading is cleared while he drives.
+    if (seat == 0 && REXCVAR_GET(pdz_counterop_river_driver_steer))
+    {
+      constexpr uint32_t kCtrlHeadingAsked = 0x62C;  // (82675B20 reads it; 82196870 sets it; 82671220 resets it)
+      constexpr uint32_t kHeadingNone = 0x8208B1F4;  // the float 82675B20 compares it with: no heading commanded
+      if (pdz::guestmem::Ok(base, ctrl + kCtrlHeadingAsked, 4) && pdz::guestmem::Ok(base, kHeadingNone, 4))
+      {
+        const uint32_t none = Load32(base, kHeadingNone), have = Load32(base, ctrl + kCtrlHeadingAsked);
+        if (have != none)
+        {
+          static uint32_t told_craft = 0, clears = 0;
+          const float asked_heading = LoadFloat(base, ctrl + kCtrlHeadingAsked);
+          Store32(base, ctrl + kCtrlHeadingAsked, none);
+          ++clears;
+          if (told_craft != rs.riding || clears % 600 == 0)
+          {
+            told_craft = rs.riding;
+            REXLOG_INFO("pdz_counterop: river: player 2's hovercraft {:08X}: the heading its AI driver had asked for "
+                        "({:.3f}) is cleared (Rare's 'none' value {:.3f}): his right stick steers the craft now "
+                        "(cleared {} time(s) this session; pdz_counterop_river_driver_steer)",
+                        rs.riding, asked_heading, LoadFloat(base, kHeadingNone), clears);
+          }
+        }
+      }
     }
     if (seat < 0 && !rs.left_told && !out)
     {
