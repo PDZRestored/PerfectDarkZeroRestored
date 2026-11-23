@@ -73,6 +73,7 @@ Get the latest version from the [Releases page](https://github.com/EddieVanHelge
 - Fixed sounds that Rare's data had the wrong name for.
 - Walls and floors make sounds quieter, so you don't hear things through buildings.
 - Fixed the Nightclub brooms being heard from the docks.
+- Restored the interactive music (stealth and action tracks) that Title Update 3 removed.
 
 ### Aiming and controls
 
