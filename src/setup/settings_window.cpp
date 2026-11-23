@@ -50,6 +50,11 @@ REXCVAR_DEFINE_BOOL(pdz_settings_open, false, "Setup",
 REXCVAR_DEFINE_STRING(pdz_map_packs_install, "", "Setup",
                       "Map pack package files to install at this start, separated by ';' (the same checks and repairs "
                       "as the settings window's Add; for scripts and tests). One line per file in the log");
+REXCVAR_DEFINE_STRING(pdz_settings_test_tab_flash, "", "Testing",
+                      "TESTING TOOL: the settings window clicks each tab in turn and writes what the window shows "
+                      "after every message it handles next (each control's own paint) as flash_tab<N>_<step>.bmp "
+                      "into this folder, then closes without saving. Shows whether a tab change draws the new page "
+                      "in one go or control by control");
 REXCVAR_DEFINE_STRING(pdz_settings_test_capture, "", "Testing",
                       "TESTING TOOL: the settings window shows each tab in turn, writes it as tab<N>.bmp into this "
                       "folder and closes itself (the close box: the game doesn't start)");
@@ -1137,9 +1142,20 @@ namespace pdz::settings_ui
       }
     }
 
+    // Mon 23 Nov (1.0.0): a tab change flashed. Every control of the new page was shown on its own (ShowWindow), so
+    // Windows erased each one to a blank rectangle and painted them one message at a time (41 to 300 paints a tab,
+    // recorded with pdz_settings_test_tab_flash) while the old page's controls were still on screen. Now the window's
+    // drawing is held (WM_SETREDRAW) while the page is swapped, and the whole window, children included, is drawn in
+    // one pass straight after. Only while the window is on screen: before its first show nothing is drawn anyway, and
+    // WM_SETREDRAW would mark it visible. Layout, controls, focus and the help line are as before.
     void ShowTab(Ui &ui, int tab)
     {
       DialRelease(ui);
+      const bool held = ui.window && IsWindowVisible(ui.window) != 0;
+      if (held)
+      {
+        SendMessageW(ui.window, WM_SETREDRAW, FALSE, 0);
+      }
       ui.tab = tab;
       if (ui.help)
       {
@@ -1163,6 +1179,11 @@ namespace pdz::settings_ui
       ShowVisualRows(ui); // Graphics: the Custom rows only with Custom
       ShowPlayRows(ui);   // Gameplay: the same (Thu 19 Nov)
       SetHelp(ui, ui.tab_help[tab]);
+      if (held)
+      {
+        SendMessageW(ui.window, WM_SETREDRAW, TRUE, 0);
+        RedrawWindow(ui.window, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW);
+      }
     }
 
     void RefreshPacks(Ui &ui, bool deep)
@@ -3591,6 +3612,18 @@ namespace pdz::settings_ui
           SetWindowTextW(GetDlgItem(hwnd, kVoiceVolValue), VoiceText(pos).c_str());
         }
         return 0;
+      case WM_CTLCOLORBTN:
+      {
+        // Mon 23 Nov: an owner-drawn button is erased with this brush before its WM_DRAWITEM. The default is the
+        // system's pale button face, which showed as a blank rectangle for a moment; ours is what lies behind it.
+        RECT wr;
+        GetWindowRect(reinterpret_cast<HWND>(lp), &wr);
+        MapWindowPoints(nullptr, hwnd, reinterpret_cast<POINT *>(&wr), 2);
+        RECT client;
+        GetClientRect(hwnd, &client);
+        const bool on_bar = ui && (wr.left < ui->px(kSideW) || wr.top >= client.bottom - ui->px(kFooterH));
+        return reinterpret_cast<LRESULT>(theme::Brush(on_bar ? theme::kSideBar : theme::kBackground));
+      }
       case WM_CTLCOLORSTATIC:
       {
         // Labels on the page; the help line on its strip; notes in the dimmer or the info colour.
@@ -4835,6 +4868,85 @@ namespace pdz::settings_ui
         }
         DialNewLock(ui);
         ui.testing = !REXCVAR_GET(pdz_settings_test_rebind).empty();
+      }
+      // pdz_settings_test_tab_flash (Mon 23 Nov): what the window shows after each message that follows a tab click.
+      if (const std::string flash = REXCVAR_GET(pdz_settings_test_tab_flash); !flash.empty())
+      {
+        std::error_code ec;
+        fs::create_directories(fs::u8path(flash), ec);
+        // The window's own surface as it is now (the top-level window's DC: what has been painted so far).
+        const auto grab = [&](const std::string &name)
+        {
+          RECT wr2;
+          GetWindowRect(ui.window, &wr2);
+          const int cw = wr2.right - wr2.left, ch = wr2.bottom - wr2.top;
+          HDC wdc = GetWindowDC(ui.window), mdc = CreateCompatibleDC(wdc);
+          BITMAPINFO bi{};
+          bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
+          bi.bmiHeader.biWidth = cw;
+          bi.bmiHeader.biHeight = ch;
+          bi.bmiHeader.biPlanes = 1;
+          bi.bmiHeader.biBitCount = 32;
+          void *bits = nullptr;
+          HBITMAP bmp = CreateDIBSection(mdc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+          HGDIOBJ old = SelectObject(mdc, bmp);
+          BitBlt(mdc, 0, 0, cw, ch, wdc, 0, 0, SRCCOPY);
+          GdiFlush();
+          BITMAPFILEHEADER fh{};
+          fh.bfType = 0x4D42;
+          fh.bfOffBits = sizeof(fh) + sizeof(bi.bmiHeader);
+          fh.bfSize = fh.bfOffBits + DWORD(cw) * DWORD(ch) * 4;
+          std::ofstream out(fs::u8path(flash) / name, std::ios::binary);
+          out.write(reinterpret_cast<const char *>(&fh), sizeof(fh));
+          out.write(reinterpret_cast<const char *>(&bi.bmiHeader), sizeof(bi.bmiHeader));
+          out.write(static_cast<const char *>(bits), std::streamsize(size_t(cw) * size_t(ch) * 4));
+          SelectObject(mdc, old);
+          DeleteObject(bmp);
+          DeleteDC(mdc);
+          ReleaseDC(ui.window, wdc);
+        };
+        const auto settle = [&](DWORD ms)
+        {
+          for (const DWORD until = GetTickCount() + ms; GetTickCount() < until;)
+          {
+            MSG pump;
+            while (PeekMessageW(&pump, nullptr, 0, 0, PM_REMOVE))
+            {
+              TranslateMessage(&pump);
+              DispatchMessageW(&pump);
+            }
+            Sleep(10);
+          }
+        };
+        settle(400);
+        const int order[kTabCount] = {1, 2, 3, 4, 5, 6, 0};
+        for (const int t : order)
+        {
+          SendMessageW(ui.tab_buttons[t], BM_CLICK, 0, 0); // the click's own path (pressed, WM_COMMAND, ShowTab)
+          int steps = 0;
+          grab(fmt::format("flash_tab{}_{:03d}_after_click.bmp", t, steps));
+          for (int idle = 0; steps < 300 && idle < 4;)
+          {
+            MSG m;
+            if (PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE))
+            {
+              TranslateMessage(&m);
+              DispatchMessageW(&m);
+              grab(fmt::format("flash_tab{}_{:03d}_msg{:04X}.bmp", t, ++steps, m.message));
+              idle = 0;
+            }
+            else
+            {
+              ++idle;
+              Sleep(4);
+            }
+          }
+          settle(300);
+          grab(fmt::format("flash_tab{}_999_settled.bmp", t));
+          Note(fmt::format("pdz_settings: test: tab flash: tab {}: {} message(s) handled before the page was complete", t, steps));
+        }
+        ui.save_on_close = false;
+        PostMessageW(ui.window, WM_CLOSE, 0, 0);
       }
       // pdz_settings_test_capture: every tab to a .bmp, then close.
       const std::string capture = REXCVAR_GET(pdz_settings_test_capture);
