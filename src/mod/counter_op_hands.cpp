@@ -1016,6 +1016,9 @@ REXCVAR_DEFINE_STRING(pdz_counterop_hands_packages,
                       "Missions in pdz_counterop_load_hands_skip load none")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+// Tue 24 Nov (1.0.2): Bridge also loads multi_char_team3 (the security girl, body 54, is on Bridge too: four takeovers
+// there got the male trooper_hands), and Jungle and Temple also load multi_char_team1 (their body 52 guards got
+// trooper_hands; their own privateforce_a_hands are in that package, as on Mansion, the Laboratory and River).
 // Mon 23 Nov night (1.0.1): River and the Laboratory also load multi_char_team3 by default: it holds the security
 // girl's own first-person hands (Vtroop_hands, the hands table's first choice for body 54); without it she had Jo's
 // (jo_adventure_hands). Run b10_river: 's1g1' (body 54): "hands: 'Vtroop_hands' (body 54 is listed)".
@@ -1023,7 +1026,8 @@ REXCVAR_DEFINE_STRING(pdz_counterop_hands_packages,
 // Carrington swat hands, "not in this level: trooper_hands"). Rare's urban trooper package (multi_char_team5) holds
 // trooper_hands; pdz_level_memory_scale 1.25 makes LevelGPUWC 54.6 MB larger than Rare's, more than the 40 MB asked.
 REXCVAR_DEFINE_STRING(pdz_counterop_hands_packages_more,
-                      "jungle:multi_char_team5,temple:multi_char_team5,outpost:multi_char_team5,bridge:multi_char_team5,"
+                      "jungle:multi_char_team5+multi_char_team1,temple:multi_char_team5+multi_char_team1,"
+                      "outpost:multi_char_team5,bridge:multi_char_team5+multi_char_team3,"
                       "river:multi_char_team3,laboratory:multi_char_team3",
                       "Gameplay",
                       "Counter-Operative (Sun 22 Nov: on for the trooper levels): more hands packages per mission "
