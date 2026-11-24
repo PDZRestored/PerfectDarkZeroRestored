@@ -112,6 +112,8 @@ list(APPEND PERFECTDARKZERORECOMP_SOURCES
     src/mod/ragdoll_step_fix_Mon16Nov.cpp
     src/mod/guard_footsteps_Mon16Nov.cpp
     src/mod/camera_blend_60_Tue17Nov.cpp
+    src/mod/mount_log_Tue24Nov.cpp
+    src/mod/mount_step_Tue24Nov.cpp
     src/mod/camera_sounds_Tue17Nov.cpp
     src/mod/restored_sounds_Tue17Nov.cpp
     src/mod/restored_sounds_r2_Tue17Nov.cpp

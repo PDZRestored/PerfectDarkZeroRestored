@@ -126,8 +126,8 @@ REXCVAR_DEFINE_BOOL(pdz_mouse_direct_steer, true, "Mouse",
                     "(pdz_mouse_sensitivity's degrees per count, whatever the frame rate, no stick turn cap); the "
                     "game's turret limits still apply. Off = the mouse is the right stick the turret reads "
                     "(mnk_sensitivity's scale, capped at the stick's top turn rate), as in 0.9.3. The controller is "
-                    "the same either way. The CamSpy, the guided rocket, the hovercraft and the jetpack keep the "
-                    "mouse as the right stick. Needs pdz_mouse_look")
+                    "the same either way. The hovercraft and the jetpack keep the mouse as the right stick (the CamSpy "
+                    "and the guided rocket have their own switches). Needs pdz_mouse_look")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(pdz_mouse_direct_camspy, true, "Mouse",
                     "Mouse aim with the CamSpy (Thu 19 Nov night): the mouse turns the CamSpy's own view directly, as "
@@ -136,13 +136,13 @@ REXCVAR_DEFINE_BOOL(pdz_mouse_direct_camspy, true, "Mouse",
                     "CamSpy reads (slow: about a tenth of Jo's turn). The controller is the game's own either way. "
                     "Needs pdz_mouse_look")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
-REXCVAR_DEFINE_BOOL(pdz_mouse_direct_rocket, false, "Mouse",
-                    "Mouse aim with the rocket launcher's guided rocket (1.0.1, OFF: written but not proven in a "
-                    "run): the mouse turns the rocket's own view directly, as Jo's view on foot (pdz_mouse_sensitivity's "
-                    "degrees per count, whatever the frame rate), the way the CamSpy and the turrets take it. Off = "
-                    "the mouse is the right stick the rocket reads (slow). Only if the rocket's view keeps its yaw / "
-                    "pitch in plain fields (logged when a rocket is first steered). The controller is the game's own "
-                    "either way. Needs pdz_mouse_look")
+REXCVAR_DEFINE_BOOL(pdz_mouse_direct_rocket, true, "Mouse",
+                    "Mouse aim with the rocket launcher's guided rocket (on by default since 1.0.2: proven in play on "
+                    "Tue 24 Nov): the mouse turns the rocket's own view directly, as Jo's view on foot "
+                    "(pdz_mouse_sensitivity's degrees per count, whatever the frame rate), the way the CamSpy and the "
+                    "turrets take it. Off = the mouse is the right stick the rocket reads (slow). Only if the rocket's "
+                    "view keeps its yaw / pitch in plain fields (logged when a rocket is first steered). The "
+                    "controller is the game's own either way. Needs pdz_mouse_look")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(pdz_mouse_direct_steer_log, false, "Mouse",
                     "Diagnostic: once a second while guest user 0 is on a mounted turret, a 'pdz_mouse: turret aim' "
@@ -257,7 +257,7 @@ namespace pdz::mouse
     // made right after it (AfterSteeredLook) is used in the same frame. Rare's look update only adds stick speed x
     // dt, so nothing overwrites ours.
     constexpr uint32_t kCamSpyCaller = 0x8253FA98;
-    // Mon 23 Nov night (1.0.1, pdz_mouse_direct_rocket, off: not proven in a run): the guided rocket's caller of the
+    // Mon 23 Nov night (1.0.1, pdz_mouse_direct_rocket; on since 1.0.2, proven in play): the guided rocket's caller of the
     // look update (sub_822533E8 at 82253584: owner = the player who fired, view = the rocket, vtable 820C8478, look
     // state rocket +1412). Rare reads the rocket's angles after the update returns (822535E4 on), as the CamSpy's.
     constexpr uint32_t kRocketCaller = 0x82253588;

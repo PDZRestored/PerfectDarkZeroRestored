@@ -77,7 +77,9 @@ driver), the mouse aims directly. Settings: `settings/mapping.toml`.
   - 0.9.3's check before the "+6560" read (`NoteSteeredLook`) is unchanged. On foot, the mouse aim's own player check
     (`OurView`) no longer reads the owner's +6560 when the owner isn't the view (the hovercraft and the jetpack pass
     the vehicle as the owner).
-  - The CamSpy, the guided rocket, the hovercraft and the jetpack keep the mouse as the right stick (not script
+  - Since 1.0.2 the guided rocket takes the mouse into its own view too (`pdz_mouse_direct_rocket`, on: proven in
+    play on 24 Nov 2026; the CamSpy since 19 Nov, `pdz_mouse_direct_camspy`).
+  - The hovercraft and the jetpack keep the mouse as the right stick (not script
     testable; the vehicles turn the player's own view with the vehicle as the owner, a different mechanism).
   - `pdz_mouse_direct_steer_log` (diagnostic, off): a `pdz_mouse: turret aim` line once a second on a turret (its
     yaw / pitch, this second's counts, the mouse turn and how far the aim moved, turret updates per second), switch on

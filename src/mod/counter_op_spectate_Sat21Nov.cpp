@@ -501,6 +501,10 @@ REX_HOOK_RAW(sub_825ADD28)
 
 // The camera manager update: counts Rare's updates of his manager; right after the agent's, his is updated once when
 // Rare did not do it since her last one (CameraControlUpdate may skip a manager whose player is out of the world).
+namespace pdz::mountlog
+{
+  void OnCameraUpdate(const uint8_t *base, uint32_t manager, double step); // Tue 24 Nov (pdz_mount_log)
+}
 REX_HOOK_RAW(sub_8220C0D8)
 {
   const uint32_t mgr = ctx.r3.u32;
@@ -511,6 +515,7 @@ REX_HOOK_RAW(sub_8220C0D8)
     ++g.rare;
   }
   __imp__sub_8220C0D8(ctx, base);
+  pdz::mountlog::OnCameraUpdate(base, mgr, step);
   if (g.on && !g.in_extra && mgr == g.jo_mgr && Ptr(g.mgr))
   {
     // Sun 22 Nov night (audit): only while the manager is still his and our chase mode is still its top (a reload can

@@ -320,6 +320,21 @@ namespace
 
 // sub_8269C688(r3 = &offset out, r4 = &centre out, r5 = character, r6 = type, r7) -> r3 = the offset of the sweep
 // sphere's centre above the feet.
+namespace pdz::playermove
+{
+  // Tue 24 Nov (mount_step_Tue24Nov.cpp): is this thread inside a PLAYER's mover update, and with which step?
+  bool InUpdate(uint32_t *mover, float *dt)
+  {
+    if (!t_frame.in_update)
+    {
+      return false;
+    }
+    *mover = t_frame.mover;
+    *dt = t_frame.dt;
+    return true;
+  }
+} // namespace pdz::playermove
+
 REX_HOOK_RAW(sub_8269C688)
 {
   const bool mine = t_frame.in_update && IsGuestPointer(ctx.r5.u32) && Load32(base, ctx.r5.u32) == kPlayerVtable;
@@ -543,6 +558,10 @@ namespace pdz::camblend
   // camera_blend_60_Tue17Nov.cpp (pdz_camera_blend_log): the zoom slide and the ladder camera, frame by frame.
   void OnPlayerMove(const uint8_t *base, uint32_t character, uint32_t mover, float dt);
 }
+namespace pdz::mountlog
+{
+  void OnPlayerMove(const uint8_t *base, uint32_t character, uint32_t mover); // Tue 24 Nov (pdz_mount_log)
+}
 
 REX_HOOK_RAW(sub_82697088)
 {
@@ -563,6 +582,7 @@ REX_HOOK_RAW(sub_82697088)
     t_mover = m;
     __imp__sub_82697088(ctx, base);
     pdz::camblend::OnPlayerMove(base, character, mover, t_frame.dt); // one cvar load while its log is off
+    pdz::mountlog::OnPlayerMove(base, character, mover);
     if (REXCVAR_GET(pdz_ladder_log))
     {
       LadderLog(base, character, mover, t_frame);
@@ -589,6 +609,7 @@ REX_HOOK_RAW(sub_82697088)
   t_frame = Frame{};
   t_mover = nullptr;
   pdz::camblend::OnPlayerMove(base, character, mover, dt);
+  pdz::mountlog::OnPlayerMove(base, character, mover);
   if (REXCVAR_GET(pdz_ladder_log))
   {
     LadderLog(base, character, mover, f);

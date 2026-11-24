@@ -347,6 +347,35 @@ REXCVAR_DEFINE_BOOL(pdz_counterop_spawn_clear_locks, true, "Gameplay",
                     "body, any of Rare's action lock counters still held from his last life (the jetpack's riding "
                     "lock after a death in the seat: no weapon, no Use) is put to 0. Off = as before")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(pdz_counterop_wait_no_low_health, true, "Gameplay",
+                    "Counter-Operative (Tue 24 Nov, default on): Rare's low-health display of player 2 (the red on "
+                    "his half, the heartbeat sound) is put to rest the moment he dies or leaves the world, and kept "
+                    "at rest while he waits for his next body; before, it stayed in the low-health state of his last "
+                    "moment until the next takeover. Off = as before")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(pdz_counterop_test_p2_health, 0.0, "Testing",
+                      "Counter-Operative TEST TOOL: each change to a value above 0 puts player 2's health there (he "
+                      "stays alive above his floor of 1), so Rare's low-health display comes on before a test death; "
+                      "to prove pdz_counterop_wait_no_low_health")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(pdz_counterop_p2_ragdoll_off, true, "Gameplay",
+                    "Counter-Operative (Tue 24 Nov, default on): when player 2 leaves the world, while he waits, and "
+                    "before every new body, his own ragdoll is ended through Rare's routine (the one Rare's co-op "
+                    "revive calls). A destroyed hovercraft throws its driver as a ragdoll; left on, it kept his body "
+                    "at the wreck in the lake, where every new life died at once. Off = as before")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(pdz_counterop_spawn_place_check, true, "Gameplay",
+                    "Counter-Operative (Tue 24 Nov, default on): in the first second of a new body player 2's "
+                    "position is compared with where he was put; if something has pulled him far away while he is in "
+                    "no vehicle, he is put back once and his health restored. After two lives in a row that ended "
+                    "within a second, the next body is not given before his ragdoll and vehicle link are cleared. "
+                    "Off = no check")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(pdz_counterop_test_p2_ragdoll, 0, "Debug",
+                     "Counter-Operative TEST TOOL: when this changes to a non-zero value, player 2's own ragdoll is "
+                     "started through Rare's routine (as a destroyed hovercraft does to its driver), to prove "
+                     "pdz_counterop_p2_ragdoll_off")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(pdz_counterop_hide_at_once, true, "Gameplay",
                     "Counter-Operative (Mon 23 Nov, default on): player 2 is hidden and locked on the first frame of "
                     "the level, before the opening cutscene test lets the start be made, so Rare's co-op player 2 is "
@@ -608,6 +637,10 @@ REX_EXTERN(__imp__sub_824573A8); // co-op revive (participant)
 REX_EXTERN(__imp__sub_825B3D58); // the SP player factory: (setup) -> human (player 2's call once player 1 exists)
 REX_EXTERN(sub_8222FF58);        // game over
 REX_EXTERN(sub_825AD148);        // move a character (character, &position, 0)
+REX_EXTERN(sub_823B1978);        // a HUD scene's value (scene, index 0 health / 1 armour, r5 the value, f1 0)
+REX_EXTERN(sub_825BAC90);        // a character's ragdoll off (Rare's co-op revive 824573A8 calls it): controller out of
+                                 // the physics world, +956 = 0
+REX_EXTERN(sub_825BAC20);        // a character's ragdoll on (the character update 825C7028 calls it when +993 is set)
 REX_EXTERN(sub_8252DE88);        // guard vtable +0x2E4: Kill(guard, killer, death type, apply damage) - level scripts
                                  // call it on live guards (8231AD18, 821DBA2C, 822FFA78)
 REX_EXTERN(sub_825AD0E0);        // Rare's script teleport (character, &position) -> 825AD148(c, pos, 1)
@@ -1060,6 +1093,11 @@ constexpr MissionIds kDenied[] = {
     float coop_max_health = 0.0f;
     bool max_health_set = false;
     float set_health = 0.0f;
+    // Tue 24 Nov (1.0.2): where the last spawn put him and when; lives that ended within a second, in a row.
+    float placed[3] = {};
+    std::chrono::steady_clock::time_point placed_at{};
+    bool place_check = false;
+    uint32_t quick_deaths = 0, ragdoll_offs = 0;
     std::chrono::steady_clock::time_point health_check_at{};
     bool health_check = false;
     bool registry_warned = false;
@@ -1927,9 +1965,41 @@ namespace
   // 82156E20), so he isn't drawn, collided with, seen or targeted; and Rare's player action lock on every bit
   // (8254D8F0), so he can't move, fire, use or pick anything up. He stays alive for Rare's co-op rules (no "partner
   // down", no revive); his view follows the agent.
+  // Tue 24 Nov (1.0.2, pdz_counterop_p2_ragdoll_off). Log 065 (River, 13:27:54): his hovercraft blew up under him.
+  // Rare's hovercraft throws its driver off as a ragdoll (his own controller at +864: active +948, the character's
+  // "is a ragdoll" byte +956, the "make him one" byte +993 that the character update 825C7028 acts on). Rare ends a
+  // human's ragdoll in the co-op revive (824573A8: the move, then 825BAC90, +993 = 0), which Counter-Op never runs
+  // (his death is our own). So the ragdoll stayed: its bodies lay at the wreck in the lake and owned his position;
+  // the spawn's move held for one frame, then he was back under the water line and the lake killed him, 12 lives in
+  // two minutes. The same two steps as the revive, on leaving the world, while he waits and before each new body.
+  bool P2RagdollOff(PPCContext &ctx, uint8_t *base, uint32_t c, const char *when, bool force = false)
+  {
+    constexpr uint32_t kRagdollPtr = 912, kRagdollActive = 948, kRagdollIs = 956, kRagdollWanted = 993;
+    if ((!force && !REXCVAR_GET(pdz_counterop_p2_ragdoll_off)) || !Ptr(c) || !pdz::guestmem::Ok(base, c + kRagdollPtr, 96))
+    {
+      return false;
+    }
+    const uint8_t active = base[c + kRagdollActive], is = base[c + kRagdollIs], wanted = base[c + kRagdollWanted];
+    if (!active && !is && !wanted)
+    {
+      return false;
+    }
+    const float x = LoadFloat(base, c + kPosition), y = LoadFloat(base, c + kPosition + 4), z = LoadFloat(base, c + kPosition + 8);
+    base[c + kRagdollWanted] = 0;
+    Call(ctx, base, sub_825BAC90, c);
+    ++g.ragdoll_offs;
+    REXLOG_INFO("pdz_counterop: ragdoll: player 2's own ragdoll ended ({}; #{}): it was active {} (controller +948), "
+                "his 'is a ragdoll' byte {} (+956), 'make him one' {} (+993), his position ({:.0f}, {:.0f}, {:.0f}); "
+                "now {} / {} / {} through Rare's 825BAC90, as Rare's co-op revive does (pdz_counterop_p2_ragdoll_off)",
+                when, g.ragdoll_offs, active, is, wanted, x, y, z, base[c + kRagdollActive], base[c + kRagdollIs],
+                base[c + kRagdollWanted]);
+    return true;
+  }
+
   void HideP2(PPCContext &ctx, uint8_t *base, const char *why)
   {
     counter_op_river::LeaveSeat(ctx, base, g.p2c, why); // round 13 h: River, a hovercraft driver leaves his seat first
+    P2RagdollOff(ctx, base, g.p2c, "he leaves the world"); // Tue 24 Nov: a thrown driver is a ragdoll
     PdzCounterOpOutpostBeforeHide(ctx, base, g.p2c); // round 13 f: Outpost, the gunner of the hovercraft leaves the gun first
     PdzCounterOpTurretBeforeHide(ctx, base, g.p2c, why); // round 13b q: the gunner of a stationary turret leaves it first
     if (Ptr(g.p2c) && counter_op_jetpack::Riding(base, g.p2c))
@@ -2463,14 +2533,16 @@ namespace
   // after it was last switched on) with its last frame's health; our plain stores (health to the guard's share,
   // armour 100 -> 0) are then drawn by that display as a loss. Nothing was hit: the display is put to rest with the
   // new values (bar off, its "last health" = the new health, no low-health heartbeat, no damage direction markers).
-  void QuietHealthFeedback(PPCContext &ctx, uint8_t *base, uint32_t human, float hp)
+  void QuietHealthFeedback(PPCContext &ctx, uint8_t *base, uint32_t human, float hp, const char *when = nullptr)
   {
-    if (!REXCVAR_GET(pdz_counterop_quiet_takeover) || !Ptr(human))
+    // Tue 24 Nov (1.0.2, pdz_counterop_wait_no_low_health): also at his death and while he waits ('when' given).
+    if (!(when ? REXCVAR_GET(pdz_counterop_wait_no_low_health) : REXCVAR_GET(pdz_counterop_quiet_takeover)) || !Ptr(human))
     {
       return;
     }
     const uint32_t fx = Load32(base, human + 0x19B4);
     std::string was = "no health display";
+    const uint32_t low_was = Ptr(fx) ? base[fx + 0x28] : 0;
     if (Ptr(fx))
     {
       was = fmt::format("bar {} ({:.1f} s), last health {:.0f}, low {}, heartbeat sound {:08X}", base[fx] ? "up" : "down",
@@ -2504,6 +2576,38 @@ namespace
     if (Ptr(participant))
     {
       StoreFloat(base, participant + 0xA0C, 5.0f); // Rare's "seconds since hurt": past the point that shows the bar
+    }
+    if (when)
+    {
+      // Rare's display (82267DE0) hands the health to his HUD scene (823B1978(scene, 0, health)) only while its bar
+      // is up; the scene kept the last value of his life (1 to 12: its low-health red) through the whole wait. The
+      // scene is told the full value now, as the display would with its bar up.
+      uint32_t scene = 0;
+      if (Rd(base, fx, 0x40))
+      {
+        const uint32_t owner = Load32(base, fx + 16);
+        scene = Rd(base, owner, 968) ? Load32(base, owner + 964) : 0;
+        if (Rd(base, scene, 4))
+        {
+          rex::CallFrame frame(ctx);
+          frame.ctx.r3.u64 = scene;
+          frame.ctx.r4.u64 = 0;
+          frame.ctx.r5.u64 = uint32_t(std::floor(hp));
+          frame.ctx.f1.f64 = 0.0;
+          sub_823B1978(frame.ctx, base);
+        }
+        else
+        {
+          scene = 0;
+        }
+      }
+      REXLOG_INFO("pdz_counterop: wait: Rare's health display put to rest {} (it was: {}, low byte {}; {} damage "
+                  "direction marker(s) cleared): no low-health red and no heartbeat on his half while he waits; now "
+                  "low {}, heartbeat sound {:08X}, last health {:.0f}; his HUD scene {:08X} told health {:.0f} "
+                  "(Rare's 823B1978) (pdz_counterop_wait_no_low_health)",
+                  when, was, low_was, cleared, Ptr(fx) ? base[fx + 0x28] : 0, Ptr(fx) ? Load32(base, fx + 0x24) : 0,
+                  Ptr(fx) ? LoadFloat(base, fx + 8) : 0.0f, scene, std::floor(hp));
+      return;
     }
     REXLOG_INFO("pdz_counterop: spawn (d): Rare's health display put to rest for the takeover (it was: {}; {} damage "
                 "direction marker(s) cleared)",
@@ -3138,6 +3242,19 @@ namespace
     g_view_from = std::chrono::steady_clock::now();
     g_view_lines = 0;
     g_view_cleared = 0;
+    P2RagdollOff(ctx, base, g.p2c, "before his new body"); // Tue 24 Nov (1.0.2)
+    if (g.quick_deaths >= 2 && REXCVAR_GET(pdz_counterop_spawn_place_check))
+    {
+      // The backstop: two lives in a row ended within a second of their spawn.
+      constexpr uint32_t kParentOf = 0x5C;
+      const bool ragdoll = P2RagdollOff(ctx, base, g.p2c, "the backstop after two quick deaths", true);
+      const uint32_t parent = Load32(base, g.p2c + kParentOf);
+      REXLOG_WARN("pdz_counterop: spawn backstop: his last {} lives ended within 1 s of their spawn: before this body "
+                  "his state is checked: ragdoll {}, attached to {:08X}{} (pdz_counterop_spawn_place_check)",
+                  g.quick_deaths, ragdoll ? "was on, ended" : "off", parent,
+                  Ptr(parent) ? " (a vehicle or prop: Rare's leave steps ran when he left the world; see the river / "
+                                "turret lines)" : "");
+    }
     ShowP2(ctx, base);
     REXLOG_INFO("pdz_counterop: spawn (a): player 2 {}", was_out ? fmt::format("back in the world (unhidden: world, "
                                                                                "team lists, physics; unlocked) after {} "
@@ -3181,6 +3298,9 @@ namespace
       g.place_log = 40;
       g.place_series.clear();
       g.place_given_y = at[1];
+      std::memcpy(g.placed, at, sizeof(at)); // Tue 24 Nov (pdz_counterop_spawn_place_check)
+      g.placed_at = std::chrono::steady_clock::now();
+      g.place_check = true;
       if (has_yaw)
       {
         const float before = LoadFloat(base, g.p2c + kViewYaw);
@@ -4154,6 +4274,20 @@ namespace
                          LoadFloat(base, p2c + kPosition + 8)};
     const auto now = std::chrono::steady_clock::now();
     ++g.own_deaths;
+    {
+      const double lived = g.placed_at.time_since_epoch().count() ? std::chrono::duration<double>(now - g.placed_at).count() : 1e9;
+      g.quick_deaths = lived < 1.0 ? g.quick_deaths + 1 : 0;
+      if (lived < 1.0)
+      {
+        REXLOG_WARN("pdz_counterop: this life lasted {:.2f} s ({} in a row under 1 s): he died at ({:.0f}, {:.0f}, "
+                    "{:.0f}), {:.1f} m from where the spawn put him ({:.0f}, {:.0f}, {:.0f})",
+                    lived, g.quick_deaths, at[0], at[1], at[2],
+                    std::sqrt((at[0] - g.placed[0]) * (at[0] - g.placed[0]) + (at[1] - g.placed[1]) * (at[1] - g.placed[1]) +
+                              (at[2] - g.placed[2]) * (at[2] - g.placed[2])) / 100.0f,
+                    g.placed[0], g.placed[1], g.placed[2]);
+      }
+      g.place_check = false;
+    }
     REXLOG_INFO("pdz_counterop: player 2 is killed (life {}, own death #{}): health {:.2f} at his floor {:.1f}, at "
                 "({:.0f}, {:.0f}, {:.0f}); no co-op death (Rare's death state stays {}): out of the world now, the "
                 "replaced guard {:08X} dies here through Rare's kill, the next guard in {:.1f} s",
@@ -4180,6 +4314,7 @@ namespace
     HideP2(ctx, base, "his guard was killed");
     // A full bar while he waits (no low-health effects in his dark half; the next spawn sets the guard's share).
     StoreFloat(base, p2p + kPartMaxHealth, g.coop_max_health > 0.0f ? g.coop_max_health : 100.0f);
+    QuietHealthFeedback(ctx, base, p2c, g.coop_max_health > 0.0f ? g.coop_max_health : 100.0f, "at his death"); // Tue 24 Nov (1.0.2)
     g.set_health = 0.0f;
     g.health_check = false;
     g.getup_rescue_at = {};
@@ -4908,6 +5043,91 @@ namespace
     // Round 2: the guard side's scan (opening settled, the forced wake, script wake-ups, clone waves) and the count.
     counter_op_guards::Tick(ctx, base, g.p1c, cutscene);
     counter_op_twins::Tick(ctx, base, p1c, p2c, g.current_guard, g.out, cutscene); // round 13 d: Trinity Infiltration's twins
+    {
+      // Tue 24 Nov (1.0.2): his own ragdoll (test tool, the watch while he waits) and the first second's place check.
+      static int32_t ragdoll_test_was = 0;
+      if (const int32_t test = REXCVAR_GET(pdz_counterop_test_p2_ragdoll); test != ragdoll_test_was)
+      {
+        ragdoll_test_was = test;
+        if (test != 0 && Ptr(p2c) && !g.out)
+        {
+          base[p2c + 993] = 1;
+          Call(ctx, base, sub_825BAC20, p2c);
+          REXLOG_INFO("pdz_counterop: ragdoll: TEST TOOL: pdz_counterop_test_p2_ragdoll {}: player 2's own ragdoll "
+                      "started through Rare's 825BAC20 (+993 = 1): active {} (+948), is a ragdoll {} (+956)",
+                      test, base[p2c + 948], base[p2c + 956]);
+        }
+      }
+      static double health_test_was = 0.0;
+      if (const double test = REXCVAR_GET(pdz_counterop_test_p2_health); test != health_test_was)
+      {
+        health_test_was = test;
+        if (test > 0.0 && Ptr(p2c) && Ptr(g.p2p) && !g.out)
+        {
+          const float had = Health(base, p2c);
+          StoreFloat(base, g.p2p + kPartMaxHealth, float(test));
+          // Rare's health display (82267DE0) takes a new health only while its bar is up (a hit raises it).
+          const uint32_t fx = Rd(base, p2c, 0x19C0) ? Load32(base, p2c + 0x19B4) : 0;
+          if (Rd(base, fx, 0x40))
+          {
+            base[fx] = 1;
+            StoreFloat(base, fx + 4, 0.0f);
+          }
+          REXLOG_INFO("pdz_counterop: TEST TOOL: pdz_counterop_test_p2_health {:.1f}: player 2's health {:.1f} -> {:.1f}; "
+                      "his health display's bar raised as a hit does",
+                      test, had, Health(base, p2c));
+        }
+      }
+      if (g.out && Ptr(p2c))
+      {
+        P2RagdollOff(ctx, base, p2c, "while he waits out of the world");
+        // Tue 24 Nov (pdz_counterop_wait_no_low_health): the display's low state or heartbeat came back in the wait.
+        if (REXCVAR_GET(pdz_counterop_wait_no_low_health) && Rd(base, p2c, 0x19C0))
+        {
+          const uint32_t fx = Load32(base, p2c + 0x19B4);
+          if (Rd(base, fx, 0x2C) && (base[fx + 0x28] != 0 || Load32(base, fx + 0x24) != 0))
+          {
+            QuietHealthFeedback(ctx, base, p2c, Health(base, p2c), "while he waits (it had come back)");
+          }
+        }
+      }
+      if (g.place_check && !g.out && Ptr(p2c) && REXCVAR_GET(pdz_counterop_spawn_place_check))
+      {
+        const double since = std::chrono::duration<double>(std::chrono::steady_clock::now() - g.placed_at).count();
+        float at[3] = {};
+        if (since > 1.0)
+        {
+          g.place_check = false;
+        }
+        else if (!Ptr(Load32(base, p2c + 0x5C)) && !counter_op_jetpack::Riding(base, p2c) && OriginOf(ctx, base, p2c, at))
+        {
+          const float dx = at[0] - g.placed[0], dy = at[1] - g.placed[1], dz = at[2] - g.placed[2];
+          const float d = std::sqrt(dx * dx + dy * dy + dz * dz), limit = 400.0f + 1500.0f * float(since);
+          if (d > limit)
+          {
+            g.place_check = false; // once per body
+            const bool ragdoll = P2RagdollOff(ctx, base, p2c, "the place check", true);
+            StoreFloat(base, g.scratch, g.placed[0]);
+            StoreFloat(base, g.scratch + 4, g.placed[1]);
+            StoreFloat(base, g.scratch + 8, g.placed[2]);
+            Call(ctx, base, sub_825AD148, p2c, g.scratch, 0);
+            const float had = Health(base, p2c);
+            if (g.set_health > 0.0f && had < g.set_health && Ptr(g.p2p))
+            {
+              StoreFloat(base, g.p2p + 980, g.set_health); // the participant's health (kPartMaxHealth's field: Health() reads it)
+            }
+            float now_at[3] = {};
+            OriginOf(ctx, base, p2c, now_at);
+            REXLOG_WARN("pdz_counterop: spawn place check: {:.2f} s after the spawn player 2 was at ({:.0f}, {:.0f}, "
+                        "{:.0f}), {:.1f} m from where he was put ({:.0f}, {:.0f}, {:.0f}), in no vehicle: put back "
+                        "(Rare's move; his origin is now ({:.0f}, {:.0f}, {:.0f})), ragdoll {}, health {:.1f} -> {:.1f} "
+                        "(pdz_counterop_spawn_place_check)",
+                        since, at[0], at[1], at[2], d / 100.0f, g.placed[0], g.placed[1], g.placed[2], now_at[0],
+                        now_at[1], now_at[2], ragdoll ? "was on, ended" : "off", had, Health(base, p2c));
+          }
+        }
+      }
+    }
     counter_op_river::Tick(ctx, base, g.mission, p1c, p2c, g.out); // round 13 h: River's hovercraft (seat watch, test tools)
     PdzCounterOpMansionTick(ctx, base, p1c, p2c, g.current_guard, g.out, cutscene); // round 13 g: Mansion's last fight (Mai Hem)
     if (counter_op_mansion::GiveBackNow()) { DatacoreGiveBack(ctx, base, "mansion: Mai Hem's fight"); counter_op_mansion::AfterGiveBack(ctx, base); } // round 13 g: his body goes back to Rare's AI without a death
