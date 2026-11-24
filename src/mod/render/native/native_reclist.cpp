@@ -157,6 +157,12 @@ namespace pdz::native
         l->CopyResource(a.dst, a.src);
         break;
       }
+      case Op::kCopyBufferRegion:
+      {
+        const auto &a = *reinterpret_cast<const reclist::CopyBuffer *>(d);
+        l->CopyBufferRegion(a.dst, a.dst_offset, a.src, a.src_offset, a.bytes);
+        break;
+      }
       case Op::kCopyTextureRegion:
       {
         const auto &a = *reinterpret_cast<const reclist::CopyRegion *>(d);

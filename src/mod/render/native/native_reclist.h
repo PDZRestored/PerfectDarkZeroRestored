@@ -33,6 +33,7 @@ namespace pdz::native
     struct DrawIndexed { UINT a, b, c; INT d; UINT e; };
     struct Dispatch3 { UINT x, y, z; };
     struct Copy { ID3D12Resource *dst, *src; };
+    struct CopyBuffer { ID3D12Resource *dst, *src; UINT64 dst_offset, src_offset, bytes; };
     struct CopyRegion
     {
       D3D12_TEXTURE_COPY_LOCATION dst, src;
@@ -72,6 +73,7 @@ namespace pdz::native
       kDispatch,
       kCopyResource,
       kCopyTextureRegion,
+      kCopyBufferRegion,
       kIASetPrimitiveTopology,
       kRSSetViewports,
       kRSSetScissorRects,
@@ -174,6 +176,17 @@ namespace pdz::native
       }
       reclist::Copy args{dst, src};
       Put(Op::kCopyResource, &args, sizeof(args));
+    }
+    void CopyBufferRegion(ID3D12Resource *dst, UINT64 dst_offset, ID3D12Resource *src, UINT64 src_offset, UINT64 bytes)
+    {
+      if (!defer_)
+      {
+        closed_calls_ += deferred_; // the replay thread on, the list closed
+        real_->CopyBufferRegion(dst, dst_offset, src, src_offset, bytes);
+        return;
+      }
+      reclist::CopyBuffer args{dst, src, dst_offset, src_offset, bytes};
+      Put(Op::kCopyBufferRegion, &args, sizeof(args));
     }
     void CopyTextureRegion(const D3D12_TEXTURE_COPY_LOCATION *dst, UINT x, UINT y, UINT z,
                            const D3D12_TEXTURE_COPY_LOCATION *src, const D3D12_BOX *box)

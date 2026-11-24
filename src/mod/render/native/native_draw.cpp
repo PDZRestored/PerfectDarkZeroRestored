@@ -121,6 +121,13 @@ REXCVAR_DEFINE_BOOL(pdz_native_sampler_evict, true, "Render",
                     "fills the region and every later table comes from the 512-entry per-frame ring, where a busy frame "
                     "runs out and skips draws (memlog.md N3). Never triggers while the region has room: within a level "
                     "nothing changes. Off = tables are never freed (the old behaviour).");
+REXCVAR_DEFINE_BOOL(pdz_native_geometry_vram, true, "Render",
+                    "Native renderer: the cached vertex and index data is also kept in video memory, and draws read "
+                    "it from there one frame after it was cached. Before, the graphics card read every mesh of every "
+                    "pass across the PCIe link from system memory in every frame (the cache lives in CPU-writable "
+                    "memory), which costs GPU time that changes from one start of the game to the next. Same data, "
+                    "same picture; 32 MB of video memory per cache chunk. false = as before")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(pdz_native_geometry_shrink, true, "Render",
                     "Native renderer: the geometry cache (upload-heap chunks of 32 MB, at most 8) releases a chunk no "
                     "draw has used for 7200 frames (about 2 min at 60 Hz: a previous level's static geometry), keeping "
@@ -843,6 +850,10 @@ namespace pdz::native
           Chunk &c = chunks_[size_t(oldest)];
           c.resource->Unmap(0, nullptr);
           dev->ReleaseLater(c.resource);
+          if (c.vram)
+          {
+            dev->ReleaseLater(c.vram);
+          }
           c = Chunk(); // an empty slot: never fits, reused by the next AddChunk
           --live;
           ++released;
@@ -860,7 +871,70 @@ namespace pdz::native
         }
       }
 
+      // pdz_native_geometry_vram: the address a draw binds for a cached range: its copy in video memory once the copy
+      // command of an earlier NewFrame covers it, else the CPU-writable copy (as before the switch existed).
+      D3D12_GPU_VIRTUAL_ADDRESS Gpu(const GeometryEntry &e)
+      {
+        const Chunk &c = chunks_[e.chunk];
+        const uint64_t offset = e.gpu - c.gpu;
+        if (c.vram && offset + e.bytes <= c.copied)
+        {
+          ++vram_binds_;
+          return c.vram_gpu + offset;
+        }
+        ++upload_binds_;
+        return e.gpu;
+      }
+
+      // pdz_native_geometry_vram, from NewFrame (the frame's list is open, none of its draws is recorded yet): what
+      // was cached since the last call is copied to the chunks' video memory twins. The bytes were written when they
+      // were cached (earlier than this command can run), and the copy sits in the command stream before every draw
+      // that binds the twin's addresses.
+      void SyncVram(RecList *list)
+      {
+        if (!list)
+        {
+          return;
+        }
+        for (Chunk &c : chunks_)
+        {
+          if (!c.resource || !c.vram || c.copied >= c.used)
+          {
+            continue;
+          }
+          D3D12_RESOURCE_BARRIER b{};
+          b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+          b.Transition.pResource = c.vram;
+          b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+          b.Transition.StateBefore = kVramReadState;
+          b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+          list->ResourceBarrier(1, &b);
+          list->CopyBufferRegion(c.vram, c.copied, c.resource, c.copied, c.used - c.copied);
+          std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
+          list->ResourceBarrier(1, &b);
+          vram_copied_bytes_ += c.used - c.copied;
+          ++vram_copies_;
+          c.copied = c.used;
+        }
+      }
+      uint64_t vram_binds() const { return vram_binds_; }
+      uint64_t upload_binds() const { return upload_binds_; }
+      uint64_t vram_copies() const { return vram_copies_; }
+      uint64_t vram_copied_bytes() const { return vram_copied_bytes_; }
+      size_t vram_chunks() const
+      {
+        size_t n = 0;
+        for (const Chunk &c : chunks_)
+        {
+          n += c.vram ? 1 : 0;
+        }
+        return n;
+      }
+
     private:
+      static constexpr D3D12_RESOURCE_STATES kVramReadState =
+          D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER | D3D12_RESOURCE_STATE_INDEX_BUFFER;
+      uint64_t vram_binds_ = 0, upload_binds_ = 0, vram_copies_ = 0, vram_copied_bytes_ = 0;
       struct Chunk
       {
         ID3D12Resource *resource = nullptr; // nullptr = a released slot (pdz_native_geometry_shrink)
@@ -869,6 +943,10 @@ namespace pdz::native
         uint32_t size = 0;
         uint32_t used = 0;
         uint64_t last_frame = 0;
+        // pdz_native_geometry_vram (Tue 24 Nov): the same bytes in video memory, complete up to `copied`.
+        ID3D12Resource *vram = nullptr;
+        D3D12_GPU_VIRTUAL_ADDRESS vram_gpu = 0;
+        uint32_t copied = 0;
       };
 
       // A new chunk in the first released slot, else at the end; returns its index or -1.
@@ -896,6 +974,13 @@ namespace pdz::native
         c.cpu = static_cast<uint8_t *>(mapped);
         c.gpu = c.resource->GetGPUVirtualAddress();
         c.size = kGeometryChunkBytes;
+        if (REXCVAR_GET(pdz_native_geometry_vram))
+        {
+          // Without it (no video memory left) the chunk works as before.
+          c.vram = dev->CreateBuffer(kGeometryChunkBytes, D3D12_HEAP_TYPE_DEFAULT, kVramReadState, D3D12_RESOURCE_FLAG_NONE,
+                                     "pdz_native geometry chunk (video memory)");
+          c.vram_gpu = c.vram ? c.vram->GetGPUVirtualAddress() : 0;
+        }
         size_t slot = chunks_.size();
         for (size_t i = 0; i < chunks_.size(); ++i)
         {
@@ -1014,6 +1099,9 @@ namespace pdz::native
         }
         DropEntries(uint32_t(best));
         chunks_[size_t(best)].used = 0;
+        // The video memory copy is filled again from the start; its old bytes stay valid for the frames already
+        // recorded (the copies run in command order, after their draws).
+        chunks_[size_t(best)].copied = 0;
         ++recycles_;
         return best;
       }
@@ -1358,6 +1446,10 @@ namespace pdz::native
       PipelineCache::Get().OnFrame(frame);
       ShaderCache::Get().OnFrame(frame);
       g_geometry.Maintain(frame);
+      if (NativeDevice *vram_dev = NativeDevice::Get())
+      {
+        g_geometry.SyncVram(vram_dev->list()); // pdz_native_geometry_vram (after Maintain: no released chunk is copied)
+      }
       drawdump::NewFrame(); // pdz_native_draw_dump (re-reads its cvars; a bool test per draw while off)
       ShortStacksNewFrame(frame); // pdz_fix_short_stacks / pdz_stack_layer_log (re-reads their cvars)
       const int32_t every = REXCVAR_GET(pdz_native_log_frames);
@@ -2636,6 +2728,14 @@ namespace pdz::native
                     REXCVAR_GET(pdz_native_geometry_watch_verify) ? "on" : "off", w.verified, w.mismatches);
       }
       w = geowatch::Stats{};
+      if (g_geometry.vram_chunks())
+      {
+        REXLOG_INFO("pdz_native: geometry in video memory (pdz_native_geometry_vram): {} chunk(s) with a copy there; "
+                    "ranges bound from video memory {} / from system memory {} (new this frame, or no copy) so far; "
+                    "{} copy command(s), {} KB copied so far",
+                    g_geometry.vram_chunks(), g_geometry.vram_binds(), g_geometry.upload_binds(),
+                    g_geometry.vram_copies(), g_geometry.vram_copied_bytes() / 1024);
+      }
     }
 
     // Primitive reset of an indexed draw (REVIEW.md 9, the SDK primitive processor's handling; native_pipeline.h
@@ -2679,7 +2779,7 @@ namespace pdz::native
           if (!REXCVAR_GET(pdz_native_debug_geometry_verify) || CountedSampleHash(src, bytes, stamp) == e->content_hash)
           {
             ++g_perf.hash_skips;
-            gpu = e->gpu;
+            gpu = g_geometry.Gpu(*e);
             if (min_index) *min_index = e->min_index;
             if (max_index) *max_index = e->max_index;
             if (is_vertex) ++g_stats.vertex_cache_hits; else ++g_stats.index_cache_hits;
@@ -2712,7 +2812,7 @@ namespace pdz::native
               g_geometry.Touch(*e, g_frame.frame, stamp);
               ++geowatch::g_stats.clean;
               geowatch::g_stats.clean_bytes += bytes;
-              gpu = e->gpu;
+              gpu = g_geometry.Gpu(*e);
               if (min_index) *min_index = e->min_index;
               if (max_index) *max_index = e->max_index;
               if (is_vertex) ++g_stats.vertex_cache_hits; else ++g_stats.index_cache_hits;
@@ -2768,7 +2868,7 @@ namespace pdz::native
             ++geowatch::g_stats.arm_refused;
           }
         }
-        gpu = e->gpu;
+        gpu = g_geometry.Gpu(*e);
         if (min_index) *min_index = e->min_index;
         if (max_index) *max_index = e->max_index;
         if (is_vertex) ++g_stats.vertex_cache_hits; else ++g_stats.index_cache_hits;

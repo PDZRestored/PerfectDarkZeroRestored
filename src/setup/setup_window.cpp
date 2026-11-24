@@ -15,6 +15,14 @@
 
 // Sun 22 Nov: the renderer's progress window opened over the game window (after a new build, ~2 s after the game
 // window), took the focus with SetForegroundWindow and an exclusive-fullscreen game was minimised until clicked.
+// Tue 24 Nov: 0.9.4 showed the progress box over the game window and went on normally. What broke it afterwards was
+// not the box: the settings file reload after the setup applied the fullscreen mode a second time while the box had
+// the focus, and the fullscreen window minimised itself on the focus loss. Both are fixed in the SDK since Sun 22 Nov
+// (pdz_fix_fullscreen_no_minimize, an unchanged mode is not applied again), so the box can be shown again.
+REXCVAR_DEFINE_BOOL(pdz_progress_box_over_game, true, "Setup",
+                    "The renderer's progress box (compiling shaders, the pipelines) is shown as in 0.9.4, also while "
+                    "the game window is open; when it closes the game window gets the focus back. false = no box "
+                    "over the game window (the small note of pdz_progress_note_over_game instead)");
 REXCVAR_DEFINE_BOOL(pdz_fix_progress_over_game, true, "Setup",
                     "No progress window while the game window is open (it took the focus from the game); the work "
                     "runs with the game window's messages handled. false = the progress window as before");
@@ -251,7 +259,7 @@ namespace pdz::setup_ui
 
   bool RunWithProgress(const std::wstring &title, State &state, const std::function<void(State &)> &work)
   {
-    if (REXCVAR_GET(pdz_fix_progress_over_game) && GameWindow())
+    if (!REXCVAR_GET(pdz_progress_box_over_game) && REXCVAR_GET(pdz_fix_progress_over_game) && GameWindow())
     {
       // The game window is open: no window over it. This thread keeps handling the game window's messages while the
       // work runs (a window left without them for 5 s is shown as Not Responding).
@@ -392,6 +400,9 @@ namespace pdz::setup_ui
     SetTimer(ui.window, kTimer, 50, nullptr);
     Refresh(ui);
     const DWORD started = GetTickCount();
+    // pdz_progress_box_over_game: was the game window open under the box, and is the box really the top window?
+    const HWND game_under = GameWindow();
+    bool top_checked = false, box_on_top = false, minimised_seen = false;
     std::wstring capture_path;
     if (!g_capture_folder.empty())
     {
@@ -415,6 +426,19 @@ namespace pdz::setup_ui
         theme::CaptureWindow(ui.window, capture_path);
         capture_path.clear();
       }
+      if (game_under)
+      {
+        minimised_seen = minimised_seen || IsIconic(game_under) != 0;
+        if (!top_checked && GetTickCount() - started > 500)
+        {
+          top_checked = true;
+          RECT box{};
+          GetWindowRect(ui.window, &box);
+          const POINT centre{(box.left + box.right) / 2, box.top + (box.bottom - box.top) / 3};
+          const HWND at = WindowFromPoint(centre);
+          box_on_top = at == ui.window || (at && GetAncestor(at, GA_ROOT) == ui.window);
+        }
+      }
       MsgWaitForMultipleObjects(0, nullptr, FALSE, 50, QS_ALLINPUT);
       MSG msg;
       while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE))
@@ -434,6 +458,7 @@ namespace pdz::setup_ui
     worker.join();
     KillTimer(ui.window, kTimer);
     SetWindowLongPtrW(ui.window, GWLP_USERDATA, 0);
+    const bool box_had_focus = GetForegroundWindow() == ui.window;
     DestroyWindow(ui.window);
     theme::FreeFonts(ui.fonts);
     MSG msg;
@@ -441,6 +466,28 @@ namespace pdz::setup_ui
     {
       TranslateMessage(&msg);
       DispatchMessageW(&msg);
+    }
+    if (game_under && IsWindow(game_under))
+    {
+      // The game window gets the focus back, but only from our own box: if the player switched to another program
+      // meanwhile, that program keeps it. Never restored from a minimised state here (it is not minimised: the log
+      // line says so if that ever changes).
+      if (box_had_focus)
+      {
+        SetForegroundWindow(game_under);
+        SetActiveWindow(game_under);
+        SetFocus(game_under);
+      }
+      const std::string name(title.begin(), title.end());
+      REXLOG_INFO("pdz_setup: '{}': the progress box was shown over the game window for {} ms (as in 0.9.4, "
+                  "pdz_progress_box_over_game); it {} the top window at its place; the game window was {} while it "
+                  "showed, is {} now and {} the foreground window ({})",
+                  name, GetTickCount() - started,
+                  !top_checked ? "closed before the check of whether it was" : box_on_top ? "was" : "WAS NOT",
+                  minimised_seen ? "MINIMISED at some point" : "never minimised",
+                  IsIconic(game_under) ? "MINIMISED" : "not minimised",
+                  GetForegroundWindow() == game_under ? "is" : "is not",
+                  box_had_focus ? "the box had the focus when it closed" : "another window had the focus when it closed");
     }
     return true;
   }
