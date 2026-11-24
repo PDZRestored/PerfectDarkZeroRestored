@@ -145,14 +145,14 @@ REXCVAR_DEFINE_BOOL(pdz_mouse_direct_rocket, true, "Mouse",
                     "controller is the game's own either way. Needs pdz_mouse_look")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(pdz_fix_rocket_control_back, true, "Mouse",
-                    "The guided rocket gives the mouse back the moment it explodes (Tue 24 Nov, 1.0.3, default on). "
+                    "The guided rocket gives the mouse back the moment it explodes (Tue 24 Nov evening, default on). "
                     "A guided rocket that has exploded stays in the game until its flight time is over (about 7 s "
                     "from the shot), and its look update goes on being called for all of that time. The mouse code "
                     "took every such call as 'the rocket is being steered', so after the blast the mouse still went "
                     "to the dead rocket and Jo could not aim until the rocket was finally removed. Now a rocket that "
                     "has detonated (Rare's own state, rocket +1244 = 3, set by its detonation routine 825B6E50) is "
                     "no longer steered: the mouse aims Jo's own view again in the same frame. The controller was "
-                    "never held (the game reads it itself). Off = as 1.0.2")
+                    "never held (the game reads it itself). Off = as before")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(pdz_rocket_log, false, "Mouse",
                     "Log the guided rocket's life frame by frame (Tue 24 Nov): every call of its look update (its "
@@ -260,7 +260,7 @@ namespace pdz::mouse
              std::chrono::duration_cast<std::chrono::nanoseconds>(kSteerHold).count();
     }
 
-    // Tue 24 Nov (1.0.3): the guided rocket (class 820C8478). Its update 825B61F0 adds the frame time to its age
+    // Tue 24 Nov evening: the guided rocket (class 820C8478). Its update 825B61F0 adds the frame time to its age
     // (+1060) against its flight time ([+1076] +4); a hit or the end of the flight sets 'detonate' (+1096) and the
     // update then calls its detonation routine 825B6E50 once: the explosion, the view handed back, state +1244 = 3.
     // The rocket object and its controller (822533E8, the look update's caller 82253588) live on after that.
