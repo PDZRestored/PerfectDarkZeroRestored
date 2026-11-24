@@ -353,6 +353,68 @@ REXCVAR_DEFINE_BOOL(pdz_counterop_wait_no_low_health, true, "Gameplay",
                     "at rest while he waits for his next body; before, it stayed in the low-health state of his last "
                     "moment until the next takeover. Off = as before")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(pdz_counterop_death_hit_clear, true, "Gameplay",
+                    "Counter-Operative (Tue 24 Nov round 2, default on): the hits that killed player 2 leave nothing "
+                    "behind. Rare's hit feedback of a player (the red glow on the edge of his view towards whoever "
+                    "hit him, its strength and timer, the pad rumble of the hits, the view kick) is only wound down "
+                    "by his own update, which stops while he is out of the world: the glow of his last hits stayed on "
+                    "his half through the whole wait and ran on over his next body. It is now ended the moment he "
+                    "dies, kept ended while he waits, and ended again before each new body. Off = as before")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(pdz_counterop_takeover_predress, false, "Gameplay",
+                    "Counter-Operative (Tue 24 Nov round 2, an experiment, default off; measured: no cure). When the "
+                    "picked guard's body or head differs from the one player 2 wore last, his body is rebuilt as the "
+                    "guard's as soon as the guard is picked, while he is still out of the world, and the takeover "
+                    "follows pdz_counterop_takeover_predress_frames later. A rebuilt body is not drawn for its first "
+                    "frames in the world (only his gun shows); the hope was that building it early gets those frames "
+                    "over unseen, but the body's model instance is only set up on its first frame IN the world, so "
+                    "it is missing just as long. Off = rebuilt in the takeover's own tick")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(pdz_counterop_takeover_predress_frames, 10, "Gameplay",
+                     "Counter-Operative (Tue 24 Nov round 2): how many frames the takeover waits after player 2's "
+                     "body was rebuilt as the picked guard's (pdz_counterop_takeover_predress). 10 = a sixth of a "
+                     "second at 60 fps")
+    .range(1, 120)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(pdz_counterop_takeover_guard_stays, 1, "Gameplay",
+                     "Counter-Operative (Tue 24 Nov round 2, default 1): how many ticks the guard player 2 takes over "
+                     "stays in the world after the takeover's tick (a guard on foot only). Player 2's body, put into "
+                     "the world in the takeover's tick, is first drawn two frames later, while a guard taken out is "
+                     "gone from the very next frame: for one frame nobody stood there. With 1 the guard is drawn for "
+                     "that frame and leaves as player 2's body appears. 0 = as before (out in the takeover's tick)")
+    .range(0, 10)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(pdz_counterop_takeover_pose, false, "Gameplay",
+                    "Counter-Operative (Tue 24 Nov round 2, an experiment, default off; measured: no cure for the "
+                    "body missing after a takeover). After a takeover's move player 2's own update is run once with a "
+                    "zero time step in the same tick, the way Rare's own teleport of a player (825AD0E0) does. Off = "
+                    "the move alone, as before")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(pdz_counterop_test_watch_takeover, 0.0, "Testing",
+                      "Counter-Operative TEST TOOL (Tue 24 Nov round 2): above 0, each takeover is held back this many "
+                      "seconds after its guard is picked; the agent is put 4 m from that guard and her view is kept on "
+                      "him (then on player 2), so mark pictures of her half show the body at the hand-over. 0 = off")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(pdz_counterop_test_takeover_log, false, "Testing",
+                    "Counter-Operative TEST TOOL (Tue 24 Nov round 2): logs what changes in player 2's body model "
+                    "instance on the ticks after a rebuild and after a takeover")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(pdz_counterop_test_takeover_mark, -1, "Testing",
+                     "Counter-Operative TEST TOOL (Tue 24 Nov round 2): N >= 0 asks for one mark picture (as F12) of "
+                     "the frame N ticks after each takeover's tick (0 = the frame of the takeover's own tick; that "
+                     "one needs pdz_counterop_test_watch_takeover, which knows the tick before). -1 = off")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DECLARE(int32_t, pdz_test_mark); // native_present.cpp
+namespace pdz::native::autodiff
+{
+  uint64_t SwapCount(); // swaps seen so far: a mark asked for now is the picture of swap SwapCount() + 1
+}
+REXCVAR_DEFINE_INT32(pdz_counterop_test_hit_glow, 0, "Testing",
+                     "Counter-Operative TEST TOOL: each change to a new non-zero value starts Rare's own hit feedback "
+                     "on player 2 (Rare's 825AB5E0, as a hit of 13 from straight ahead would: the red glow on the top "
+                     "edge of his half), with or without a body, to prove pdz_counterop_death_hit_clear. 0 = off")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REX_EXTERN(sub_825AB5E0); // Rare's hit feedback of a player (human, kind, &direction, by a friend, push him, f1 damage)
 REXCVAR_DEFINE_DOUBLE(pdz_counterop_test_p2_health, 0.0, "Testing",
                       "Counter-Operative TEST TOOL: each change to a value above 0 puts player 2's health there (he "
                       "stays alive above his floor of 1), so Rare's low-health display comes on before a test death; "
@@ -1098,6 +1160,18 @@ constexpr MissionIds kDenied[] = {
     std::chrono::steady_clock::time_point placed_at{};
     bool place_check = false;
     uint32_t quick_deaths = 0, ragdoll_offs = 0;
+    uint32_t hit_trace = 0; // Tue 24 Nov round 2: frames of the new body logged so far (0 = not tracing)
+    // Tue 24 Nov round 2 (item 2): the frames around a takeover (trace), and the test tool's held-back takeover.
+    int32_t take_trace = -1; // frames since the takeover's tick (-1 = not tracing)
+    uint32_t stay_guard = 0;     // pdz_counterop_takeover_guard_stays: the taken guard not yet out of the world
+    int32_t stay_ticks = 0;      // ticks he still stays
+    uint32_t predress_guard = 0; // pdz_counterop_takeover_predress: the guard he was rebuilt as, takeover pending
+    int32_t predress_ticks = 0;  // ticks since that rebuild
+    uint32_t take_trace_guard = 0;
+    bool watch_pending = false, watch_marked = false, watch_done = false;
+    int32_t watch_ticks = 0;
+    uint32_t watch_guard = 0;
+    std::chrono::steady_clock::time_point watch_at{};
     std::chrono::steady_clock::time_point health_check_at{};
     bool health_check = false;
     bool registry_warned = false;
@@ -1996,10 +2070,135 @@ namespace
     return true;
   }
 
+  // Tue 24 Nov round 2 (pdz_counterop_death_hit_clear). What a hit leaves on a player (Rare's 825AD9B0 -> 825AB5E0):
+  //   human +6648 (byte) feedback running, +6649 by a friend, +6652 its timer (s), +6656 its strength (0..1), +6660
+  //   its length, +6636 the direction of the hit in his view; +6632 the glow itself: a screen sprite (alpha at +36,
+  //   colour +8 / +24) made on the first hit and kept; +7540 eight pad rumble slots of 16 bytes (the first float is
+  //   the phase, 1 -> 0); his camera ([participant +1676] +20): the view kick (+1132 byte running, +1116 strength).
+  // Only his own update winds these down (825A7CB0 -> 825AB200 the glow, 825ABAB8 the rumble). Out of the world that
+  // update does not reach them, so the glow of the hits that killed him stayed drawn at its last strength for the
+  // whole wait, and the timer ran on over his next body. Here they are put to what Rare's own end leaves: flag and
+  // timer 0, strength 0, direction straight on (825AB5E0's own 'no direction'), the sprite's alpha 0, the rumble
+  // slots at rest (as Rare's 825ABA90), the view kick off, and the damage total of that life (participant +2576,
+  // 'recent damage' in the log) emptied as Rare's participant reset does.
+  struct HitState
+  {
+    uint8_t on = 0, friendly = 0, kick = 0;
+    float timer = 0, strength = 0, length = 0, alpha = -1, kick_strength = 0, since_hurt = -1, recent = -1;
+    uint32_t sprite = 0, rumble = 0, camera = 0;
+    int16_t flinch = 0;
+    bool Any() const { return on || timer != 0.0f || strength != 0.0f || alpha > 0.0f || rumble || kick || recent > 0.0f; }
+  };
+  HitState ReadHitState(const uint8_t *base, uint32_t c)
+  {
+    HitState h;
+    if (!Ptr(c) || !Rd(base, c, 7680))
+    {
+      return h;
+    }
+    h.on = base[c + 6648];
+    h.friendly = base[c + 6649];
+    h.timer = LoadFloat(base, c + 6652);
+    h.strength = LoadFloat(base, c + 6656);
+    h.length = LoadFloat(base, c + 6660);
+    h.sprite = Load32(base, c + 6632);
+    if (Rd(base, h.sprite, 0x80))
+    {
+      h.alpha = LoadFloat(base, h.sprite + 36);
+    }
+    for (uint32_t i = 0; i < 8; ++i)
+    {
+      h.rumble += LoadFloat(base, c + 7540 + 16 * i) > 0.0f;
+    }
+    h.flinch = int16_t((uint16_t(base[c + 976]) << 8) | base[c + 977]);
+    const uint32_t participant = Load32(base, c + kParticipantOf);
+    if (Rd(base, participant, 0xA18))
+    {
+      h.since_hurt = LoadFloat(base, participant + 0xA0C);
+      h.recent = LoadFloat(base, participant + 0xA10);
+      const uint32_t view = Load32(base, participant + 1676);
+      h.camera = Rd(base, view, 24) ? Load32(base, view + 20) : 0;
+      if (Rd(base, h.camera, 1140))
+      {
+        h.kick = base[h.camera + 1132];
+        h.kick_strength = LoadFloat(base, h.camera + 1116);
+      }
+    }
+    return h;
+  }
+  std::string HitText(const HitState &h)
+  {
+    return fmt::format("hit feedback {} (timer {:.2f} s of {:.2f}, strength {:.2f}{}), glow sprite {:08X} alpha {:.2f}, "
+                       "{} rumble slot(s) running, view kick {} (strength {:.3f}), flinch +976 {}, seconds since hurt "
+                       "{:.2f}, recent damage {:.1f}",
+                       h.on ? "RUNNING" : "off", h.timer, h.length, h.strength, h.friendly ? ", by a friend" : "", h.sprite,
+                       h.alpha, h.rumble, h.kick ? "RUNNING" : "off", h.kick_strength, h.flinch, h.since_hurt, h.recent);
+  }
+  uint32_t g_hit_clears = 0;
+  bool ClearHitState(uint8_t *base, uint32_t c, const char *when, bool always_log = false)
+  {
+    if (!Ptr(c) || !Rd(base, c, 7680))
+    {
+      return false;
+    }
+    const HitState was = ReadHitState(base, c);
+    if (!REXCVAR_GET(pdz_counterop_death_hit_clear))
+    {
+      if (always_log)
+      {
+        REXLOG_INFO("pdz_counterop: hit state {}: {}: LEFT AS IT IS (pdz_counterop_death_hit_clear off)", when,
+                    HitText(was));
+      }
+      return false;
+    }
+    if (!was.Any())
+    {
+      if (always_log)
+      {
+        REXLOG_INFO("pdz_counterop: hit state {}: {}: nothing to end (pdz_counterop_death_hit_clear)", when, HitText(was));
+      }
+      return false;
+    }
+    base[c + 6648] = 0;
+    base[c + 6649] = 0;
+    StoreFloat(base, c + 6652, 0.0f);
+    StoreFloat(base, c + 6656, 0.0f);
+    StoreFloat(base, c + 6636, 0.0f);
+    StoreFloat(base, c + 6640, 0.0f);
+    StoreFloat(base, c + 6644, 1.0f);
+    if (Rd(base, was.sprite, 0x80))
+    {
+      StoreFloat(base, was.sprite + 36, 0.0f);
+    }
+    for (uint32_t i = 0; i < 8; ++i)
+    {
+      StoreFloat(base, c + 7540 + 16 * i, 0.0f);
+    }
+    if (was.kick && Rd(base, was.camera, 1140))
+    {
+      base[was.camera + 1132] = 0;
+      StoreFloat(base, was.camera + 1116, 0.0f);
+    }
+    // The damage he took in that life (participant +2576, +2580): Rare's own participant reset (82473B60) empties both.
+    if (const uint32_t participant = Load32(base, c + kParticipantOf); Rd(base, participant, 0xA18))
+    {
+      StoreFloat(base, participant + 0xA10, 0.0f);
+      StoreFloat(base, participant + 0xA14, 0.0f);
+    }
+    ++g_hit_clears;
+    if (always_log || g_hit_clears <= 40 || g_hit_clears % 600 == 0)
+    {
+      REXLOG_INFO("pdz_counterop: hit state {}: ENDED (#{}): it was: {}; now: {} (pdz_counterop_death_hit_clear)", when,
+                  g_hit_clears, HitText(was), HitText(ReadHitState(base, c)));
+    }
+    return true;
+  }
+
   void HideP2(PPCContext &ctx, uint8_t *base, const char *why)
   {
     counter_op_river::LeaveSeat(ctx, base, g.p2c, why); // round 13 h: River, a hovercraft driver leaves his seat first
     P2RagdollOff(ctx, base, g.p2c, "he leaves the world"); // Tue 24 Nov: a thrown driver is a ragdoll
+    ClearHitState(base, g.p2c, "as he leaves the world", true); // Tue 24 Nov round 2
     PdzCounterOpOutpostBeforeHide(ctx, base, g.p2c); // round 13 f: Outpost, the gunner of the hovercraft leaves the gun first
     PdzCounterOpTurretBeforeHide(ctx, base, g.p2c, why); // round 13b q: the gunner of a stationary turret leaves it first
     if (Ptr(g.p2c) && counter_op_jetpack::Riding(base, g.p2c))
@@ -3243,6 +3442,8 @@ namespace
     g_view_lines = 0;
     g_view_cleared = 0;
     P2RagdollOff(ctx, base, g.p2c, "before his new body"); // Tue 24 Nov (1.0.2)
+    ClearHitState(base, g.p2c, "before his new body", true); // Tue 24 Nov round 2
+    g.hit_trace = 1;
     if (g.quick_deaths >= 2 && REXCVAR_GET(pdz_counterop_spawn_place_check))
     {
       // The backstop: two lives in a row ended within a second of their spawn.
@@ -3558,6 +3759,7 @@ namespace
     // (e)
     if (take)
     {
+      const bool guard_sat = Ptr(Load32(base, guard + 0x5C)); // (pdz_counterop_takeover_guard_stays: on foot only)
       counter_op_levels13::OnTake(ctx, base, g.p2c, guard); // round 13 i: the cloak hand-over (before the guard is hidden)
       // Round 5 (item 1): awake or asleep, the sleeping guards of his whole area wake with him (round 4 woke only a
       // sleeping guard's own group: the awake 'fac3' of the sleeping warehouse woke nobody).
@@ -3566,7 +3768,20 @@ namespace
       PdzCounterOpOutpostUnseat(ctx, base, g.p2c, guard); // round 13 f: Mai Hem at her hovercraft's gun leaves it first
       PdzCounterOpTurretUnseat(ctx, base, g.p2c, guard); // round 13b q: a guard at a stationary turret leaves it first
       counter_op_river::Unseat(ctx, base, g.p2c, guard); // round 13 h: River, a driver picked in his hovercraft seat leaves it first
-      const std::string removed = RemoveGuard(ctx, base, guard);
+      // Tue 24 Nov round 2 (item 2, pdz_counterop_takeover_guard_stays): a guard on foot (he sat on nothing before
+      // the unseat steps above, and is no jetpack rider) leaves the world a tick later; the tick hides him then.
+      const int32_t stays = REXCVAR_GET(pdz_counterop_takeover_guard_stays);
+      const bool stay = stays > 0 && !e.air && !e.dormant && !guard_sat && !(Load32(base, guard + kHidden) & 0x10) &&
+                        !Ptr(Load32(base, g.p2c + 0x5C));
+      if (stay)
+      {
+        g.stay_guard = guard;
+        g.stay_ticks = stays;
+      }
+      const std::string removed = stay ? fmt::format("stays in the world for {} more tick(s), then Rare's script despawn: "
+                                                     "player 2's body is first drawn two frames from now "
+                                                     "(pdz_counterop_takeover_guard_stays)", stays)
+                                       : RemoveGuard(ctx, base, guard);
       REXLOG_INFO("pdz_counterop: spawn (e): guard {:08X} {}", guard, removed);
       REXLOG_INFO("pdz_counterop: armour pieces: after the despawn the guard {:08X} has {} piece(s) attached",
                   guard, PdzCounterOpArmourPieces(ctx, base, guard, false));
@@ -3590,6 +3805,44 @@ namespace
     counter_op_pad::Arm(base, g.p2c, take ? "took a guard" : "spawned as a guard");
     g.tries = 0;
     PdzCounterOpHudOnNewBody(base); // round 16 (item 2): his weapon HUD elements are checked at every new body
+    g.watch_done = false;
+    if (REXCVAR_GET(pdz_counterop_test_takeover_mark) == -2 && REXCVAR_GET(pdz_counterop_takeover_predress))
+    {
+      REXCVAR_SET(pdz_test_mark, REXCVAR_GET(pdz_test_mark) + 1000); // TESTING TOOL: the frame after the takeover's
+    }
+    g.take_trace = 0; // Tue 24 Nov round 2 (item 2): the frames from here on are logged by the tick
+    g.take_trace_guard = take ? guard : 0;
+    // Tue 24 Nov round 2 (item 2, pdz_counterop_takeover_pose). Rare's teleport of a character (825AD0E0, what the
+    // level scripts use for the players) is: the move (825AD148), then the character's own Update (vtable +4) with a
+    // zero step, which poses the body at the new place. The takeover made the move alone: his body kept the pose and
+    // place of his last update (where he died, or the level's start) until his next update, one frame later, while
+    // the guard was already out of the world. The zero-step Update is made here, last, with everything of the new
+    // body set (place, facing, look, gun, health). Not in a seat (a hovercraft, a jetpack, a gun: Rare's mount has
+    // just placed him).
+    if (REXCVAR_GET(pdz_counterop_takeover_pose) && Ptr(g.p2c) && !g.out)
+    {
+      constexpr uint32_t kParentOf = 0x5C;
+      const uint32_t vt = Load32(base, g.p2c), parent = Load32(base, g.p2c + kParentOf);
+      const uint32_t update = Rd(base, vt, 8) ? Load32(base, vt + 4) : 0;
+      PPCFunc *fn = !Ptr(parent) && update ? pdz::GuestFunction(update, "counter-op: player 2's Update (zero step)") : nullptr;
+      if (fn)
+      {
+        rex::CallFrame frame(ctx);
+        frame.ctx.r3.u64 = g.p2c;
+        frame.ctx.f1.f64 = 0.0;
+        fn(frame.ctx, base);
+      }
+      static uint32_t poses = 0;
+      if (++poses <= 12 || poses % 50 == 0)
+      {
+        REXLOG_INFO("pdz_counterop: spawn (p): {} (#{}; pdz_counterop_takeover_pose)",
+                    fn ? fmt::format("player 2's body posed at the new place in this tick: his Update {:08X} with a zero "
+                                     "step, as Rare's teleport 825AD0E0 does", update)
+                       : Ptr(parent) ? fmt::format("not posed by us: he sits on {:08X} (Rare's mount placed him)", parent)
+                                     : std::string("not posed: no Update routine found"),
+                    poses);
+      }
+    }
   }
 
   // Mon 23 Nov (co21, pdz_counterop_safe_handback). Log 058 (Bridge): cut-off move (c) handed guard 's11a' back
@@ -3660,6 +3913,10 @@ namespace
       if (!counter_op_guards::StillExists(base, guard))
       {
         continue; // Rare deleted it (Datacore's stage-3 clean-up of its IndoorGuard01s)
+      }
+      if (guard == g.stay_guard && g.stay_ticks > 0)
+      {
+        continue; // Tue 24 Nov round 2: he leaves a tick after the takeover (pdz_counterop_takeover_guard_stays)
       }
       if (!pdz::guestmem::Ok(base, guard, kHidden + 4) || // Sun 22 Nov night (audit): a guard Rare freed under us
           (Load32(base, guard) != kGuardVtable && !counter_op_twins::IsTwin(guard) && !counter_op_mansion::IsBoss(guard)) || (Load32(base, guard + kHidden) & 0x10)) // round 13 d, round 13 g
@@ -3976,6 +4233,135 @@ namespace
     Spot e;
     ++g.tries;
     const char *step = Pick(ctx, base, spots, e);
+    // TESTING TOOL (pdz_counterop_test_watch_takeover): the picked guard is taken a little later, the agent watching.
+    if (const double watch_s = REXCVAR_GET(pdz_counterop_test_watch_takeover); watch_s > 0.0 && TakeGuard())
+    {
+      if (g.watch_pending)
+      {
+        if (std::chrono::steady_clock::now() < g.watch_at || !g.watch_marked || g.watch_ticks < 2)
+        {
+          --g.tries;
+          return false;
+        }
+        g.watch_pending = false;
+        g.watch_done = true; // (cleared by the takeover)
+        const Spot *same = nullptr;
+        for (const Spot &c : spots)
+        {
+          if (c.character == g.watch_guard && !c.dead && !c.dormant)
+          {
+            same = &c;
+          }
+        }
+        if (same)
+        {
+          e = *same;
+          step = "the watched guard (pdz_counterop_test_watch_takeover)";
+        }
+        g.watch_guard = 0;
+      }
+      else if (step && !g.predress_guard && !g.watch_done && !e.dormant && !e.dead && Ptr(g.p1c) && g.scratch)
+      {
+        // 4 m in front of the guard (his facing, Rare's getter), at his height
+        float dx = 0.0f, dz = 1.0f;
+        {
+          rex::CallFrame frame(ctx);
+          frame.ctx.r3.u64 = e.character;
+          frame.ctx.f1.f64 = 0.0;
+          sub_82519A90(frame.ctx, base);
+          if (std::isfinite(frame.ctx.f1.f64))
+          {
+            dx = float(std::sin(frame.ctx.f1.f64));
+            dz = float(std::cos(frame.ctx.f1.f64));
+          }
+        }
+        g.watch_marked = false;
+        StoreFloat(base, g.scratch, e.x + dx * 160.0f);
+        StoreFloat(base, g.scratch + 4, e.y);
+        StoreFloat(base, g.scratch + 8, e.z + dz * 160.0f);
+        Call(ctx, base, sub_825AD148, g.p1c, g.scratch, 0);
+        g.watch_pending = true;
+        g.watch_guard = e.character;
+        g.watch_at = std::chrono::steady_clock::now() + std::chrono::milliseconds(int(watch_s * 1000));
+        REXLOG_INFO("pdz_counterop: TEST TOOL (pdz_counterop_test_watch_takeover {:.1f}): guard {:08X} '{}' picked; the "
+                    "agent put 4 m from him at ({:.0f}, {:.0f}, {:.0f}), her view kept on him; the takeover in {:.1f} s",
+                    watch_s, e.character, IdChars(e.id), e.x + dx * 160.0f, e.y, e.z + dz * 160.0f, watch_s);
+        --g.tries;
+        return false;
+      }
+    }
+    // Tue 24 Nov round 2 (item 2, pdz_counterop_takeover_predress): a body built in the takeover's tick is not drawn
+    // for its first frames (pictures: two frames after the takeover his gun floats where the guard stood). So a
+    // guard whose body or head differs from what player 2 wears is not taken at once: player 2, still out of the
+    // world, is rebuilt as him now (the same steps as at the takeover), and the takeover follows some frames later
+    // with the guard still standing there. A guard who is gone by then (dead, hidden) is not taken: the next pick.
+    if (TakeGuard() && g.out && Ptr(g.p2c))
+    {
+      if (g.predress_guard)
+      {
+        if (g.predress_ticks < REXCVAR_GET(pdz_counterop_takeover_predress_frames))
+        {
+          // TESTING TOOL (pdz_counterop_test_takeover_mark 0): the tick before the takeover's
+          if (g.predress_ticks == REXCVAR_GET(pdz_counterop_takeover_predress_frames) - 1 &&
+              REXCVAR_GET(pdz_counterop_test_takeover_mark) == 0)
+          {
+            REXCVAR_SET(pdz_test_mark, REXCVAR_GET(pdz_test_mark) + 1000);
+          }
+          --g.tries;
+          g.next_try = std::chrono::steady_clock::now(); // again on the next tick
+          return false;
+        }
+        const Spot *same = nullptr;
+        for (const Spot &c : spots)
+        {
+          if (c.character == g.predress_guard && !c.dead && !c.dormant)
+          {
+            same = &c;
+          }
+        }
+        REXLOG_INFO("pdz_counterop: look: the takeover of guard {:08X} now, {} tick(s) after player 2 was rebuilt as "
+                    "him: {} (pdz_counterop_takeover_predress)",
+                    g.predress_guard, g.predress_ticks,
+                    same ? "he is still a usable body" : "he is no longer usable (dead or hidden): another pick");
+        g.predress_guard = 0;
+        if (same)
+        {
+          e = *same;
+          if (!step)
+          {
+            step = "the guard he was rebuilt as";
+          }
+        }
+      }
+      else if (step && REXCVAR_GET(pdz_counterop_takeover_predress) && REXCVAR_GET(pdz_counterop_guard_look) &&
+               !e.dormant && !e.dead && !e.air && Rd(base, e.character, 5288) && Rd(base, g.p2c, 5288) &&
+               (Load32(base, e.character) == kGuardVtable || counter_op_twins::IsTwin(e.character) ||
+                counter_op_mansion::IsBoss(e.character)) &&
+               (Load32(base, e.character + kBodyId) != Load32(base, g.p2c + kBodyId) ||
+                Load32(base, e.character + kHeadId) != Load32(base, g.p2c + kHeadId)))
+      {
+        if (REXCVAR_GET(pdz_counterop_guard_weapons))
+        {
+          Call(ctx, base, sub_8254BDF0, g.p2c, 0);
+        }
+        const uint32_t body = Load32(base, e.character + kBodyId), head = Load32(base, e.character + kHeadId);
+        std::string hands_why, dress;
+        const uint32_t hands = PdzCounterOpHandsFor(ctx, base, body, hands_why);
+        const bool dressed = PdzCounterOpDress(ctx, base, g.p2c, body, head, hands, -1, dress);
+        REXLOG_INFO("pdz_counterop: look: guard {:08X} '{}' picked (body {} / head {}): player 2 rebuilt as him now, out "
+                    "of the world: {}{}; hands: {}; the takeover follows in {} frame(s) (pdz_counterop_takeover_predress)",
+                    e.character, IdChars(e.id), body, head, dressed ? "" : "NOT re-dressed: ", dress, hands_why,
+                    REXCVAR_GET(pdz_counterop_takeover_predress_frames));
+        if (dressed)
+        {
+          g.predress_guard = e.character;
+          g.predress_ticks = 0;
+          --g.tries;
+          g.next_try = std::chrono::steady_clock::now();
+          return false;
+        }
+      }
+    }
     if (step)
     {
       if (TakeGuard())
@@ -5078,9 +5464,55 @@ namespace
                       test, had, Health(base, p2c));
         }
       }
+      // TESTING TOOL (Tue 24 Nov round 2, pdz_counterop_test_hit_glow): Rare's own hit feedback, from straight ahead.
+      if (static int32_t glow_was = 0; REXCVAR_GET(pdz_counterop_test_hit_glow) != glow_was)
+      {
+        glow_was = REXCVAR_GET(pdz_counterop_test_hit_glow);
+        if (glow_was != 0 && Ptr(p2c) && Rd(base, p2c, 7680))
+        {
+          rex::CallFrame frame(ctx);
+          const uint32_t dir = (ctx.r1.u32 - 0x400) & ~0xFu;
+          frame.ctx.r1.u64 = (ctx.r1.u32 - 0x800) & ~0xFu;
+          // 825AD9B0 hands over (his position - the attacker's): an attacker 3 m in front of his view
+          const float yaw = LoadFloat(base, p2c + 0x1670) * 3.14159265f / 180.0f;
+          StoreFloat(base, dir, -std::sin(yaw) * 300.0f);
+          StoreFloat(base, dir + 4, 0.0f);
+          StoreFloat(base, dir + 8, -std::cos(yaw) * 300.0f);
+          frame.ctx.r3.u64 = p2c;
+          frame.ctx.r4.u64 = 2;
+          frame.ctx.r6.u64 = dir;
+          frame.ctx.r7.u64 = 0;
+          frame.ctx.r8.u64 = 0;
+          frame.ctx.f1.f64 = 13.0;
+          sub_825AB5E0(frame.ctx, base);
+          REXLOG_INFO("pdz_counterop: TEST TOOL (pdz_counterop_test_hit_glow {}): Rare's hit feedback 825AB5E0 started "
+                      "on player 2 ({}): {}",
+                      glow_was, g.out ? "out of the world, waiting" : "in a body", HitText(ReadHitState(base, p2c)));
+        }
+      }
+      if (!g.out && Ptr(p2c) && g.hit_trace)
+      {
+        // The first frames of a new body: is anything of the last death's hits still running?
+        const uint32_t n = g.hit_trace++;
+        if (n <= 3 || n == 10 || n == 30 || n == 120)
+        {
+          REXLOG_INFO("pdz_counterop: hit state on frame {} of his new body: {}; health {:.0f}", n,
+                      HitText(ReadHitState(base, p2c)), Health(base, p2c));
+        }
+        if (n >= 120)
+        {
+          g.hit_trace = 0;
+        }
+      }
       if (g.out && Ptr(p2c))
       {
         P2RagdollOff(ctx, base, p2c, "while he waits out of the world");
+        ClearHitState(base, p2c, "while he waits out of the world"); // Tue 24 Nov round 2
+        if (static uint32_t wait_log = 0; !REXCVAR_GET(pdz_counterop_death_hit_clear) && ++wait_log % 120 == 1)
+        {
+          REXLOG_INFO("pdz_counterop: hit state while he waits (pdz_counterop_death_hit_clear off): {}",
+                      HitText(ReadHitState(base, p2c)));
+        }
         // Tue 24 Nov (pdz_counterop_wait_no_low_health): the display's low state or heartbeat came back in the wait.
         if (REXCVAR_GET(pdz_counterop_wait_no_low_health) && Rd(base, p2c, 0x19C0))
         {
@@ -5260,6 +5692,135 @@ namespace
       if (REXCVAR_GET(pdz_counterop_test_agent_aim) && !cutscene && !g.spectating && !g.out && Alive(ctx, base, p2c))
       {
         AimAgentAtP2(ctx, base);
+      }
+      // TESTING TOOL (pdz_counterop_test_watch_takeover): her view on the guard about to be taken, then on player 2.
+      if (REXCVAR_GET(pdz_counterop_test_watch_takeover) > 0.0 && !cutscene && Ptr(p1c))
+      {
+        const uint32_t at = g.watch_pending && Ptr(g.watch_guard) ? g.watch_guard : (!g.out && g.take_trace >= 0) ? p2c : 0;
+        if (Ptr(at) && Rd(base, at, 64) && Rd(base, p1c, 64))
+        {
+          const float dx = LoadFloat(base, at + kPosition) - LoadFloat(base, p1c + kPosition);
+          const float dz = LoadFloat(base, at + kPosition + 8) - LoadFloat(base, p1c + kPosition + 8);
+          if (dx * dx + dz * dz > 2500.0f)
+          {
+            rex::CallFrame frame(ctx);
+            frame.ctx.r3.u64 = p1c;
+            frame.ctx.f1.f64 = 0.30; // down (825AD3B0's pitch is positive down): his whole body in view
+            frame.ctx.f2.f64 = std::atan2(double(dx), double(dz));
+            sub_825AD3B0(frame.ctx, base);
+          }
+        }
+      }
+      if (g.watch_pending && g.watch_marked)
+      {
+        // one tick after 'due': the picture asked for now is the next tick's frame, and the takeover is made there
+        if (const int32_t m = REXCVAR_GET(pdz_counterop_test_takeover_mark); ++g.watch_ticks == (m == -2 ? 2 : 1) && (m == 0 || m == -2) && !REXCVAR_GET(pdz_counterop_takeover_predress)) // -2: the frame after the takeover's
+        {
+          REXCVAR_SET(pdz_test_mark, REXCVAR_GET(pdz_test_mark) + 1000);
+        }
+        g.next_try = std::chrono::steady_clock::now() - std::chrono::milliseconds(1);
+      }
+      if (g.watch_pending && !g.watch_marked && std::chrono::steady_clock::now() >= g.watch_at)
+      {
+        g.watch_ticks = 0;
+        // The tick before the takeover: the pick is tried again on the next tick; with mark 0 the picture asked for
+        // now is that tick's frame.
+        g.watch_marked = true;
+        REXLOG_INFO("pdz_counterop: TEST TOOL (pdz_counterop_test_watch_takeover): the takeover is due on the next tick "
+                    "(swaps so far {}; mark {}); the watched guard {:08X} is {}", pdz::native::autodiff::SwapCount(),
+                    REXCVAR_GET(pdz_counterop_test_takeover_mark), g.watch_guard,
+                    Ptr(g.watch_guard) && Rd(base, g.watch_guard, 6280) && !(Load32(base, g.watch_guard + kHidden) & 0x10)
+                        ? "in the world" : "NOT in the world");
+      }
+      if (g.stay_guard && --g.stay_ticks <= 0)
+      {
+        const uint32_t guard = g.stay_guard;
+        g.stay_guard = 0;
+        // (only while he is still the taken guard: a death in between has handed him back already)
+        if (g.taken.count(guard) && counter_op_guards::StillExists(base, guard) && Rd(base, guard, kHidden + 4))
+        {
+          const std::string removed = RemoveGuard(ctx, base, guard);
+          REXLOG_INFO("pdz_counterop: spawn (e), a tick later: guard {:08X} {} (pdz_counterop_takeover_guard_stays)",
+                      guard, removed);
+        }
+      }
+      // Tue 24 Nov round 2 (item 2, measuring): what changes in his body's model instance (pool 82E75160, 0x200 bytes
+      // a slot, state words at 82D70E80) on the ticks after a rebuild and after a takeover.
+      if (REXCVAR_GET(pdz_counterop_test_takeover_log) && (g.predress_guard || g.take_trace >= 0) && Ptr(p2c) && Rd(base, p2c, 0x50))
+      {
+        static uint32_t inst_was = 0, words[128] = {}, state_was = 0, changes_logged = 0;
+        const uint32_t inst = Load32(base, p2c + 0x48);
+        if (inst >= 0x82E75160u && inst < 0x82E75160u + 0x9C4u * 0x200u && Rd(base, inst, 0x200))
+        {
+          const uint32_t state = Load32(base, 0x82D70E80u + ((inst - 0x82E75160u) >> 9) * 4);
+          std::string diff;
+          int n = 0;
+          for (uint32_t i = 0; i < 128; ++i)
+          {
+            const uint32_t w = Load32(base, inst + i * 4);
+            if (inst == inst_was && w != words[i] && ++n <= 8)
+            {
+              diff += fmt::format(" +{:03X}:{:08X}->{:08X}", i * 4, words[i], w);
+            }
+            words[i] = w;
+          }
+          if (inst != inst_was || state != state_was || n)
+          {
+            if (inst != inst_was)
+            {
+              changes_logged = 0;
+            }
+            if (++changes_logged <= 60)
+            {
+              REXLOG_INFO("pdz_counterop: body instance {:08X} (rebuild tick {}, takeover tick {}): state word {:08X}{}; "
+                          "{} word(s) changed:{}", inst, g.predress_guard ? g.predress_ticks : -1, g.take_trace,
+                          state, inst != inst_was ? " (a new instance)" : "", n, diff);
+            }
+          }
+          inst_was = inst;
+          state_was = state;
+        }
+      }
+      if (g.predress_guard)
+      {
+        ++g.predress_ticks;
+        if (!g.out)
+        {
+          g.predress_guard = 0; // he got a body another way
+        }
+      }
+      // Tue 24 Nov round 2 (item 2): who is in the world at the spot on the frames from a takeover on.
+      if (g.take_trace >= 0)
+      {
+        const int32_t n = g.take_trace++;
+        const uint32_t gd = g.take_trace_guard;
+        const bool gok = Ptr(gd) && Rd(base, gd, 6280);
+        if (n <= 3 || n == 20)
+        {
+          REXLOG_INFO("pdz_counterop: takeover trace: tick +{} (the next picture is swap {}): player 2 {} flags +64 "
+                      "{:08X} at ({:.0f}, {:.0f}, {:.0f}), {} armour piece(s); the guard {:08X}: {}",
+                      n, pdz::native::autodiff::SwapCount() + 1, g.out ? "OUT of the world" : "in the world",
+                      Ptr(p2c) ? Load32(base, p2c + 64) : 0, Ptr(p2c) ? LoadFloat(base, p2c + kPosition) : 0.0f,
+                      Ptr(p2c) ? LoadFloat(base, p2c + kPosition + 4) : 0.0f,
+                      Ptr(p2c) ? LoadFloat(base, p2c + kPosition + 8) : 0.0f,
+                      Ptr(p2c) ? PdzCounterOpArmourPieces(ctx, base, p2c, false) : 0, gd,
+                      gok ? fmt::format("{} flags +64 {:08X} at ({:.0f}, {:.0f}, {:.0f})",
+                                        (Load32(base, gd + kHidden) & 0x10) ? "hidden (+6272 0x10)" : "IN THE WORLD",
+                                        Load32(base, gd + 64), LoadFloat(base, gd + kPosition),
+                                        LoadFloat(base, gd + kPosition + 4), LoadFloat(base, gd + kPosition + 8))
+                          : std::string("none"));
+        }
+        if (const int32_t mark_at = REXCVAR_GET(pdz_counterop_test_takeover_mark); mark_at >= 1 && n == mark_at - 1)
+        {
+          REXCVAR_SET(pdz_test_mark, REXCVAR_GET(pdz_test_mark) + 1000);
+          REXLOG_INFO("pdz_counterop: TEST TOOL (pdz_counterop_test_takeover_mark {}): a mark picture asked for on tick "
+                      "+{} of the takeover, for the frame of tick +{} (swaps so far {})", mark_at, n, mark_at,
+                      pdz::native::autodiff::SwapCount());
+        }
+        if (n >= 90)
+        {
+          g.take_trace = -1;
+        }
       }
       if (REXCVAR_GET(pdz_counterop_test_p2_attack) > 0 && REXCVAR_GET(pdz_counterop_test_seek) && !cutscene &&
           !g.spectating && !g.out && Alive(ctx, base, p2c) && Alive(ctx, base, p1c))
