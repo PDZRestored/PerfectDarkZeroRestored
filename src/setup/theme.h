@@ -100,4 +100,9 @@ namespace pdz::theme
   // focus, A presses the focused control, B is Esc, LB / RB are Ctrl+Shift+Tab / Ctrl+Tab. Returns the virtual key it
   // sent (0: none).
   UINT PollController(HWND window);
+  // Mon 23 Nov night (testing tool): controller presses played instead of a real pad's (PollController reads them the
+  // same way). items: LB RB UP DOWN LEFT RIGHT A B, comma separated; one every 500 ms from 1.5 s after the first poll
+  // with the window in front; END = the list is over (PollController answers VK_F24 once). Empty = off.
+  void SetTestPad(const std::string &items);
+  bool TestPadActive();
 } // namespace pdz::theme

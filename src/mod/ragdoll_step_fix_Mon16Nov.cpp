@@ -565,6 +565,7 @@ namespace
   bool ControllerOk(const uint8_t *base, uint32_t c) { return Plausible(c) && pdz::guestmem::Ok(base, c, kControllerPhysical + 4); }
 
   // ---- Mon 23 Nov: pdz_fix_ragdoll_rest_sleep ----
+  constexpr bool kOldRestSleep = false; // (Mon 23 Nov night: the first form, see SettledBlend)
   constexpr uint32_t kEntityIsland = 84, kIslandActive = 40; // (829C2188 / 829C21A0 / 829C2200 read them)
   uint64_t g_sleeps = 0, g_sleep_lines = 0;
   bool IslandAwake(const uint8_t *base, uint32_t body)
@@ -777,7 +778,9 @@ namespace
       }
       StoreBe(base, c + kControllerWeight, std::bit_cast<uint32_t>(1.0f));
       // Mon 23 Nov: and once Rare's update has made it physical (no drive any more), its bodies go to sleep.
-      if (REXCVAR_GET(pdz_fix_ragdoll_rest_sleep))
+      // (Mon 23 Nov night: retired. This first form used the stillness measured BEFORE the body went physical and froze
+      // a body in mid-hop; RestSleepWatch below replaces it. Kept behind a switch that is always off.)
+      if (kOldRestSleep && REXCVAR_GET(pdz_fix_ragdoll_rest_sleep))
       {
         if (r.sleep == 0 && base[c + kControllerPhysical] != 0 && r.still_s >= 0.4)
         {
@@ -846,6 +849,205 @@ namespace
       g_rest.clear();
     }
   }
+
+  // ---- Mon 23 Nov night (1.0.1 job): the rest sleep done again (pdz_fix_ragdoll_rest_sleep, OFF by default) ----
+  // What went wrong with the first form (the owner's photo, 18:17: a body held stiff off the ground, propped on a hand):
+  // it trusted the stillness measured before the body went physical and tested the floor once, with a loose rule.
+  // The rules now, for a ragdoll every active controller of which is physical (nothing drives it any more):
+  //   - every bone under 5 cm/s for 0.5 s, measured only from then on, and measured again after every wake;
+  //   - every bone within 30 cm of the floor under it (a limb in the air, a body on a ledge or on another body: never);
+  //   - no bone of another ragdoll in the same island (a body that touches another body is left to the engine);
+  //   - anything else in the island (a dropped gun) must not have moved since the last try.
+  // Then Havok's own sleep call for the island (829C2200), as before: the state the engine reaches by itself seconds
+  // later. Everything that wakes a sleeping body still wakes it.
+  struct Rest2
+  {
+    std::vector<std::array<float, 3>> bones; // last frame's places (cm)
+    std::unordered_map<uint32_t, std::array<float, 3>> others;
+    double still_s = 0.0, since_try_s = 1.0;
+    int state = 0; // 0 watched, 1 put to sleep by us, 2 asleep by the engine itself
+    const char *why = "";
+    bool told = false;
+    uint32_t body0 = 0;
+    int wakes = 0;
+  };
+  std::unordered_map<uint32_t, Rest2> g_rest2; // by ragdoll
+  uint64_t g_sleeps2 = 0, g_refused2 = 0, g_lines2 = 0;
+
+  void RestSleepWatch(PPCContext &ctx, uint8_t *base, double frame_dt)
+  {
+    const double dt = frame_dt > 0.0 && frame_dt < 0.25 ? frame_dt : 1.0 / 60.0;
+    struct Seen
+    {
+      uint32_t controller = 0;
+      bool physical = true;
+    };
+    std::unordered_map<uint32_t, Seen> ragdolls;
+    for (uint32_t c = pdz::guestmem::Ok(base, kControllerList, 4) ? Load32(base, kControllerList) : 0, guard = 0;
+         ControllerOk(base, c) && guard < 256; c = Load32(base, c + kControllerNext), ++guard)
+    {
+      if (!base[c + kControllerActive])
+      {
+        continue;
+      }
+      const uint32_t ragdoll = Load32(base, c + kControllerRagdoll);
+      if (!Plausible(ragdoll))
+      {
+        continue;
+      }
+      Seen &s = ragdolls[ragdoll];
+      s.controller = c;
+      s.physical = s.physical && base[c + kControllerPhysical] != 0;
+    }
+    for (auto it = g_rest2.begin(); it != g_rest2.end();)
+    {
+      it = ragdolls.count(it->first) ? std::next(it) : g_rest2.erase(it);
+    }
+    for (const auto &[ragdoll, seen] : ragdolls)
+    {
+      Rest2 &r = g_rest2[ragdoll];
+      if (!seen.physical || Bodies(base, seen.controller, g_bones) == 0 || g_body_ids.empty())
+      {
+        r.still_s = 0.0; // something still drives it: nothing measured before it is fully physical counts
+        r.bones.clear();
+        continue;
+      }
+      const std::vector<uint32_t> ids = g_body_ids;
+      const std::vector<std::array<float, 3>> bones = g_bones;
+      r.body0 = ids[0];
+      if (!IslandAwake(base, ids[0]))
+      {
+        if (r.state == 0)
+        {
+          r.state = 2; // the engine put it to sleep itself
+        }
+        r.still_s = 0.0;
+        r.bones = bones;
+        continue;
+      }
+      if (r.state != 0)
+      {
+        // Awake again (a hit, another body, a prop): watched from the start, every rule again.
+        ++r.wakes;
+        r.state = 0, r.still_s = 0.0, r.since_try_s = 1.0, r.told = false;
+        r.others.clear();
+      }
+      float fastest = 1.0e9f;
+      if (r.bones.size() == bones.size())
+      {
+        fastest = 0.0f;
+        for (size_t b = 0; b < bones.size(); ++b)
+        {
+          const float dx = bones[b][0] - r.bones[b][0], dy = bones[b][1] - r.bones[b][1], dz = bones[b][2] - r.bones[b][2];
+          fastest = std::max(fastest, std::sqrt(dx * dx + dy * dy + dz * dz) / float(dt)); // cm/s
+        }
+      }
+      r.bones = bones;
+      r.still_s = fastest < 5.0f ? r.still_s + dt : 0.0;
+      r.since_try_s += dt;
+      if (r.still_s < 0.5 || r.since_try_s < 0.25 || r.wakes > 20)
+      {
+        continue;
+      }
+      r.since_try_s = 0.0;
+      // Every bone on the floor.
+      float highest = 0.0f;
+      int off_floor = 0;
+      for (const auto &b : bones)
+      {
+        const float f = FloorUnder(ctx, base, b);
+        const float h = std::isfinite(f) ? b[1] - f : 1.0e6f;
+        highest = std::max(highest, h);
+        off_floor += h > 30.0f ? 1 : 0;
+      }
+      const char *why = "";
+      std::vector<uint32_t> all;
+      if (off_floor)
+      {
+        why = "a bone is more than 30 cm over the floor under it (a limb in the air, a ledge, another body under it)";
+      }
+      else if (!IslandEntities(base, Load32(base, ids[0] + kEntityIsland), ids[0], all))
+      {
+        why = "its island's entity list was not found";
+      }
+      else
+      {
+        // Another ragdoll in the island? (Every other watched ragdoll's bodies.)
+        bool other_body = false, moved = false;
+        std::unordered_map<uint32_t, std::array<float, 3>> now;
+        for (const uint32_t e : all)
+        {
+          if (std::find(ids.begin(), ids.end(), e) != ids.end())
+          {
+            continue;
+          }
+          for (const auto &[other, other_seen] : ragdolls)
+          {
+            if (other != ragdoll && !other_body && Bodies(base, other_seen.controller, g_bones) != 0)
+            {
+              other_body = std::find(g_body_ids.begin(), g_body_ids.end(), e) != g_body_ids.end();
+            }
+          }
+          const uint32_t motion = Plausible(e) && pdz::guestmem::Ok(base, e, kBodyMotion + 4) ? Load32(base, e + kBodyMotion) : 0;
+          if (!Plausible(motion) || !pdz::guestmem::Ok(base, motion, kMotionPosition + 12))
+          {
+            moved = true;
+            continue;
+          }
+          std::array<float, 3> q{};
+          for (int k = 0; k < 3; ++k)
+          {
+            q[size_t(k)] = LoadFloat(base, motion + kMotionPosition + 4 * k);
+          }
+          now[e] = q;
+          const auto was = r.others.find(e);
+          if (was == r.others.end())
+          {
+            moved = true; // first seen: looked at again at the next try
+          }
+          else
+          {
+            const float dx = q[0] - was->second[0], dy = q[1] - was->second[1], dz = q[2] - was->second[2];
+            moved = moved || std::sqrt(dx * dx + dy * dy + dz * dz) > 0.01f; // 1 cm since the last try
+          }
+        }
+        r.others = std::move(now);
+        why = other_body ? "it shares its island with another body (it touches one): left to the physics engine"
+              : moved    ? "something else in its island moved since the last try"
+                         : "";
+      }
+      if (why[0])
+      {
+        if (r.why != why || !r.told)
+        {
+          r.why = why;
+          r.told = true;
+          ++g_refused2;
+          if (++g_lines2 <= 120)
+          {
+            REXLOG_INFO("pdz_ragdoll: rest sleep: ragdoll {:08X} (controller {:08X}) lies still but is NOT put to sleep: {} "
+                        "(highest bone {:.0f} cm over its floor, {} of {} bones over 30 cm)",
+                        ragdoll, seen.controller, why, highest > 9.0e5f ? -1.0f : highest, off_floor, bones.size());
+          }
+        }
+        continue;
+      }
+      rex::CallFrame frame(ctx);
+      frame.ctx.r1.u64 = (ctx.r1.u32 - 0x1000) & ~0xFu;
+      frame.ctx.r3.u64 = ids[0];
+      sub_829C2200(frame.ctx, base);
+      r.state = 1;
+      ++g_sleeps2;
+      if (++g_lines2 <= 120 || g_sleeps2 % 100 == 0)
+      {
+        REXLOG_INFO("pdz_ragdoll: rest sleep: ragdoll {:08X} (controller {:08X}): fully physical, every one of its {} bones "
+                    "still for {:.2f} s and on the floor (the highest {:.0f} cm over it), alone in its island with {} "
+                    "resting thing(s): put to sleep with the engine's own call (#{}; pdz_fix_ragdoll_rest_sleep)",
+                    ragdoll, seen.controller, bones.size(), r.still_s, highest, all.size() - std::min(all.size(), ids.size()),
+                    g_sleeps2);
+      }
+    }
+  }
 } // namespace
 
 // Mon 23 Nov (log only, pdz_ragdoll_settle_log): every position / rotation SET on a rigid body of a ragdoll the settle
@@ -910,9 +1112,32 @@ REX_HOOK_RAW(sub_829C1068)
   __imp__sub_829C1068(ctx, base);
 }
 
+// Mon 23 Nov night (1.0.1 job, B8): what a frame's ragdoll update costs, Rare's part and ours, with the number of
+// active ragdoll controllers. One line every 2 s while the switch is on.
+REXCVAR_DEFINE_BOOL(pdz_ragdoll_cost_log, false, "Testing",
+                    "Measuring aid (off): every 2 s one 'pdz_ragdoll: cost' line: the active ragdoll controllers and "
+                    "the time per frame of the game's own ragdoll update and of each piece of this project's work "
+                    "in it (the settled blend, the body-fall sound check, the logs)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+namespace
+{
+  struct Cost
+  {
+    double rare = 0.0, blend = 0.0, after = 0.0, sound = 0.0, log = 0.0;
+    uint64_t frames = 0, active = 0, listed = 0;
+    std::chrono::steady_clock::time_point since{};
+  } g_cost;
+  double Ms(std::chrono::steady_clock::time_point a)
+  {
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - a).count();
+  }
+} // namespace
+
 REX_HOOK_RAW(sub_825EA370)
 {
   ++g_frames;
+  const bool cost = REXCVAR_GET(pdz_ragdoll_cost_log);
+  auto t = std::chrono::steady_clock::now();
   const double frame_dt = ctx.f1.f64;
   const uint32_t hz = pdz::pace::EffectiveHz();
   const bool paced = hz >= kMinHz && hz <= kMaxHz;
@@ -931,11 +1156,35 @@ REX_HOOK_RAW(sub_825EA370)
   {
     SettledBlend(ctx, base, frame_dt); // (Sun 22 Nov night)
   }
+  if (cost)
+  {
+    g_cost.blend += Ms(t);
+    t = std::chrono::steady_clock::now();
+  }
   g_in_update = true;
   __imp__sub_825EA370(ctx, base);
   g_in_update = false;
+  if (cost)
+  {
+    g_cost.rare += Ms(t);
+    t = std::chrono::steady_clock::now();
+  }
   SettledBlendAfter(base);
+  if (REXCVAR_GET(pdz_fix_ragdoll_rest_sleep))
+  {
+    RestSleepWatch(ctx, base, frame_dt); // (Mon 23 Nov night: the rest sleep done again; off by default)
+  }
+  if (cost)
+  {
+    g_cost.after += Ms(t);
+    t = std::chrono::steady_clock::now();
+  }
   pdz::restored_sounds::RagdollTick(ctx, base, frame_dt); // (Tue 17 Nov: a ragdoll that lands makes the body-fall sound)
+  if (cost)
+  {
+    g_cost.sound += Ms(t);
+    t = std::chrono::steady_clock::now();
+  }
   if (REXCVAR_GET(pdz_ragdoll_log))
   {
     LogControllers(base, frame_dt, drive_dt, step, hz);
@@ -943,5 +1192,33 @@ REX_HOOK_RAW(sub_825EA370)
   if (REXCVAR_GET(pdz_ragdoll_settle_log))
   {
     SettleLog(ctx, base, frame_dt); // (Sat 21 Nov evening, log only)
+  }
+  if (cost)
+  {
+    g_cost.log += Ms(t);
+    ++g_cost.frames;
+    for (uint32_t c = pdz::guestmem::Ok(base, kControllerList, 4) ? Load32(base, kControllerList) : 0, n = 0;
+         ControllerOk(base, c) && n < 256; c = Load32(base, c + kControllerNext), ++n)
+    {
+      ++g_cost.listed;
+      g_cost.active += base[c + kControllerActive] != 0;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (g_cost.since == std::chrono::steady_clock::time_point{})
+    {
+      g_cost.since = now;
+    }
+    if (now - g_cost.since >= std::chrono::seconds(2) && g_cost.frames)
+    {
+      const double n = double(g_cost.frames);
+      REXLOG_INFO("pdz_ragdoll: cost: {} frames: ragdoll controllers {:.1f} listed, {:.1f} active | per frame: the game's "
+                  "own ragdoll update {:.3f} ms | ours: settled blend {:.3f} ms, after-update {:.3f} ms, body-fall sound "
+                  "check {:.3f} ms, logs {:.3f} ms (sum {:.3f} ms)",
+                  g_cost.frames, double(g_cost.listed) / n, double(g_cost.active) / n, g_cost.rare / n, g_cost.blend / n,
+                  g_cost.after / n, g_cost.sound / n, g_cost.log / n,
+                  (g_cost.blend + g_cost.after + g_cost.sound + g_cost.log) / n);
+      g_cost = Cost{};
+      g_cost.since = now;
+    }
   }
 }

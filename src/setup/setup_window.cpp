@@ -19,6 +19,15 @@ REXCVAR_DEFINE_BOOL(pdz_fix_progress_over_game, true, "Setup",
                     "No progress window while the game window is open (it took the focus from the game); the work "
                     "runs with the game window's messages handled. false = the progress window as before");
 
+// Mon 23 Nov night (1.0.1): with no window at all the game window stayed black for 4 to 5 s on the first start after
+// an update. Now a small note is shown over the game window that cannot take the focus: a popup owned by the game
+// window, created and shown without activation (WS_EX_NOACTIVATE, SW_SHOWNOACTIVATE), never made the foreground
+// window, with no button, and clicks pass through it. The game window keeps the focus, so nothing minimises it.
+REXCVAR_DEFINE_BOOL(pdz_progress_note_over_game, true, "Setup",
+                    "While the renderer is prepared with the game window open (the first start after an update), a "
+                    "small 'preparing' note is shown over the game window that never takes the focus (needs "
+                    "pdz_fix_progress_over_game). false = no note, a black game window meanwhile (1.0.0)");
+
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "ole32.lib")
 
@@ -157,6 +166,62 @@ namespace pdz::setup_ui
       return DefWindowProcW(hwnd, msg, wp, lp);
     }
 
+    // Mon 23 Nov night (pdz_progress_note_over_game): the note's own window procedure: painted in the theme, never
+    // activated, transparent to the mouse.
+    void PaintNote(Ui &ui, HDC target)
+    {
+      RECT rc;
+      GetClientRect(ui.window, &rc);
+      HDC dc = CreateCompatibleDC(target);
+      HBITMAP bmp = CreateCompatibleBitmap(target, rc.right, rc.bottom);
+      HGDIOBJ old = SelectObject(dc, bmp);
+      theme::FillRect(dc, rc, theme::kBackground);
+      theme::FillRect(dc, RECT{0, 0, rc.right, 1}, theme::kBorder);
+      theme::FillRect(dc, RECT{0, rc.bottom - 1, rc.right, rc.bottom}, theme::kBorder);
+      theme::FillRect(dc, RECT{0, 0, 1, rc.bottom}, theme::kBorder);
+      theme::FillRect(dc, RECT{rc.right - 1, 0, rc.right, rc.bottom}, theme::kBorder);
+      const int x = ui.px(28), w = rc.right - ui.px(56);
+      theme::DrawTitle(dc, RECT{x, ui.px(20), rc.right, ui.px(56)}, ui.fonts.title, ui.dpi);
+      theme::Text(dc, ui.line1, RECT{x, ui.px(70), x + w, ui.px(94)}, ui.fonts.body_bold, theme::kText,
+                  DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
+      theme::DrawProgress(dc, RECT{x, ui.px(102), x + w, ui.px(120)}, ui.progress, ui.progress < 0.0 ? ui.marquee : -1,
+                          ui.dpi);
+      theme::Text(dc, ui.line2, RECT{x, ui.px(128), x + w, ui.px(150)}, ui.fonts.note, theme::kTextDim,
+                  DT_LEFT | DT_SINGLELINE | DT_PATH_ELLIPSIS);
+      BitBlt(target, 0, 0, rc.right, rc.bottom, dc, 0, 0, SRCCOPY);
+      SelectObject(dc, old);
+      DeleteObject(bmp);
+      DeleteDC(dc);
+    }
+
+    LRESULT CALLBACK NoteProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+    {
+      Ui *ui = reinterpret_cast<Ui *>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+      switch (msg)
+      {
+      case WM_ERASEBKGND:
+        return 1;
+      case WM_PAINT:
+      {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(hwnd, &ps);
+        if (ui)
+        {
+          PaintNote(*ui, dc);
+        }
+        EndPaint(hwnd, &ps);
+        return 0;
+      }
+      case WM_MOUSEACTIVATE:
+        return MA_NOACTIVATE;
+      case WM_NCHITTEST:
+        return HTTRANSPARENT;
+      default:
+        break;
+      }
+      return DefWindowProcW(hwnd, msg, wp, lp);
+    }
+
     // TestCapture: from then on each progress window writes itself once into this folder: setup_progress.bmp (the
     // sample), then setup_progress_1.bmp, _2... (the real ones: the disc copy, the shader translation after the
     // settings window).
@@ -191,9 +256,48 @@ namespace pdz::setup_ui
       // The game window is open: no window over it. This thread keeps handling the game window's messages while the
       // work runs (a window left without them for 5 s is shown as Not Responding).
       const std::string name(title.begin(), title.end());
-      REXLOG_INFO("pdz_setup: '{}': no progress window (the game window is open; a window over it would take the "
-                  "focus from it)",
-                  name);
+      HWND game = GameWindow();
+      Ui note;
+      note.state = &state;
+      if (REXCVAR_GET(pdz_progress_note_over_game) && game)
+      {
+        HINSTANCE inst = GetModuleHandleW(nullptr);
+        static bool note_registered = false;
+        if (!note_registered)
+        {
+          WNDCLASSW wc{};
+          wc.lpfnWndProc = NoteProc;
+          wc.hInstance = inst;
+          wc.hbrBackground = nullptr;
+          wc.lpszClassName = L"PDZRestoredSetupNote";
+          note_registered = RegisterClassW(&wc) != 0;
+        }
+        note.dpi = theme::ScreenDpi();
+        RECT gr{};
+        GetWindowRect(game, &gr);
+        const int w = note.px(560), h = note.px(170);
+        note.window = note_registered
+                          ? CreateWindowExW(WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST, L"PDZRestoredSetupNote",
+                                            title.c_str(), WS_POPUP, gr.left + ((gr.right - gr.left) - w) / 2,
+                                            gr.top + ((gr.bottom - gr.top) - h) / 2, w, h, game, nullptr, inst, nullptr)
+                          : nullptr;
+        if (note.window)
+        {
+          SetWindowLongPtrW(note.window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(&note));
+          note.fonts = theme::MakeFonts(note.dpi);
+          Refresh(note);
+          ShowWindow(note.window, SW_SHOWNOACTIVATE);
+          SetWindowPos(note.window, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+          UpdateWindow(note.window);
+        }
+      }
+      const HWND fg_before = GetForegroundWindow();
+      REXLOG_INFO("pdz_setup: '{}': {} (the game window is open; a window that takes the focus would take it from the "
+                  "game); the foreground window is {} now",
+                  name,
+                  note.window ? "a note over the game window that never takes the focus (pdz_progress_note_over_game)"
+                              : "no progress window",
+                  fg_before == game ? "the game window" : "another window");
       std::thread worker([&] {
         work(state);
         std::lock_guard<std::mutex> lock(state.mutex);
@@ -208,6 +312,11 @@ namespace pdz::setup_ui
             break;
           }
         }
+        if (note.window)
+        {
+          Refresh(note);
+          UpdateWindow(note.window);
+        }
         MsgWaitForMultipleObjects(0, nullptr, FALSE, 50, QS_ALLINPUT);
         MSG msg;
         while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE))
@@ -217,6 +326,18 @@ namespace pdz::setup_ui
         }
       }
       worker.join();
+      if (note.window)
+      {
+        const HWND fg_after = GetForegroundWindow();
+        game = GameWindow();
+        REXLOG_INFO("pdz_setup: '{}': the note is closed; while it showed the foreground window {}; the game window is "
+                    "{} and {} the foreground window now",
+                    name, fg_before == fg_after ? "did not change" : "changed",
+                    game && IsIconic(game) ? "MINIMISED" : "not minimised", fg_after == game ? "is" : "is not");
+        SetWindowLongPtrW(note.window, GWLP_USERDATA, 0);
+        DestroyWindow(note.window);
+        theme::FreeFonts(note.fonts);
+      }
       return true;
     }
     HINSTANCE inst = GetModuleHandleW(nullptr);

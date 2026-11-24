@@ -121,6 +121,40 @@ namespace
 // Player 2 (a live human, out of the world) re-dressed as body_id / head_id of the level's lists. true = done (or
 // nothing to do); false = refused before anything was touched (why says exactly why). Game thread only (the
 // counter-op tick).
+// Mon 23 Nov night (1.0.1). Rare's armour pieces of a character (helmet, vest ...): children of type 0x19 with +0x3C8
+// set (Rare's re-skin 825B4860 deletes exactly these). Counted; with destroy they are deleted the way Rare's re-skin
+// does (each one's own destructor), so none is left to be shed and fall. Every child is read only where readable and
+// destroyed only through a vtable in the game image (as the dress code below).
+uint32_t PdzCounterOpArmourPieces(PPCContext &ctx, uint8_t *base, uint32_t character, bool destroy)
+{
+  uint32_t pieces = 0;
+  if (!pdz::guestmem::Ok(base, character, kChildFirst + 4))
+  {
+    return 0;
+  }
+  uint32_t child = Load32(base, character + kChildFirst);
+  for (int n = 0; pdz::guestmem::Ok(base, child, 0x3CC) && n < 64; ++n)
+  {
+    const uint32_t next = Load32(base, child + kChildNext); // read first: the child may be destroyed below
+    const uint32_t child_vt = Load32(base, child);
+    if (Load32(base, child + 0xC) == 0x19 && Load32(base, child + 0x3C8) != 0 && child_vt >= 0x82000000u &&
+        child_vt < 0x83000000u)
+    {
+      if (!destroy)
+      {
+        ++pieces;
+      }
+      else if (PPCFunc *fn = pdz::GuestFunction(Load32(base, child_vt), "counter-op: armour piece"))
+      {
+        Call(ctx, base, fn, child, 1);
+        ++pieces;
+      }
+    }
+    child = next;
+  }
+  return pieces;
+}
+
 bool PdzCounterOpDress(PPCContext &ctx, uint8_t *base, uint32_t human, uint32_t body_id, uint32_t head_id,
                        uint32_t hands_asset, int32_t voice, std::string &why)
 {

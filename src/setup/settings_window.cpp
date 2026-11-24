@@ -55,6 +55,11 @@ REXCVAR_DEFINE_STRING(pdz_settings_test_tab_flash, "", "Testing",
                       "after every message it handles next (each control's own paint) as flash_tab<N>_<step>.bmp "
                       "into this folder, then closes without saving. Shows whether a tab change draws the new page "
                       "in one go or control by control");
+REXCVAR_DEFINE_STRING(pdz_settings_test_pad, "", "Testing",
+                      "TESTING TOOL: 'file|items': controller presses played into the settings window instead of a "
+                      "real pad's (items: LB RB UP DOWN LEFT RIGHT A B END, comma separated, one every 0.5 s), with "
+                      "one line per press written to the file: the tab, the control that has the focus and the "
+                      "Gameplay choice before the press is handled. Empty = off");
 REXCVAR_DEFINE_STRING(pdz_settings_test_capture, "", "Testing",
                       "TESTING TOOL: the settings window shows each tab in turn, writes it as tab<N>.bmp into this "
                       "folder and closes itself (the close box: the game doesn't start)");
@@ -3530,6 +3535,28 @@ namespace pdz::settings_ui
         {
           // A controller: up / down move the focus, A presses, LB / RB change tabs, left / right change a choice.
           const UINT vk = theme::PollController(hwnd);
+          if (vk && theme::TestPadActive())
+          {
+            // TESTING TOOL (pdz_settings_test_pad): the state each press meets (so the next line shows what it did).
+            const std::string spec = REXCVAR_GET(pdz_settings_test_pad);
+            const int focus_id = GetDlgCtrlID(GetFocus());
+            const auto group = ui->seg_group.find(focus_id);
+            const auto preset = ui->segs.find(kPlayPreset);
+            wchar_t text[64] = {};
+            GetWindowTextW(GetFocus(), text, 64);
+            std::string label;
+            for (const wchar_t *p = text; *p; ++p)
+            {
+              label += *p < 128 ? char(*p) : '?';
+            }
+            std::ofstream(spec.substr(0, spec.find('|')), std::ios::app)
+                << "press " << (vk == VK_PRIOR ? "LB" : vk == VK_NEXT ? "RB" : vk == VK_UP ? "UP" : vk == VK_DOWN ? "DOWN"
+                                : vk == VK_LEFT ? "LEFT" : vk == VK_RIGHT ? "RIGHT" : vk == VK_RETURN ? "A"
+                                : vk == VK_ESCAPE ? "B" : "END")
+                << " meets: tab " << ui->tab << ", focus on control " << focus_id << " '" << label << "'"
+                << (group != ui->seg_group.end() ? (group->second == kPlayPreset ? " (the Gameplay choice row)" : " (a choice row)") : "")
+                << ", Gameplay choice selected: " << (preset != ui->segs.end() ? preset->second.sel : -1) << "\n";
+          }
           if (vk == VK_PRIOR || vk == VK_NEXT)
           {
             OnCommand(*ui, kTabButton0 + (ui->tab + (vk == VK_NEXT ? 1 : kTabCount - 1)) % kTabCount, BN_CLICKED);
@@ -4622,6 +4649,10 @@ namespace pdz::settings_ui
         update_check::Start(); // in the background; the window and the game never wait for it
       }
       SetTimer(ui.window, 1, 100, nullptr);
+      if (const std::string pad = REXCVAR_GET(pdz_settings_test_pad); pad.find('|') != std::string::npos)
+      {
+        theme::SetTestPad(pad.substr(pad.find('|') + 1)); // TESTING TOOL: played controller presses
+      }
       ShowWindow(ui.window, SW_SHOW);
       SetForegroundWindow(ui.window);
       SetFocus(play);

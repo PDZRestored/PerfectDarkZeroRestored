@@ -63,6 +63,19 @@ REXCVAR_DEFINE_DOUBLE(pdz_counterop_wait_camera_cm, 0.0, "Gameplay",
     .range(0.0, 3000.0)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+// Mon 23 Nov night (1.0.1). Logs 057 / 062: when player 2 died his picture was, for a frame, his hidden body's eye
+// (our stand-in, 1.2 m from the agent's eye), and the frame after that a stale picture: the chase camera was only
+// pushed once the replaced guard's kill had run (one or two ticks after the death; the spectate step also ran before
+// the death check), and a pushed camera got its first update only on the frame after the push. Now the push is made
+// in the death's own tick (counter_op.cpp asks again right after the death, and a pending guard kill no longer holds
+// the camera back: the push moves no body) and the pushed camera is updated in the same frame, right after the
+// agent's. The camera's distance is Rare's own from its first update (the eased distance +0x1A4 is at its goal at
+// the push already: measured, nothing to change there).
+REXCVAR_DEFINE_BOOL(pdz_counterop_wait_camera_at_once, true, "Gameplay",
+                    "Counter-Operative (1.0.1, default on): when player 2 dies, Rare's spectator chase camera is put "
+                    "on his half in the same frame and updated in it, so his first waiting picture is that camera at "
+                    "Rare's own distance. Off = 1.0.0 (a frame at her eye and a stale frame first)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REX_EXTERN(sub_8220CCD0);        // camera manager: create mode id and push it (r3 manager, r4 id) -> the mode
 REX_EXTERN(__imp__sub_825ADD28); // Rare's spectate callback (r3 mode, ...): writes the mode's distances +0x104 / +0x108
 REX_EXTERN(sub_8220CE08);        // camera manager: pop the top (r3 manager, r4 1 = delete, r5 0)
@@ -117,6 +130,8 @@ namespace
     uint32_t rare_since = 0;     // Rare's updates of his manager since her last update
     uint64_t ours = 0, rare = 0; // his manager's updates: ours / Rare's (while on)
     uint32_t retargets = 0, pushes = 0, lost = 0;
+    uint32_t first_ticks = 0;    // Mon 23 Nov night: ticks since the last push (the first ones are logged)
+    float eased_was = 0.0f;      // the eased distance as Rare's push left it
     int64_t retry_at = 0, log_at = 0;
     uint32_t fail_lines = 0;
     bool in_extra = false;
@@ -249,6 +264,7 @@ namespace
       frame.ctx.f1.f64 = wanted;
       sub_82276B58(frame.ctx, base);
     }
+    g.eased_was = LoadFloat(base, m + 0x1A4); // (diagnostic: the eased distance as the push left it)
     if (base[m + 0x128])
     {
       StoreFloat(base, m + 0x144, 0.0f);
@@ -302,6 +318,7 @@ namespace
 } // namespace
 
 bool PdzCounterOpRareSpectateActive() { return g.on; }
+bool PdzCounterOpWaitCameraAtOnce() { return REXCVAR_GET(pdz_counterop_wait_camera_at_once); }
 
 // Off: pop Rare's chase mode (if it is still the top of his stack) and forget it. Before he gets a body (ShowP2), when
 // he starts to drive a spiderbot or ride, or when the wait ends.
@@ -383,6 +400,16 @@ bool PdzCounterOpRareSpectateTick(PPCContext &ctx, uint8_t *base, bool want, boo
         g.log_at = now;
         LogState(base, fmt::format("following the agent (her view yaw {:.1f} deg)", view_deg).c_str());
       }
+      else if (g.first_ticks < 6)
+      {
+        // Mon 23 Nov night: the first ticks after a push, one line each (where the camera starts).
+        LogState(base, fmt::format("tick {} after the push (eased distance now {:.0f} cm, at the push {:.0f} cm; "
+                                   "pdz_counterop_wait_camera_at_once {})",
+                                   g.first_ticks + 1, LoadFloat(base, g.mode + 0x1A4), g.eased_was,
+                                   REXCVAR_GET(pdz_counterop_wait_camera_at_once) ? "on" : "off")
+                             .c_str());
+      }
+      ++g.first_ticks;
       return true;
     }
   }
@@ -417,6 +444,11 @@ bool PdzCounterOpRareSpectateTick(PPCContext &ctx, uint8_t *base, bool want, boo
   g.on = true;
   g.mgr = mgr, g.mode = m, g.jo = jo, g.p2c = p2c, g.jo_mgr = Load32(base, jo + kManagerOf);
   g.rare_since = 1; // (no extra update until Rare's update of hers has been seen once)
+  if (REXCVAR_GET(pdz_counterop_wait_camera_at_once))
+  {
+    g.rare_since = 0; // Mon 23 Nov night: its first update this frame, right after the agent's (the camera task runs after us)
+  }
+  g.first_ticks = 0;
   ++g.pushes;
   g.log_at = now;
   REXLOG_INFO("pdz_counterop: rare spectate: ON: Rare's spectator chase camera (mode 1, {:08X}) pushed on player 2's "

@@ -86,6 +86,7 @@
 
 #include "../game_cvars.h"
 #include "hook_profile.h" // pdz_hook_profile (must follow <rex/hook.h>)
+#include "guest_readable_Sat21Nov.h" // pdz::guestmem::Ok (Mon 23 Nov night: the test kill tool)
 #include "render/test_harness.h" // pdz::test::LogMpSnapshotSummary
 
 REX_EXTERN(__imp__sub_823B8340); // option getter (id) -> value
@@ -567,8 +568,85 @@ REXCVAR_DEFINE_STRING(pdz_test_warp, "", "Testing",
                       "pdz_test_warp \"x y z yaw pitch\"'). Empty = off")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+// Mon 23 Nov night (1.0.1 job, B8): a scene with many dead bodies for measuring. Rare's own Kill (guard vtable +0x2E4 =
+// 8252DE88: Kill(guard, killer, death type 5, apply damage 1), the call level scripts make) on the N live guards
+// nearest player 1, with her as the killer. Only guards whose vtable is the guard class's and whose kill is Rare's.
+REXCVAR_DEFINE_INT32(pdz_test_kill_guards, 0, "Testing",
+                     "TESTING TOOL: each change to a new value above 0 kills that many of the live guards nearest "
+                     "player 1 with the game's own kill (as a level script does), for measuring scenes with many "
+                     "bodies. 0 = off")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REX_EXTERN(sub_8252DE88);
+
+namespace
+{
+  void TestKillGuardsTick(PPCContext &ctx, uint8_t *base)
+  {
+    static int32_t was = 0;
+    const int32_t want = REXCVAR_GET(pdz_test_kill_guards);
+    if (want == was)
+    {
+      return;
+    }
+    was = want;
+    constexpr uint32_t kPlayerOne = 0x82E3C3E4, kGuardVtable = 0x820C45A0, kWorld = 0x82D6BFD8 + 24;
+    constexpr uint32_t kWorldFirst = 43212, kWorldEnd = 43216, kHealth = 120, kHidden = 6272, kPosition = 48;
+    const auto ok = [base](uint32_t a, uint32_t n) { return pdz::guestmem::Ok(base, a, n); };
+    const uint32_t jo = ok(kPlayerOne, 4) ? Load32(base, kPlayerOne) : 0;
+    if (want <= 0 || !ok(jo, kPosition + 12) || Load32(base, jo + kCharacterType) != 2 || !ok(kWorld, 4))
+    {
+      return;
+    }
+    const auto f = [base](uint32_t a) {
+      const uint32_t v = Load32(base, a);
+      float x;
+      std::memcpy(&x, &v, 4);
+      return x;
+    };
+    std::vector<std::pair<float, uint32_t>> guards;
+    const uint32_t world = Load32(base, kWorld);
+    const uint32_t end = ok(world + kWorldFirst, 8) ? Load32(base, world + kWorldEnd) : 0;
+    uint32_t node = ok(world + kWorldFirst, 8) ? Load32(base, world + kWorldFirst) : 0;
+    for (int i = 0; node != end && ok(node, 16) && i < 16384; ++i, node = Load32(base, node + 12))
+    {
+      const uint32_t o = Load32(base, node + 4);
+      if (!ok(o, kHidden + 4) || Load32(base, o) != kGuardVtable || (Load32(base, o + kHidden) & 0x10) ||
+          !(f(o + kHealth) > 0.0f) || (Load32(base, o + 0x44) & 8) || !ok(kGuardVtable + 0x2E4, 4) ||
+          Load32(base, kGuardVtable + 0x2E4) != 0x8252DE88u)
+      {
+        continue;
+      }
+      const float dx = f(o + kPosition) - f(jo + kPosition), dy = f(o + kPosition + 4) - f(jo + kPosition + 4),
+                  dz = f(o + kPosition + 8) - f(jo + kPosition + 8);
+      guards.emplace_back(dx * dx + dy * dy + dz * dz, o);
+    }
+    std::sort(guards.begin(), guards.end());
+    int killed = 0;
+    float furthest = 0.0f;
+    for (const auto &[d2, o] : guards)
+    {
+      if (killed >= want)
+      {
+        break;
+      }
+      rex::CallFrame frame(ctx);
+      frame.ctx.r3.u64 = o;
+      frame.ctx.r4.u64 = jo;
+      frame.ctx.r5.u64 = 5;
+      frame.ctx.r6.u64 = 1;
+      sub_8252DE88(frame.ctx, base);
+      ++killed;
+      furthest = std::sqrt(d2) / 100.0f;
+    }
+    REXLOG_INFO("pdz_test: kill guards (pdz_test_kill_guards {}): {} of the {} live guards in the world killed with the "
+                "game's own kill (8252DE88, player 1 as the killer), the furthest {:.0f} m from her",
+                want, killed, guards.size(), furthest);
+  }
+} // namespace
+
 void PdzTestWarpTick(PPCContext &ctx, uint8_t *base)
 {
+  TestKillGuardsTick(ctx, base);
   static std::string applied;
   static uint32_t scratch = 0;
   const std::string value = REXCVAR_GET(pdz_test_warp);

@@ -5,6 +5,10 @@
 #include <dwmapi.h>
 
 #include <algorithm>
+
+#include <rex/cvar.h>
+#include <string>
+#include <vector>
 #include <atomic>
 #include <fstream>
 #include <map>
@@ -749,6 +753,43 @@ namespace pdz::theme
     WORD g_prev = 0;
   } // namespace
 
+} // namespace pdz::theme
+REXCVAR_DEFINE_BOOL(pdz_fix_settings_pad_focus, true, "Setup",
+                    "Settings and setup windows on a controller: up / down (D-pad or left stick) move the focus to "
+                    "the previous / next control, as the Tab key does. Off = 1.0.0 (they did nothing: the focus "
+                    "stayed where it was)");
+namespace pdz::theme
+{
+  namespace
+  {
+    std::vector<std::string> g_test_pad;
+    ULONGLONG g_test_pad_start = 0;
+    size_t g_test_pad_next = 0;
+  } // namespace
+  void SetTestPad(const std::string &items)
+  {
+    g_test_pad.clear();
+    std::string item;
+    for (const char c : items + ",")
+    {
+      if (c == ',')
+      {
+        if (!item.empty())
+        {
+          g_test_pad.push_back(item);
+        }
+        item.clear();
+      }
+      else if (c != ' ')
+      {
+        item += c;
+      }
+    }
+    g_test_pad_start = 0;
+    g_test_pad_next = 0;
+  }
+  bool TestPadActive() { return !g_test_pad.empty(); }
+
   UINT PollController(HWND window)
   {
     std::call_once(g_xinput_once, [] {
@@ -759,12 +800,32 @@ namespace pdz::theme
       }
       g_get_state = x ? reinterpret_cast<GetStateFn>(GetProcAddress(x, "XInputGetState")) : nullptr;
     });
-    if (!g_get_state || GetForegroundWindow() != window)
+    if ((!g_get_state && g_test_pad.empty()) || GetForegroundWindow() != window)
     {
       return 0;
     }
     WORD now = 0;
-    for (DWORD i = 0; i < 4; ++i)
+    if (!g_test_pad.empty())
+    {
+      // TESTING TOOL: the played presses instead of a pad's (one poll with the button down, then released).
+      const ULONGLONG t = GetTickCount64();
+      if (!g_test_pad_start)
+      {
+        g_test_pad_start = t + 1500;
+      }
+      g_prev = 0;
+      if (g_test_pad_next < g_test_pad.size() && t >= g_test_pad_start + 500ull * g_test_pad_next)
+      {
+        const std::string &item = g_test_pad[g_test_pad_next++];
+        if (item == "END")
+        {
+          return VK_F24;
+        }
+        now = item == "UP" ? 0x0001 : item == "DOWN" ? 0x0002 : item == "LEFT" ? 0x0004 : item == "RIGHT" ? 0x0008
+              : item == "A" ? 0x1000 : item == "B" ? 0x2000 : item == "LB" ? 0x0100 : item == "RB" ? 0x0200 : 0;
+      }
+    }
+    for (DWORD i = 0; i < 4 && g_test_pad.empty(); ++i)
     {
       XInputState s{};
       if (g_get_state(i, &s) == ERROR_SUCCESS)
@@ -792,14 +853,35 @@ namespace pdz::theme
     const WORD pressed = now & ~g_prev;
     g_prev = now;
     HWND focus = GetFocus();
+    // Mon 23 Nov night (1.0.1, pdz_fix_settings_pad_focus): up / down used to send WM_NEXTDLGCTL, which only a dialog
+    // class answers; these windows are plain windows, so the focus never moved (measured on 1.0.0: five sends, the
+    // focus stayed on Play). Now the next / previous tab stop is found the way the Tab key finds it
+    // (GetNextDlgTabItem) and given the focus.
+    const auto move_focus = [&](bool previous) {
+      if (!REXCVAR_GET(pdz_fix_settings_pad_focus))
+      {
+        SendMessageW(window, WM_NEXTDLGCTL, previous ? 1 : 0, FALSE);
+        return;
+      }
+      HWND from = focus && IsChild(window, focus) ? focus : nullptr;
+      // (A control inside another control, e.g. a combo box's edit: its top child of the window.)
+      while (from && GetParent(from) != window)
+      {
+        from = GetParent(from);
+      }
+      if (HWND next = GetNextDlgTabItem(window, from, previous ? TRUE : FALSE))
+      {
+        SetFocus(next);
+      }
+    };
     if (pressed & 0x0001) // up
     {
-      SendMessageW(window, WM_NEXTDLGCTL, 1, FALSE);
+      move_focus(true);
       return VK_UP;
     }
     if (pressed & 0x0002) // down
     {
-      SendMessageW(window, WM_NEXTDLGCTL, 0, FALSE);
+      move_focus(false);
       return VK_DOWN;
     }
     if (pressed & 0x1000) // A

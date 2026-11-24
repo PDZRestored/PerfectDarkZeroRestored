@@ -505,6 +505,7 @@ void PdzCounterOpWaitViewUpright(uint8_t *base, uint32_t mode, const float eye[3
 double PdzCounterOpTestFirstPickS();
 // counter_op_spectate_Sat21Nov.cpp (Sat 21 Nov, spectate job): Rare's spectator chase camera while player 2 waits.
 bool PdzCounterOpRareSpectateTick(PPCContext &ctx, uint8_t *base, bool want, bool cutscene, uint32_t jo, uint32_t p2c);
+bool PdzCounterOpWaitCameraAtOnce(); // counter_op_spectate_Sat21Nov.cpp (Mon 23 Nov night)
 void PdzCounterOpRareSpectateOff(PPCContext &ctx, uint8_t *base, const char *why);
 bool PdzCounterOpRareSpectateActive();
 void PdzCounterOpRareSpectateReset();
@@ -559,6 +560,48 @@ REXCVAR_DEFINE_BOOL(pdz_counterop_wait_hud_hidden, true, "Gameplay",
                     "agent) his weapon HUD (weapon row, pick-up box, ammo bars), his gun's crosshair and his red damage "
                     "direction markers (and the health bar flash) are hidden; they come back with his next body. Off = "
                     "as before (his hidden body's crosshair and markers showed while he waited)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+// Mon 23 Nov night (1.0.1, pdz_counterop_wait_hud_no_damage): Rare's radar / damage display of a human (human +0x19BC)
+// keeps TWO sets of four red markers: the direction of whoever hurt him (started by 8226F970: attacker handles at
+// +0xA08, timers at +0xA38) and a second set aimed at an object (started by 8226FA78: handles +0xA58, timers +0xA88),
+// plus two eased red levels (+0xAA4, +0xAB0). The wait cleared the first four timers only, once a frame, so the second
+// set and anything started after our tick in a frame still showed on his half ('DEPLOYING...' with red arrows).
+REX_EXTERN(__imp__sub_8226F970);
+REX_EXTERN(__imp__sub_8226FA78);
+REX_EXTERN(sub_8226F970);
+REXCVAR_DEFINE_BOOL(pdz_counterop_wait_hud_no_damage, true, "Gameplay",
+                    "Counter-Operative (1.0.1, default on; needs pdz_counterop_wait_hud_hidden): while player 2 waits "
+                    "for his next body no red damage marker is started on his half at all (both of Rare's marker sets "
+                    "are refused at the source) and both sets and the red levels are cleared every frame. Off = as "
+                    "1.0.0 (only the first set was cleared, once a frame)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(pdz_test_counterop_wait_damage, 0, "Testing",
+                     "TESTING TOOL: each change to a new non-zero value asks Rare's game for a red damage marker on "
+                     "player 2's half aimed at the agent (Rare's own 8226F970, as a hit by her would), to prove what "
+                     "the wait shows. 0 = off")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+// Mon 23 Nov night (1.0.1, pdz_counterop_armour_pieces_quiet). The pieces that fell at player 2's feet at a takeover:
+// Rare's per-frame dress (8254FF30) gives ANY character armour pieces while his armour is above zero and sheds them
+// (they drop as props) when it is gone. We empty player 2's armour when he leaves the world and set the guard's at
+// the takeover, so the pieces his last body wore were shed where he next stood. Now they are deleted the way Rare's
+// own re-skin deletes them, before his armour is emptied or replaced: nothing is left to fall. With the guard's
+// armour above zero Rare's dress then builds the new body's own pieces, as before.
+uint32_t PdzCounterOpArmourPieces(PPCContext &ctx, uint8_t *base, uint32_t character, bool destroy); // counter_op_dress.cpp
+REXCVAR_DEFINE_INT32(pdz_counterop_test_agent_faces_p2, 0, "Testing",
+                     "TESTING TOOL (counter-op): each change to a new non-zero value puts the agent 2.5 m in front of "
+                     "player 2, looking at him (for a picture of his body). 0 = off")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(pdz_counterop_armour_pieces_worn, true, "Gameplay",
+                    "Counter-Operative (1.0.1, default on): at a takeover player 2's body is dressed in the armour "
+                    "pieces of the guard's body by the game's own dress routine when the guard had armour (his "
+                    "armour bar is their protection; they are shot off as the game does). Off = 1.0.0 (he wore "
+                    "pieces only after a change of body)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(pdz_counterop_armour_pieces_quiet, true, "Gameplay",
+                    "Counter-Operative (1.0.1, default on): the armour pieces player 2's last body wore are taken "
+                    "off quietly when he leaves the world and at a takeover (deleted as the game's own re-skin "
+                    "does), so none falls to the floor at his feet. Off = 1.0.0 (the game sheds them when his armour "
+                    "is emptied)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REX_EXTERN(__imp__sub_8222FD98); // co-op: game over? (every human down)
 REX_EXTERN(__imp__sub_824573A8); // co-op revive (participant)
@@ -1899,6 +1942,17 @@ namespace
       return;
     }
     const uint32_t c = g.p2c, world = Load32(base, kGame + 24);
+    // Mon 23 Nov night (pdz_counterop_armour_pieces_quiet): his pieces go first, quietly.
+    {
+      const bool quiet = REXCVAR_GET(pdz_counterop_armour_pieces_quiet);
+      const uint32_t pieces = PdzCounterOpArmourPieces(ctx, base, c, quiet);
+      const uint32_t part = Load32(base, c + kParticipantOf);
+      REXLOG_INFO("pdz_counterop: armour pieces: player 2 leaves the world wearing {} piece(s) (armour {:.1f}): {}",
+                  pieces, Ptr(part) ? LoadFloat(base, part + 988) : -1.0f,
+                  !pieces ? "nothing to take off"
+                          : quiet ? "deleted quietly (pdz_counterop_armour_pieces_quiet): none can fall"
+                                  : "left on (the game sheds them when his armour is emptied)");
+    }
     // Round 16 (item 9): his armour bar is emptied while he waits (his HUD is hidden then), so the next takeover's
     // armour (the guard's) never shows as a drop from the co-op start's 100.
     if (REXCVAR_GET(pdz_counterop_guard_armour))
@@ -2897,7 +2951,7 @@ namespace
 
   // The N64 rule (see the header): health and max = (the guard's health / its spawn health) x the co-op max x the
   // scale, capped at the co-op max, floor kMinHealth. Armour stays 0.
-  void ApplyHealth(uint8_t *base, const Spot &e)
+  void ApplyHealth(PPCContext &ctx, uint8_t *base, const Spot &e)
   {
     const float spawn_health = Ptr(e.setup) ? LoadFloat(base, e.setup + kSetupHealth) : 0.0f;
     // No-take mode: nothing is taken from the guard, so player 2 is a fresh guard of that setup (ratio 1).
@@ -2944,6 +2998,32 @@ namespace
       // armour each). No armour; and the second health value the player damage handler lowers (+984) follows the
       // health, so nothing is left over from the last life.
       armour_before = LoadFloat(base, participant + 988);
+      // Mon 23 Nov night (pdz_counterop_armour_pieces_quiet): what both bodies wear now; his own old pieces go before
+      // his armour is replaced.
+      {
+        const bool quiet = REXCVAR_GET(pdz_counterop_armour_pieces_quiet);
+        const uint32_t guard_pieces = PdzCounterOpArmourPieces(ctx, base, e.character, false);
+        const uint32_t his = PdzCounterOpArmourPieces(ctx, base, g.p2c, quiet);
+        REXLOG_INFO("pdz_counterop: armour pieces: takeover: the guard {:08X} wears {} piece(s) (armour {:.1f}); "
+                    "player 2's body wore {} from before (armour {:.1f}): {}",
+                    e.character, guard_pieces, LoadFloat(base, e.character + kArmour), his, armour_before,
+                    !his ? "nothing to take off"
+                         : quiet ? "deleted quietly (pdz_counterop_armour_pieces_quiet): none can fall"
+                                 : "left on (the game sheds them when his armour changes)");
+        // pdz_counterop_armour_pieces_worn: Rare's dress (8254FF30) builds a character's pieces only while his two
+        // piece flags (+5260 / +5261) are clear and his armour is above zero (a human's only with +5444 == 1). The
+        // flags are cleared here, so with the guard's armour on his bar the next frame dresses player 2's body (the
+        // guard's body) in that body's own pieces; with no armour nothing is built, as for a guard without any.
+        if (REXCVAR_GET(pdz_counterop_armour_pieces_worn) && Rd(base, g.p2c + 5260, 0xC0))
+        {
+          REXLOG_INFO("pdz_counterop: armour pieces: takeover: player 2's piece flags {} / {} cleared (his +5444 is {}: "
+                      "Rare's dress builds a human's pieces only when it is 1); Rare's dress builds his new body's "
+                      "pieces on the next frame if his armour is above zero (pdz_counterop_armour_pieces_worn)",
+                      int(base[g.p2c + 5260]), int(base[g.p2c + 5261]), int32_t(Load32(base, g.p2c + 5444)));
+          base[g.p2c + 5260] = 0;
+          base[g.p2c + 5261] = 0;
+        }
+      }
       StoreFloat(base, participant + 984, hp);
       StoreFloat(base, participant + 988, 0.0f);
     }
@@ -3353,7 +3433,7 @@ namespace
                   Load16(base, g.p2c + kTeamBits), Load16(base, g.p2c + kEnemies), no_gun);
     }
     // (d)
-    ApplyHealth(base, e);
+    ApplyHealth(ctx, base, e);
     QuietHealthFeedback(ctx, base, g.p2c, g.set_health); // round 8 (item 5)
     // (e)
     if (take)
@@ -3368,6 +3448,8 @@ namespace
       counter_op_river::Unseat(ctx, base, g.p2c, guard); // round 13 h: River, a driver picked in his hovercraft seat leaves it first
       const std::string removed = RemoveGuard(ctx, base, guard);
       REXLOG_INFO("pdz_counterop: spawn (e): guard {:08X} {}", guard, removed);
+      REXLOG_INFO("pdz_counterop: armour pieces: after the despawn the guard {:08X} has {} piece(s) attached",
+                  guard, PdzCounterOpArmourPieces(ctx, base, guard, false));
       PdzCounterOpOutpostAfterSpawn(ctx, base, g.p2c, guard); // round 13 f: Outpost, Rare's mount onto the hovercraft's gun
       PdzCounterOpTurretAfterSpawn(ctx, base, g.p2c, guard); // round 13b q: the stationary gun of the guard he took (cvar, off)
       counter_op_river::AfterSpawn(ctx, base, g.p2c, guard); // round 13 h: River, Rare's mount into the driver's seat
@@ -4863,7 +4945,8 @@ namespace
     CameraProbeTick(ctx, base, cutscene);            // round 16 (item 1): a wait with no camera object gets one
     // Sat 21 Nov (spectate job): while he waits (or is out for good), Rare's spectator chase camera follows the agent.
     PdzCounterOpRareSpectateTick(ctx, base,
-                                 g.started && g.out && (g.need_guard || g.spectating) && !g_ride.on && !g.kill_guard &&
+                                 g.started && g.out && (g.need_guard || g.spectating) && !g_ride.on &&
+                                     (!g.kill_guard || PdzCounterOpWaitCameraAtOnce()) && // (Mon 23 Nov night: the push moves no body)
                                      !g.revive_participant && !g.wait_getup && !PdzCounterOpSpiderDriving() &&
                                      Ptr(g.p2c) && !counter_op_jetpack::Riding(base, g.p2c),
                                  cutscene, g.p1c, g.p2c);
@@ -5140,6 +5223,17 @@ namespace
         if (!cutscene && Health(base, p2c) <= kOwnFloor + 0.05f && Load32(base, p2p + kPartDeathState) == 0)
         {
           OwnDeath(ctx, base);
+          // Mon 23 Nov night (1.0.1, pdz_counterop_wait_camera_at_once): Rare's chase camera in the death's own tick
+          // (this tick's spectate step ran before the death; the camera task runs after us in the frame).
+          if (PdzCounterOpWaitCameraAtOnce() && g.started && g.out && (g.need_guard || g.spectating) && !g_ride.on &&
+              !g.revive_participant && !g.wait_getup && !PdzCounterOpSpiderDriving() && Ptr(g.p2c) &&
+              !counter_op_jetpack::Riding(base, g.p2c))
+          {
+            const bool on = PdzCounterOpRareSpectateTick(ctx, base, true, cutscene, g.p1c, g.p2c);
+            REXLOG_INFO("pdz_counterop: rare spectate: asked for in the tick of his death "
+                        "(pdz_counterop_wait_camera_at_once): {}",
+                        on ? "the chase camera is his view from this frame" : "not pushed this tick (see above)");
+          }
         }
       }
     }
@@ -5380,6 +5474,10 @@ namespace
       const uint32_t participant = Load32(base, p2c + kParticipantOf);
       const float now_health = Health(base, p2c);
       const float now_max = Ptr(participant) ? LoadFloat(base, participant + kPartMaxHealth) : -1.0f;
+      REXLOG_INFO("pdz_counterop: armour pieces: 5 s after the spawn player 2 wears {} piece(s) (armour {:.1f} on his "
+                  "bar)",
+                  PdzCounterOpArmourPieces(ctx, base, p2c, false),
+                  Ptr(participant) ? LoadFloat(base, participant + 988) : -1.0f);
       REXLOG_INFO("pdz_counterop: 5 s after the spawn: health {:.1f} (set {:.1f}), max {} (set {:.1f}){}; armour {:.1f}; "
                   "body {} head {}; at ({:.0f}, {:.0f}, {:.0f}); death state {}, get-up flag {}, invulnerable {:.2f}{}",
                   now_health, g.set_health, now_max >= 0.0f ? fmt::format("{:.1f}", now_max) : std::string("?"),
@@ -6470,17 +6568,60 @@ bool PdzCounterOpWaitHudHidden() { return g_wait_hud_p2.load(std::memory_order_r
 namespace
 {
   bool g_wait_hud_was = false;
+  uint64_t g_wait_mark2_clears = 0, g_wait_level_clears = 0;
+  std::atomic<uint64_t> g_wait_mark_refused{0};
+  PPCContext *g_wait_test_ctx = nullptr; // the tick's own context, for the testing tool only (set by the tick)
+
+  // Is this radar / damage display the waiting player 2's? (The marker hooks; plain reads only.)
+  bool WaitMarksOf(const uint8_t *base, uint32_t marks)
+  {
+    const uint32_t p2 = g_wait_hud_p2.load(std::memory_order_relaxed);
+    return p2 && Ptr(marks) && REXCVAR_GET(pdz_counterop_wait_hud_no_damage) && Rd(base, p2 + 0x19BC, 4) &&
+           Load32(base, p2 + 0x19BC) == marks;
+  }
+
   void WaitHudTick(uint8_t *base, bool on)
   {
     if (on != g_wait_hud_was)
     {
       g_wait_hud_was = on;
       REXLOG_INFO("pdz_counterop: HUD: player 2 {} (pdz_counterop_wait_hud_hidden): his weapon HUD, his crosshair and "
-                  "his damage markers {}; so far {} crosshair draw(s) skipped, {} damage marker(s) cleared",
+                  "his damage markers {}; so far {} crosshair draw(s) skipped, {} damage marker(s) cleared (of them {} "
+                  "of the second set), {} red level(s) cleared, {} marker(s) refused at the source "
+                  "(pdz_counterop_wait_hud_no_damage)",
                   on ? "waits" : "has a body again", on ? "hidden" : "back as Rare's", g_wait_crosshair_skips,
-                  g_wait_mark_clears);
+                  g_wait_mark_clears, g_wait_mark2_clears, g_wait_level_clears,
+                  g_wait_mark_refused.load(std::memory_order_relaxed));
     }
     g_wait_hud_p2.store(on ? g.p2c : 0, std::memory_order_relaxed);
+    {
+      // TESTING TOOL: one marker asked of Rare's own routine, aimed at the agent (what a hit by her starts). It runs
+      // whether the wait HUD is hidden or not (the 'before' picture needs a marker that stays).
+      const uint32_t marks = Rd(base, g.p2c, 0x19C0) ? Load32(base, g.p2c + 0x19BC) : 0;
+      static int32_t test_was = 0;
+      const int32_t test = REXCVAR_GET(pdz_test_counterop_wait_damage);
+      if (test != test_was)
+      {
+        test_was = test;
+        if (test != 0 && Rd(base, marks + 0xA38, 0x7C) && Ptr(g.p1c) && Rd(base, g.p1c, 8) && g_wait_test_ctx)
+        {
+          const uint64_t refused = g_wait_mark_refused.load(std::memory_order_relaxed);
+          rex::CallFrame frame(*g_wait_test_ctx);
+          frame.ctx.r3.u64 = marks;
+          frame.ctx.r4.u64 = g.p1c;
+          sub_8226F970(frame.ctx, base);
+          REXLOG_INFO("pdz_counterop: HUD: TEST (pdz_test_counterop_wait_damage {}): a damage marker aimed at the agent "
+                      "asked of Rare's 8226F970 for the waiting player 2: {}; his marker timers now {:.2f} {:.2f} {:.2f} "
+                      "{:.2f} | second set {:.2f} {:.2f} {:.2f} {:.2f}",
+                      test,
+                      g_wait_mark_refused.load(std::memory_order_relaxed) > refused ? "refused at the source"
+                                                                                   : "started (not refused)",
+                      LoadFloat(base, marks + 0xA38), LoadFloat(base, marks + 0xA3C), LoadFloat(base, marks + 0xA40),
+                      LoadFloat(base, marks + 0xA44), LoadFloat(base, marks + 0xA88), LoadFloat(base, marks + 0xA8C),
+                      LoadFloat(base, marks + 0xA90), LoadFloat(base, marks + 0xA94));
+        }
+      }
+    }
     if (!on)
     {
       return;
@@ -6499,6 +6640,27 @@ namespace
         {
           ++g_wait_mark_clears;
           Store32(base, marks + 0xA38 + 4 * i, 0);
+        }
+      }
+    }
+    // Mon 23 Nov night (1.0.1): the second marker set and the two red levels (see pdz_counterop_wait_hud_no_damage).
+    if (REXCVAR_GET(pdz_counterop_wait_hud_no_damage) && Rd(base, marks + 0xA88, 0x2C))
+    {
+      for (uint32_t i = 0; i < 4; ++i)
+      {
+        if (Load32(base, marks + 0xA88 + 4 * i) != 0)
+        {
+          ++g_wait_mark_clears;
+          ++g_wait_mark2_clears;
+          Store32(base, marks + 0xA88 + 4 * i, 0);
+        }
+      }
+      for (const uint32_t level : {0xAA4u, 0xAB0u})
+      {
+        if (Load32(base, marks + level) != 0)
+        {
+          ++g_wait_level_clears;
+          Store32(base, marks + level, 0);
         }
       }
     }
@@ -6537,6 +6699,26 @@ namespace
   }
 } // namespace
 
+// Mon 23 Nov night (1.0.1, pdz_counterop_wait_hud_no_damage): Rare's two 'start a red marker' routines (display r3,
+// the thing it points at r4). For the waiting player 2's display nothing is started.
+REX_HOOK_RAW(sub_8226F970)
+{
+  if (WaitMarksOf(base, ctx.r3.u32))
+  {
+    g_wait_mark_refused.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+  __imp__sub_8226F970(ctx, base);
+}
+REX_HOOK_RAW(sub_8226FA78)
+{
+  if (WaitMarksOf(base, ctx.r3.u32))
+  {
+    g_wait_mark_refused.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+  __imp__sub_8226FA78(ctx, base);
+}
 REX_HOOK_RAW(sub_82263F08)
 {
   if (WaitCrosshair(base, ctx.r3.u32))
@@ -6613,7 +6795,38 @@ REX_HOOK_RAW(sub_8222F740)
     // are cleared every frame.
     const bool wait_hud = !spider_hud && REXCVAR_GET(pdz_counterop_wait_hud_hidden) && On() && g.started &&
                           !g.unsupported && g.out && Ptr(g.p2c);
+    g_wait_test_ctx = &ctx;
     WaitHudTick(base, wait_hud);
+    g_wait_test_ctx = nullptr;
+    // TESTING TOOL (Mon 23 Nov night, pdz_counterop_test_agent_faces_p2): the agent 2.5 m in front of player 2, looking
+    // at him, for a picture of what he wears.
+    if (static int32_t faces_was = 0; REXCVAR_GET(pdz_counterop_test_agent_faces_p2) != faces_was)
+    {
+      faces_was = REXCVAR_GET(pdz_counterop_test_agent_faces_p2);
+      if (faces_was != 0 && !g.out && Ptr(g.p1c) && Ptr(g.p2c) && g.scratch && Rd(base, g.p2c, 0x1678) &&
+          Rd(base, g.p1c, 0x1678))
+      {
+        const float yaw = LoadFloat(base, g.p2c + 0x1670) * 3.14159265f / 180.0f; // his view yaw; forward = (sin, cos)
+        const float to[3] = {LoadFloat(base, g.p2c + kPosition) + std::sin(yaw) * 250.0f,
+                             LoadFloat(base, g.p2c + kPosition + 4) - 82.0f, // (+48 is his sphere's centre, 82 cm up)
+                             LoadFloat(base, g.p2c + kPosition + 8) + std::cos(yaw) * 250.0f};
+        for (uint32_t i = 0; i < 3; ++i)
+        {
+          StoreFloat(base, g.scratch + 4 * i, to[i]);
+        }
+        Call(ctx, base, sub_825AD148, g.p1c, g.scratch, 0);
+        {
+          rex::CallFrame frame(ctx);
+          frame.ctx.r3.u64 = g.p1c;
+          frame.ctx.f1.f64 = 0.05;
+          frame.ctx.f2.f64 = double(yaw) + 3.14159265358979;
+          sub_825AD3B0(frame.ctx, base);
+        }
+        REXLOG_INFO("pdz_counterop: TEST TOOL (pdz_counterop_test_agent_faces_p2 {}): the agent put at ({:.0f}, {:.0f}, "
+                    "{:.0f}), 2.5 m in front of player 2, looking at him; he wears {} armour piece(s)",
+                    faces_was, to[0], to[1], to[2], PdzCounterOpArmourPieces(ctx, base, g.p2c, false));
+      }
+    }
     if (!spider_hud && !wait_hud)
     {
       PdzCounterOpSpiderHud(saved, base, false, p2_pad);

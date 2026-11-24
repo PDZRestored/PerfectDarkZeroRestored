@@ -115,6 +115,20 @@ REXCVAR_DEFINE_BOOL(pdz_counterop_river_driver_steer, true, "Gameplay",
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 // Round 13b (helper r): the real order.
+// Mon 23 Nov night (1.0.1). Log 062, 21:30:28: player 2's hovercraft was destroyed under him (seat state 3 -> 4) and
+// Rare threw him off alive, as it does a human; an AI driver dies with his craft. Now his life ends there too: when
+// Rare's own 'destroyed' test of the craft is true while he holds a seat (or within 2 s of leaving it), his health
+// goes to his floor and counter_op.cpp's own death runs on its next check (the replaced guard dies where he stood).
+REXCVAR_DEFINE_BOOL(pdz_counterop_river_dies_with_craft, true, "Gameplay",
+                    "Counter-Operative, River (1.0.1, default on): when the hovercraft player 2 drives is destroyed "
+                    "with him in the seat, his life ends, as an AI driver's does. Off = 1.0.0 (Rare throws him off "
+                    "alive)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(pdz_counterop_test_river_destroy_craft, 0, "Testing",
+                     "TESTING TOOL (counter-op, River): each change to a new non-zero value marks the hovercraft "
+                     "player 2 sits in as destroyed (Rare's destroyed flag 0x4000 of the prop; no explosion is "
+                     "played), to prove pdz_counterop_river_dies_with_craft")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(pdz_counterop_river_hovercraft_first, true, "Gameplay",
                     "Counter-Operative (round 13b; on by default since round 14), River: while the agent sits in a hovercraft, the driver of an enemy "
                     "hovercraft that may be taken (pdz_counterop_river_hovercraft: a gunner aboard, within the range) "
@@ -1315,12 +1329,61 @@ namespace counter_op_river
     if (seat_state != rs.last_seat_state || vehicle != rs.last_vehicle_state || asked != rs.last_asked)
     {
       REXLOG_INFO("pdz_counterop: river: player 2's hovercraft {:08X}, {:.1f} s after the mount: his seat {} state {} -> "
-                  "{}, craft state {} -> {} (asked {} -> {}), his parent {:08X}, gunner '{}'",
+                  "{}, craft state {} -> {} (asked {} -> {}), his parent {:08X}, gunner '{}'; craft flags {:08X}, craft "
+                  "health {:.0f}, Rare's destroyed test {}",
                   rs.riding, since, seat, rs.last_seat_state, seat_state, rs.last_vehicle_state, vehicle, rs.last_asked,
-                  asked, Load32(base, p2c + kParent), Id(base, GunnerOf(base, rs.riding, p2c)));
+                  asked, Load32(base, p2c + kParent), Id(base, GunnerOf(base, rs.riding, p2c)),
+                  Load32(base, rs.riding + kPropFlags), LoadFloat(base, rs.riding + kPropHealth),
+                  Destroyed(base, rs.riding) ? "yes" : "no");
       rs.last_seat_state = seat_state;
       rs.last_vehicle_state = vehicle;
       rs.last_asked = asked;
+    }
+    // Mon 23 Nov night (1.0.1, pdz_counterop_river_dies_with_craft): his craft destroyed under him ends his life.
+    {
+      static int32_t test_was = 0;
+      if (const int32_t test = REXCVAR_GET(pdz_counterop_test_river_destroy_craft); test != test_was)
+      {
+        test_was = test;
+        if (test != 0 && seat >= 0 && pdz::guestmem::Ok(base, rs.riding + kPropFlags, 4))
+        {
+          Store32(base, rs.riding + kPropFlags, Load32(base, rs.riding + kPropFlags) | 0x4000u);
+          REXLOG_INFO("pdz_counterop: river: TEST TOOL: pdz_counterop_test_river_destroy_craft {}: player 2's "
+                      "hovercraft {:08X} marked destroyed (prop flag 0x4000; no explosion)",
+                      test, rs.riding);
+        }
+      }
+      static uint32_t left_craft = 0, killed_for = 0;
+      static Clock::time_point left_at{};
+      if (seat >= 0)
+      {
+        left_craft = rs.riding;
+        left_at = now;
+      }
+      const bool recent = left_craft == rs.riding && std::chrono::duration<double>(now - left_at).count() <= 2.0;
+      if (REXCVAR_GET(pdz_counterop_river_dies_with_craft) && !out && recent && killed_for != rs.riding &&
+          pdz::guestmem::Ok(base, rs.riding + kPropHealth, 4) && Destroyed(base, rs.riding) &&
+          pdz::guestmem::Ok(base, p2c + kParticipantOf, 4))
+      {
+        const uint32_t participant = Load32(base, p2c + kParticipantOf);
+        if (pdz::guestmem::Ok(base, participant + kPartHealth, 4))
+        {
+          killed_for = rs.riding;
+          const float had = LoadFloat(base, participant + kPartHealth);
+          StoreFloat(base, participant + kPartHealth, 1.0f);
+          REXLOG_INFO("pdz_counterop: river: player 2's hovercraft {:08X} is DESTROYED ({}; prop flags {:08X}, craft "
+                      "health {:.0f}, seat {} state {}): his life ends with it, as an AI driver's does: health {:.1f} "
+                      "-> 1.0 (his floor: counter_op.cpp's own death runs on its next check; "
+                      "pdz_counterop_river_dies_with_craft)",
+                      rs.riding, seat >= 0 ? "he is in the seat" : "he left the seat less than 2 s ago",
+                      Load32(base, rs.riding + kPropFlags), LoadFloat(base, rs.riding + kPropHealth), seat, seat_state,
+                      had);
+        }
+      }
+      if (!rs.riding)
+      {
+        killed_for = 0;
+      }
     }
     if (seat == 0 && seat_state == 3 && !rs.seated_told)
     {

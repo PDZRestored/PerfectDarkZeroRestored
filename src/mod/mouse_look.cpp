@@ -136,6 +136,14 @@ REXCVAR_DEFINE_BOOL(pdz_mouse_direct_camspy, true, "Mouse",
                     "CamSpy reads (slow: about a tenth of Jo's turn). The controller is the game's own either way. "
                     "Needs pdz_mouse_look")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(pdz_mouse_direct_rocket, false, "Mouse",
+                    "Mouse aim with the rocket launcher's guided rocket (1.0.1, OFF: written but not proven in a "
+                    "run): the mouse turns the rocket's own view directly, as Jo's view on foot (pdz_mouse_sensitivity's "
+                    "degrees per count, whatever the frame rate), the way the CamSpy and the turrets take it. Off = "
+                    "the mouse is the right stick the rocket reads (slow). Only if the rocket's view keeps its yaw / "
+                    "pitch in plain fields (logged when a rocket is first steered). The controller is the game's own "
+                    "either way. Needs pdz_mouse_look")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(pdz_mouse_direct_steer_log, false, "Mouse",
                     "Diagnostic: once a second while guest user 0 is on a mounted turret, a 'pdz_mouse: turret aim' "
                     "line (its yaw / pitch, this second's mouse counts and turn and the change of its aim, turret "
@@ -249,10 +257,15 @@ namespace pdz::mouse
     // made right after it (AfterSteeredLook) is used in the same frame. Rare's look update only adds stick speed x
     // dt, so nothing overwrites ours.
     constexpr uint32_t kCamSpyCaller = 0x8253FA98;
+    // Mon 23 Nov night (1.0.1, pdz_mouse_direct_rocket, off: not proven in a run): the guided rocket's caller of the
+    // look update (sub_822533E8 at 82253584: owner = the player who fired, view = the rocket, vtable 820C8478, look
+    // state rocket +1412). Rare reads the rocket's angles after the update returns (822535E4 on), as the CamSpy's.
+    constexpr uint32_t kRocketCaller = 0x82253588;
     bool DirectCaller(uint32_t caller)
     {
       return (caller == kTurretCaller && REXCVAR_GET(pdz_mouse_direct_steer)) ||
-             (caller == kCamSpyCaller && REXCVAR_GET(pdz_mouse_direct_camspy));
+             (caller == kCamSpyCaller && REXCVAR_GET(pdz_mouse_direct_camspy)) ||
+             (caller == kRocketCaller && REXCVAR_GET(pdz_mouse_direct_rocket));
     }
 
     // A steered view's yaw / pitch fields, from its own vtable: +24 / +28 must be 'lfs f1,D(r3); blr' and +32 / +36
@@ -459,7 +472,8 @@ namespace pdz::mouse
     // (AfterSteeredLook); everything else (and a view of another shape) the right stick, as before.
     AngleFields fields;
     const bool direct = DirectCaller(caller) && REXCVAR_GET(pdz_mouse_look) && FindAngleFields(base, object, fields);
-    if (DirectCaller(caller) && !direct && LogOnce(caller == kTurretCaller ? 0xFFFF0003u : 0xFFFF0007u))
+    if (DirectCaller(caller) && !direct &&
+        LogOnce(caller == kTurretCaller ? 0xFFFF0003u : caller == kRocketCaller ? 0xFFFF000Bu : 0xFFFF0007u))
     {
       REXLOG_INFO("pdz_mouse: {} {:08X} (vtable {:08X}): {}: the mouse stays the right stick", SteeredName(caller), object,
                   Be32(base, object),
@@ -480,6 +494,14 @@ namespace pdz::mouse
         REXLOG_INFO("pdz_mouse: the CamSpy takes the mouse into its own view (object {:08X}, vtable {:08X}, yaw +{} pitch "
                     "+{}): {:.4f} deg per count as Jo's view (pdz_mouse_sensitivity {:.2f}), mouse up = {}, the game's "
                     "pitch limit; no stick model (pdz_mouse_direct_camspy)",
+                    object, Be32(base, object), fields.yaw, fields.pitch, REXCVAR_GET(pdz_mouse_sensitivity) * kDegreesPerCount,
+                    REXCVAR_GET(pdz_mouse_sensitivity), REXCVAR_GET(pdz_mouse_invert) ? "look down (pdz_mouse_invert)" : "look up");
+      }
+      else if (direct && caller == kRocketCaller)
+      {
+        REXLOG_INFO("pdz_mouse: the guided rocket takes the mouse into its own view (object {:08X}, vtable {:08X}, yaw "
+                    "+{} pitch +{}): {:.4f} deg per count as Jo's view (pdz_mouse_sensitivity {:.2f}), mouse up = {}; "
+                    "no stick model (pdz_mouse_direct_rocket)",
                     object, Be32(base, object), fields.yaw, fields.pitch, REXCVAR_GET(pdz_mouse_sensitivity) * kDegreesPerCount,
                     REXCVAR_GET(pdz_mouse_sensitivity), REXCVAR_GET(pdz_mouse_invert) ? "look down (pdz_mouse_invert)" : "look up");
       }
@@ -515,6 +537,17 @@ namespace pdz::mouse
                     "(mnk_sensitivity {:.2f}, mouse up = {})",
                     SteeredName(caller), object, SteerSensitivity(),
                     REXCVAR_GET(pdz_mouse_invert) ? "look down (pdz_mouse_invert)" : "look up");
+        if (caller == kRocketCaller)
+        {
+          // Mon 23 Nov night: could the rocket take the mouse directly? (For the next hand test of pdz_mouse_direct_rocket.)
+          AngleFields probe;
+          const bool plain = FindAngleFields(base, object, probe);
+          REXLOG_INFO("pdz_mouse: the guided rocket's view (vtable {:08X}): its yaw / pitch are {} (pdz_mouse_direct_rocket "
+                      "{}: with it on and plain fields the mouse turns the rocket directly)",
+                      Be32(base, object), plain ? fmt::format("plain fields, yaw +{} pitch +{}", probe.yaw, probe.pitch)
+                                                : std::string("not plain fields"),
+                      REXCVAR_GET(pdz_mouse_direct_rocket) ? "on" : "off");
+        }
       }
     }
     return direct ? Steer::kDirect : Steer::kStick;
@@ -1597,7 +1630,8 @@ namespace pdz::mouse
   void AfterSteeredLook(uint8_t *base, uint32_t owner, uint32_t object, uint32_t caller, Steer steer)
   {
     const bool log = REXCVAR_GET(pdz_mouse_direct_steer_log);
-    if (steer == Steer::kNotTaken || (caller != kTurretCaller && caller != kCamSpyCaller) || (steer != Steer::kDirect && !log))
+    if (steer == Steer::kNotTaken || (caller != kTurretCaller && caller != kCamSpyCaller && caller != kRocketCaller) ||
+        (steer != Steer::kDirect && !log))
     {
       return;
     }
@@ -1636,7 +1670,8 @@ namespace pdz::mouse
     if (steer == Steer::kDirect)
     {
       // (The CamSpy: Jo's degrees per count, no zoom scale of the player's: the CamSpy's view is its own.)
-      const MouseLook::SteerTurn st = MouseLook::Get().ConsumeSteer(caller == kCamSpyCaller ? 1.0 : ::ZoomScale(base, owner));
+      const MouseLook::SteerTurn st =
+          MouseLook::Get().ConsumeSteer(caller == kCamSpyCaller || caller == kRocketCaller ? 1.0 : ::ZoomScale(base, owner));
       if (st.turn.yaw != 0.0 || st.turn.pitch != 0.0)
       {
         ::Turn(base, object, st.turn.yaw, st.turn.pitch, false, f.yaw, f.pitch);

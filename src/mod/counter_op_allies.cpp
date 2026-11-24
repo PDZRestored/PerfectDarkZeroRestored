@@ -102,6 +102,21 @@ REXCVAR_DEFINE_INT32(pdz_counterop_test_p2_ally, 0, "Testing",
                      "smallest distance since the put and how many sweeps / rays left the other out")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+// Mon 23 Nov night (1.0.1). River, log 062: the gunner on the agent's hovercraft shot player 2's hovercraft to
+// pieces and every hit on him was answered 'does not count' (the rule above), so he outlived his craft. While he sits
+// in a vehicle (his parent +0x5C is a vehicle prop) an ally's hit on him now counts as anyone's. Every other ally rule
+// stays: on foot they cannot hurt him, they never see or target him, and his hits do nothing to them.
+REXCVAR_DEFINE_BOOL(pdz_counterop_allies_hit_p2_in_vehicle, true, "Gameplay",
+                    "Counter-Operative (1.0.1, default on; part of pdz_counterop_allies_ignore_p2): while player 2 "
+                    "sits in a vehicle (a hovercraft seat, a jetpack) the hits of the agent's AI friends on him count, "
+                    "so the gunner on the agent's hovercraft can kill him. Off = 1.0.0 (their hits never count)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(pdz_counterop_test_ally_hit_p2, 0, "Testing",
+                     "TESTING TOOL (counter-op): each change to a new non-zero value asks Rare's 'does this hit "
+                     "count' (82545698) for a hit on player 2 by the agent's nearest live AI friend and logs the "
+                     "answer with where he is (in a vehicle or on foot)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REX_EXTERN(sub_825AD3B0);        // set a human's view (character, f1 pitch, positive down, f2 yaw)
 REX_EXTERN(sub_825AD148);        // move a character (character, &position, 0)
 REX_EXTERN(sub_82545698);        // 'does this hit count' (victim, attacker) -> byte (hooked in counter_op_pvp.cpp)
@@ -326,6 +341,22 @@ uint32_t PdzCounterOpRules13OwnerOf(const uint8_t *base, uint32_t object)
 
 bool PdzCounterOpAlliesIgnoreP2() { return On() && PdzCounterOpPlayer2() != 0; }
 
+namespace
+{
+  // Mon 23 Nov night (1.0.1): the vehicle prop player 2 sits in (his parent), or 0.
+  uint32_t P2Vehicle(const uint8_t *base, uint32_t p2)
+  {
+    constexpr uint32_t kVehicleVtable = 0x820CA9E0; // vehicle prop (825D18A0)
+    if (!pdz::guestmem::Ok(base, p2 + kParent, 4))
+    {
+      return 0;
+    }
+    const uint32_t parent = L32(base, p2 + kParent);
+    return pdz::guestmem::Ok(base, parent, 4) && L32(base, parent) == kVehicleVtable ? parent : 0;
+  }
+  std::atomic<uint32_t> g_vehicle_hits{0};
+} // namespace
+
 // counter_op_pvp.cpp's 82545698 hook (victim, attacker / source). True = the hit does not count (already logged).
 bool PdzCounterOpAllyHitRefused(const uint8_t *base, uint32_t victim, uint32_t source, uint32_t from)
 {
@@ -341,6 +372,21 @@ bool PdzCounterOpAllyHitRefused(const uint8_t *base, uint32_t victim, uint32_t s
     if (!owner || owner == p2 || !PdzCounterOpIsAgentAlly(base, owner))
     {
       return false;
+    }
+    if (REXCVAR_GET(pdz_counterop_allies_hit_p2_in_vehicle))
+    {
+      if (const uint32_t vehicle = P2Vehicle(base, p2))
+      {
+        const uint32_t n = g_vehicle_hits.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= 8 || n % 200 == 0)
+        {
+          REXLOG_INFO("pdz_counterop: allies: a hit on player 2 from {:08X} (its owner {:08X}, an ally of the agent) "
+                      "COUNTS: he sits in the vehicle {:08X} (#{}; pdz_counterop_allies_hit_p2_in_vehicle; asked "
+                      "from {:08X})",
+                      source, owner, vehicle, n, from);
+        }
+        return false;
+      }
     }
     if (++g_fire_refused <= 8 || g_fire_refused % 200 == 0)
     {
@@ -969,6 +1015,53 @@ void PdzCounterOpRules13Tick(PPCContext &ctx, uint8_t *base, bool playing)
   if (playing)
   {
     AllyGadgetTestTick(ctx, base); // round 13b p
+  }
+  // TESTING TOOL (Mon 23 Nov night): Rare's answer for a hit on him by the agent's nearest live AI friend.
+  if (static int32_t was = 0; REXCVAR_GET(pdz_counterop_test_ally_hit_p2) != was)
+  {
+    was = REXCVAR_GET(pdz_counterop_test_ally_hit_p2);
+    const uint32_t p2 = PdzCounterOpPlayer2();
+    if (was != 0 && playing && p2 && pdz::guestmem::Ok(base, p2, kPosition + 12))
+    {
+      uint32_t best = 0;
+      float best_d = 1.0e12f;
+      const uint32_t world = L32(base, kWorld);
+      const uint32_t end = Ptr(world) ? L32(base, world + kWorldEnd) : 0;
+      uint32_t node = Ptr(world) ? L32(base, world + kWorldFirst) : 0;
+      for (int i = 0; Ptr(node) && node != end && i < 16384; ++i, node = L32(base, node + 12))
+      {
+        const uint32_t o = L32(base, node + 4);
+        if (!Ptr(o) || L32(base, o + kClass) != 0x21 || !(LF(base, o + kHealth) > 0.0f) ||
+            !PdzCounterOpIsAgentAlly(base, o))
+        {
+          continue;
+        }
+        const float dx = LF(base, o + kPosition) - LF(base, p2 + kPosition),
+                    dz = LF(base, o + kPosition + 8) - LF(base, p2 + kPosition + 8);
+        if (const float d = dx * dx + dz * dz; d < best_d)
+        {
+          best_d = d;
+          best = o;
+        }
+      }
+      if (best)
+      {
+        const uint32_t vehicle = P2Vehicle(base, p2);
+        const uint32_t answer = Ask(ctx, base, p2, best);
+        REXLOG_INFO("pdz_counterop: TEST TOOL (pdz_counterop_test_ally_hit_p2 {}): a hit on player 2 by the agent's "
+                    "friend {:08X} ({:.0f} m away): Rare's hit-counts answer 82545698 = {} ({}); player 2 is {} "
+                    "(parent {:08X}); pdz_counterop_allies_hit_p2_in_vehicle {}",
+                    was, best, std::sqrt(best_d) / 100.0f, answer, answer ? "the hit COUNTS" : "the hit does not count",
+                    vehicle ? "in a vehicle" : "not in a vehicle", L32(base, p2 + kParent),
+                    REXCVAR_GET(pdz_counterop_allies_hit_p2_in_vehicle));
+      }
+      else
+      {
+        REXLOG_INFO("pdz_counterop: TEST TOOL (pdz_counterop_test_ally_hit_p2 {}): no live AI friend of the agent "
+                    "in the level",
+                    was);
+      }
+    }
   }
   PdzCounterOpVehiclesTestTick(ctx, base, playing);
 }
