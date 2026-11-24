@@ -79,6 +79,9 @@ driver), the mouse aims directly. Settings: `settings/mapping.toml`.
     the vehicle as the owner).
   - Since 1.0.2 the guided rocket takes the mouse into its own view too (`pdz_mouse_direct_rocket`, on: proven in
     play on 24 Nov 2026; the CamSpy since 19 Nov, `pdz_mouse_direct_camspy`).
+    Since 1.0.3 it gives the mouse back the moment it explodes (`pdz_fix_rocket_control_back`, on): the exploded
+    rocket stays in the game for 5 s more and its look update goes on being called, which held the mouse until
+    then. `pdz_rocket_log` (off) logs a rocket's life frame by frame.
   - The hovercraft and the jetpack keep the mouse as the right stick (not script
     testable; the vehicles turn the player's own view with the vehicle as the owner, a different mechanism).
   - `pdz_mouse_direct_steer_log` (diagnostic, off): a `pdz_mouse: turret aim` line once a second on a turret (its

@@ -144,6 +144,21 @@ REXCVAR_DEFINE_BOOL(pdz_mouse_direct_rocket, true, "Mouse",
                     "view keeps its yaw / pitch in plain fields (logged when a rocket is first steered). The "
                     "controller is the game's own either way. Needs pdz_mouse_look")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(pdz_fix_rocket_control_back, true, "Mouse",
+                    "The guided rocket gives the mouse back the moment it explodes (Tue 24 Nov, 1.0.3, default on). "
+                    "A guided rocket that has exploded stays in the game until its flight time is over (about 7 s "
+                    "from the shot), and its look update goes on being called for all of that time. The mouse code "
+                    "took every such call as 'the rocket is being steered', so after the blast the mouse still went "
+                    "to the dead rocket and Jo could not aim until the rocket was finally removed. Now a rocket that "
+                    "has detonated (Rare's own state, rocket +1244 = 3, set by its detonation routine 825B6E50) is "
+                    "no longer steered: the mouse aims Jo's own view again in the same frame. The controller was "
+                    "never held (the game reads it itself). Off = as 1.0.2")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(pdz_rocket_log, false, "Mouse",
+                    "Log the guided rocket's life frame by frame (Tue 24 Nov): every call of its look update (its "
+                    "state, age, place, whether the mouse steers it) and, for 10 s after a rocket was last seen, "
+                    "every look update of Jo's own view (her view angles, her place, who has the mouse)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(pdz_mouse_direct_steer_log, false, "Mouse",
                     "Diagnostic: once a second while guest user 0 is on a mounted turret, a 'pdz_mouse: turret aim' "
                     "line (its yaw / pitch, this second's mouse counts and turn and the change of its aim, turret "
@@ -243,6 +258,35 @@ namespace pdz::mouse
     {
       return NowNs() - g_steered_ns.load(std::memory_order_relaxed) <
              std::chrono::duration_cast<std::chrono::nanoseconds>(kSteerHold).count();
+    }
+
+    // Tue 24 Nov (1.0.3): the guided rocket (class 820C8478). Its update 825B61F0 adds the frame time to its age
+    // (+1060) against its flight time ([+1076] +4); a hit or the end of the flight sets 'detonate' (+1096) and the
+    // update then calls its detonation routine 825B6E50 once: the explosion, the view handed back, state +1244 = 3.
+    // The rocket object and its controller (822533E8, the look update's caller 82253588) live on after that.
+    constexpr uint32_t kRocketVtable = 0x820C8478, kRocketState = 1244, kRocketAge = 1060, kRocketDef = 1076;
+    uint32_t Be32(const uint8_t *base, uint32_t address); // (below)
+    float BeF(const uint8_t *base, uint32_t address)
+    {
+      const uint32_t b = Be32(base, address);
+      float f;
+      std::memcpy(&f, &b, 4);
+      return f;
+    }
+    std::atomic<uint32_t> g_rocket{0};          // the last rocket whose look update was seen
+    std::atomic<int64_t> g_rocket_ns{INT64_MIN / 2}; // when
+    std::atomic<int64_t> g_rocket_first_ns{0}, g_rocket_blast_ns{0};
+    // Each rocket seen lately (an exploded one lives on while the next is already flying): the look update's thread only.
+    struct RocketSeen
+    {
+      uint32_t object = 0, calls = 0;
+      int64_t first_ns = 0, last_ns = INT64_MIN / 2, blast_ns = 0;
+    };
+    RocketSeen g_rockets[4];
+    bool RocketDetonated(const uint8_t *base, uint32_t rocket)
+    {
+      return rocket >= 0x10000u && rocket < 0xFFFF0000u && Be32(base, rocket) == kRocketVtable &&
+             int32_t(Be32(base, rocket + kRocketState)) >= 3;
     }
 
     // Steering, with the mouse into the steered aim directly (no right stick from the mouse meanwhile).
@@ -467,6 +511,78 @@ namespace pdz::mouse
                     g_human_player.load(std::memory_order_relaxed), human_known ? "yes" : "no");
       }
       return Steer::kNotTaken;
+    }
+    if (caller == kRocketCaller && Be32(base, object) == kRocketVtable)
+    {
+      const int64_t now = NowNs();
+      const bool detonated = RocketDetonated(base, object);
+      RocketSeen *seen = nullptr, *oldest = &g_rockets[0];
+      for (RocketSeen &r : g_rockets)
+      {
+        if (r.object == object && now - r.last_ns < 1000000000LL)
+        {
+          seen = &r;
+        }
+        if (r.last_ns < oldest->last_ns)
+        {
+          oldest = &r;
+        }
+      }
+      if (!seen)
+      {
+        seen = oldest;
+        *seen = RocketSeen{};
+        seen->object = object;
+        seen->first_ns = now;
+      }
+      seen->last_ns = now;
+      const uint32_t n = seen->calls++;
+      const int64_t first_ns = seen->first_ns;
+      // What Jo's own look update reports on (pdz_rocket_log): the rocket in flight, or the one that just exploded.
+      if (!detonated || g_rocket.load(std::memory_order_relaxed) == object ||
+          now - g_rocket_ns.load(std::memory_order_relaxed) > 100000000LL)
+      {
+        if (g_rocket.exchange(object, std::memory_order_relaxed) != object)
+        {
+          g_rocket_blast_ns.store(seen->blast_ns, std::memory_order_relaxed);
+        }
+        g_rocket_first_ns.store(first_ns, std::memory_order_relaxed);
+        g_rocket_ns.store(now, std::memory_order_relaxed);
+      }
+      if (detonated && seen->blast_ns == 0)
+      {
+        seen->blast_ns = now;
+        if (g_rocket.load(std::memory_order_relaxed) == object)
+        {
+          g_rocket_blast_ns.store(now, std::memory_order_relaxed);
+        }
+        REXLOG_INFO("pdz_mouse: guided rocket {:08X}: DETONATED (Rare's state +1244 = {}), {:.2f} s after its first look "
+                    "update, age {:.2f} s of its {:.2f} s flight time; the mouse {}",
+                    object, int32_t(Be32(base, object + kRocketState)),
+                    double(now - first_ns) / 1e9, BeF(base, object + kRocketAge),
+                    Be32(base, object + kRocketDef) >= 0x10000u ? BeF(base, Be32(base, object + kRocketDef) + 4) : -1.0f,
+                    REXCVAR_GET(pdz_fix_rocket_control_back) ? "goes back to Jo's own view now (pdz_fix_rocket_control_back)"
+                                                             : "stays with the rocket until it is removed (pdz_fix_rocket_control_back off)");
+      }
+      if (REXCVAR_GET(pdz_rocket_log))
+      {
+        REXLOG_INFO("pdz_rocket: call {} ({:.3f} s): rocket {:08X} state {} detonate-flag {} / {} age {:.3f} at ({:.0f}, "
+                    "{:.0f}, {:.0f}) yaw {:.2f} pitch {:.2f}; steering {}, direct {}",
+                    n, double(now - first_ns) / 1e9, object,
+                    int32_t(Be32(base, object + kRocketState)), int(base[object + 1096]), int(base[object + 1097]),
+                    BeF(base, object + kRocketAge), BeF(base, object + 48), BeF(base, object + 52),
+                    BeF(base, object + 56), BeF(base, object + 1408), BeF(base, object + 1404),
+                    SteeringActive() ? "active" : "not active", g_steered_direct.load(std::memory_order_relaxed) ? "yes" : "no");
+      }
+      if (detonated && REXCVAR_GET(pdz_fix_rocket_control_back))
+      {
+        // Not steered any more: the on-foot look update that follows hands the mouse back in this same frame.
+        if (g_steered_object.load(std::memory_order_relaxed) == object)
+        {
+          g_steered_ns.store(INT64_MIN / 2, std::memory_order_relaxed);
+        }
+        return Steer::kNotTaken;
+      }
     }
     // pdz_mouse_direct_steer: a mounted turret whose view has plain yaw / pitch fields takes the mouse into its aim
     // (AfterSteeredLook); everything else (and a view of another shape) the right stick, as before.
@@ -1565,6 +1681,24 @@ namespace
     // The CamSpy, a turret, the guided rocket, the hovercraft or the jetpack is being steered (NoteSteeredLook): the
     // pointer stays ours and its motion becomes the right stick that reads (TakeSteerStick); the player's own view
     // isn't turned by it meanwhile.
+    if (REXCVAR_GET(pdz_rocket_log) &&
+        pdz::mouse::NowNs() - pdz::mouse::g_rocket_ns.load(std::memory_order_relaxed) < 10000000000LL)
+    {
+      const uint32_t rocket = pdz::mouse::g_rocket.load(std::memory_order_relaxed);
+      const int64_t now = pdz::mouse::NowNs();
+      REXLOG_INFO("pdz_rocket: Jo's own look update ({:.3f} s after the rocket's first, {:.3f} s after its last): her "
+                  "view yaw {:.2f} pitch {:.2f}, at ({:.0f}, {:.0f}, {:.0f}); the mouse: {}; rocket {:08X} {}",
+                  double(now - pdz::mouse::g_rocket_first_ns.load(std::memory_order_relaxed)) / 1e9,
+                  double(now - pdz::mouse::g_rocket_ns.load(std::memory_order_relaxed)) / 1e9,
+                  LoadBeFloat(base, view + kViewYaw), LoadBeFloat(base, view + kViewYaw + 4), LoadBeFloat(base, player + 48),
+                  LoadBeFloat(base, player + 52), LoadBeFloat(base, player + 56),
+                  pdz::mouse::SteeringActive() ? (pdz::mouse::DirectSteering() ? "with the rocket (direct)" : "the right stick (steering)")
+                                               : "Jo's view",
+                  rocket,
+                  pdz::mouse::Be32(base, rocket) == pdz::mouse::kRocketVtable
+                      ? fmt::format("state {}", int32_t(pdz::mouse::Be32(base, rocket + pdz::mouse::kRocketState)))
+                      : std::string("is no rocket any more"));
+    }
     if (pdz::mouse::SteeringActive())
     {
       look.ConsumeForSteering(pdz::mouse::DirectSteering());
@@ -1572,6 +1706,12 @@ namespace
     }
     if (pdz::mouse::g_steering.exchange(false, std::memory_order_relaxed))
     {
+      if (const int64_t blast = pdz::mouse::g_rocket_blast_ns.load(std::memory_order_relaxed);
+          blast != 0 && pdz::mouse::g_steered_caller.load(std::memory_order_relaxed) == pdz::mouse::kRocketCaller)
+      {
+        REXLOG_INFO("pdz_mouse: the guided rocket gave the mouse back {:.3f} s after it detonated",
+                    double(pdz::mouse::NowNs() - blast) / 1e9);
+      }
       REXLOG_INFO("pdz_mouse: the {} gives the mouse back: mouse aim on foot again",
                   pdz::mouse::SteeredName(pdz::mouse::g_steered_caller.load(std::memory_order_relaxed)));
     }

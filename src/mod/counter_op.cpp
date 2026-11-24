@@ -361,6 +361,14 @@ REXCVAR_DEFINE_BOOL(pdz_counterop_death_hit_clear, true, "Gameplay",
                     "his half through the whole wait and ran on over his next body. It is now ended the moment he "
                     "dies, kept ended while he waits, and ended again before each new body. Off = as before")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(pdz_test_give_weapon, 0, "Testing",
+                     "TESTING TOOL (Tue 24 Nov): each change to a new value above 0 gives player 1 the weapon of that "
+                     "type through Rare's give (8254C378) with full reserves and draws it, when the level's weapon "
+                     "list holds the type (logged with the list's types when it does not). Single player and "
+                     "Counter-Op. Her inventory is emptied first. A TEST TOOL ONLY: it crashes the game where the "
+                     "level lists the type but has not loaded the weapon (type 23, the rocket launcher: fine on River "
+                     "and Bridge, a crash on Jungle), and when she sits on a turret. 999 = only list the types. 0 = off")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(pdz_counterop_takeover_predress, false, "Gameplay",
                     "Counter-Operative (Tue 24 Nov round 2, an experiment, default off; measured: no cure). When the "
                     "picked guard's body or head differs from the one player 2 wore last, his body is rebuilt as the "
@@ -7529,6 +7537,102 @@ REX_HOOK_RAW(sub_8222F740)
     {
       PPCContext saved = ctx;
       counter_op_jetpack::TestTools(saved, base, p1c, p2c);
+      // TESTING TOOL (Tue 24 Nov, pdz_test_give_weapon): a weapon of the level's list for player 1.
+      if (static int32_t give_was = 0; REXCVAR_GET(pdz_test_give_weapon) != give_was)
+      {
+        give_was = REXCVAR_GET(pdz_test_give_weapon);
+        if (give_was > 0)
+        {
+          PPCContext copy = ctx;
+          std::string types;
+          {
+            const uint32_t list = Load32(base, kGame + kWeaponList);
+            const uint32_t entries = Ptr(list) ? Load32(base, list) : 0;
+            const uint32_t count = Ptr(list) ? base[list + kWeaponListCount] : 0;
+            for (uint32_t i = 0; Ptr(entries) && i < count; ++i)
+            {
+              const uint32_t d = Load32(base, entries + i * kWeaponEntryBytes);
+              types += Ptr(d) ? fmt::format("{} ", Load32(base, d + kWeaponDefType)) : std::string("- ");
+              if (give_was == 999 && Ptr(d) && Rd(base, d, 0x100))
+              {
+                // (the tool's value 999: every definition with the first names found in it, to tell the types apart)
+                std::string names;
+                for (uint32_t o = 0; o < 0x100 && names.size() < 160; o += 4)
+                {
+                  const uint32_t q = Load32(base, d + o);
+                  if (Ptr(q) && Rd(base, q, 24))
+                  {
+                    size_t n = 0;
+                    while (n < 23 && base[q + n] >= 0x20 && base[q + n] < 0x7F)
+                    {
+                      ++n;
+                    }
+                    if (n >= 5 && base[q + n] == 0)
+                    {
+                      names += fmt::format(" +{:02X} '{}'", o, std::string(reinterpret_cast<const char *>(base + q), n));
+                    }
+                  }
+                }
+                REXLOG_INFO("pdz_test_give_weapon 999: list entry {}: type {} definition {:08X}:{}", i,
+                            Load32(base, d + kWeaponDefType), d, names);
+              }
+            }
+          }
+          if (!LevelGivesType(base, uint32_t(give_was)))
+          {
+            REXLOG_INFO("pdz_test_give_weapon {}: not in this level's weapon list: nothing given; the list's types: {}",
+                        give_was, types);
+          }
+          else
+          {
+            Call(copy, base, sub_8254BDF0, p1c, 0); // her inventory emptied first (a full one refuses the give)
+            g_giving = true;
+            uint32_t item = Call(copy, base, sub_8254C378, p1c, uint32_t(give_was), 0, 0, 0, 0);
+            g_giving = false;
+            for (const uint32_t hand : {kHand0, kHand1})
+            {
+              const uint32_t held = Load32(base, p1c + hand);
+              if (!Ptr(item) && Ptr(held) && Load32(base, held + kItemType) == uint32_t(give_was))
+              {
+                item = held;
+              }
+            }
+            std::string drawn = "not drawn";
+            if (Ptr(item))
+            {
+              // (as the takeover: each reserve only when the item's weapon entry has that definition)
+              const uint32_t entry = Rd(base, item, 1252) ? Load32(base, item + 1248) : 0;
+              if (Rd(base, entry, 8) && Ptr(Load32(base, entry)))
+              {
+                Call(copy, base, sub_82583F80, item, kFullAmmo, 1);
+                if (Ptr(Load32(base, entry + 4)))
+                {
+                  Call(copy, base, sub_82584118, item, kFullAmmo, 1);
+                }
+              }
+              const uint32_t switcher = Load32(base, p1c + 5780);
+              if (PPCFunc *select = SwitcherOk(base, switcher)
+                                        ? pdz::GuestFunction(Load32(base, Load32(base, switcher)), "test give: draw") : nullptr)
+              {
+                rex::CallFrame frame(copy);
+                frame.ctx.r1.u64 = (copy.r1.u32 - 0x800) & ~0xFu;
+                frame.ctx.r3.u64 = switcher;
+                frame.ctx.r4.u64 = item;
+                frame.ctx.r5.u64 = 0;
+                frame.ctx.r6.u64 = 0;
+                frame.ctx.r7.u64 = 0;
+                frame.ctx.r8.u64 = 0;
+                frame.ctx.r9.u64 = 0;
+                frame.ctx.r10.u64 = 0;
+                select(frame.ctx, base);
+                drawn = "drawn through her weapon switcher";
+              }
+            }
+            REXLOG_INFO("pdz_test_give_weapon {}: item {:08X} for player 1 {:08X}, reserves filled, {}; the level's "
+                        "weapon types: {}", give_was, item, p1c, drawn, types);
+          }
+        }
+      }
       if (!PdzCounterOpRunning())
       {
         PPCContext saved2 = ctx;
